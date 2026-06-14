@@ -129,10 +129,25 @@ Ensure publishing is scoped, update `package.json`:
 }
 ```
 
-Then:
+Login to npm:
 
 ```powershell
+# When 2FA is enabled, login with npm credentials
 npm login
+
+# Otherwise, set NPM_TOKEN environment variable
+$env:NPM_TOKEN = "npm_xxx"
+```
+
+Ensure logged in is successful:
+
+```powershell
+npm whoami
+```
+
+Then version bump and publish:
+
+```powershell
 npm version patch
 npm publish --access public
 ```
