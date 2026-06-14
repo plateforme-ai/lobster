@@ -11,14 +11,14 @@
     "pipeline",
     "workflow"
   ],
-  "homepage": "https://github.com/openclaw/lobster#readme",
+  "homepage": "https://github.com/plateforme-ai/lobster#readme",
   "bugs": {
-    "url": "https://github.com/openclaw/lobster/issues"
+    "url": "https://github.com/plateforme-ai/lobster/issues"
   },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/openclaw/lobster.git"
+    "url": "git+https://github.com/plateforme-ai/lobster.git"
   },
   "bin": {
     "clawd.invoke": "bin/clawd.invoke.js",

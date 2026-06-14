@@ -145,6 +145,12 @@ Ensure logged in is successful:
 npm whoami
 ```
 
+Use forked version or optionally version bump:
+
+```powershell
+npm version patch
+```
+
 Then publish:
 
 ```powershell
