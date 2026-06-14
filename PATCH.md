@@ -145,12 +145,13 @@ Ensure logged in is successful:
 npm whoami
 ```
 
-Then version bump and publish:
+Then publish:
 
 ```powershell
-npm version patch
 npm publish --access public
 ```
+
+## Install
 
 Install published package:
 
