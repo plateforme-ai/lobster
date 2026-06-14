@@ -1,5 +1,5 @@
 {
-  "name": "@clawdbot/lobster",
+  "name": "@plateforme-ai/lobster",
   "version": "2026.6.11",
   "description": "Workflow runtime for AI agents - deterministic pipelines with approval gates",
   "keywords": [
