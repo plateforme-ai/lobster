@@ -444,7 +444,7 @@ async function runLlmInvoke({
     }
 
     if (!validateResponseEnvelope(responseEnvelope)) {
-      throw new Error(`${config.name} received invalid response envelope`);
+      throw new Error(`${config.name} received invalid response envelope: ${JSON.stringify(responseEnvelope)}`);
     }
 
     if (responseEnvelope.ok !== true) {
@@ -658,12 +658,56 @@ async function invokeOpenClawAdapter({
     }
     const inner = parsed.result;
     if (inner && typeof inner === "object" && !Array.isArray(inner) && "ok" in inner) {
-      return inner as LlmResponseEnvelope;
+      const envelope = inner as LlmResponseEnvelope;
+      return {
+        ...envelope,
+        result: envelope.result ? normalizeOpenClawToolResult(envelope.result) : envelope.result,
+      };
     }
-    return { ok: true, result: inner } as LlmResponseEnvelope;
+    return { ok: true, result: normalizeOpenClawToolResult(inner) } as LlmResponseEnvelope;
   }
 
   return { ok: true, result: parsed } as LlmResponseEnvelope;
+}
+
+function normalizeOpenClawToolResult(result: any): LlmResponse {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return {
+      output: {
+        text: result == null ? "" : String(result),
+        data: result,
+        format: "json",
+      },
+    };
+  }
+
+  if (result.output) {
+    return result as LlmResponse;
+  }
+
+  const content = Array.isArray(result.content) ? result.content : [];
+  const text = content
+    .filter((item: any) => item?.type === "text" && typeof item.text === "string")
+    .map((item: any) => item.text)
+    .join("\n");
+
+  const details = result.details && typeof result.details === "object" ? result.details : null;
+  const data = details && "json" in details ? details.json : undefined;
+
+  return {
+    ...result,
+    model: result.model ?? details?.model ?? null,
+    output: {
+      text: text || null,
+      data: data ?? null,
+      format: data !== undefined ? "json" : "text",
+    },
+    metadata: {
+      ...(result.metadata ?? {}),
+      ...(details?.provider ? { provider: details.provider } : null),
+      ...(details ? { details } : null),
+    },
+  } as LlmResponse;
 }
 
 async function invokeHttpAdapter({
