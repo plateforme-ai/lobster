@@ -83,11 +83,27 @@ async function syncCreatedDirectoryChain(firstCreated: string, finalDir: string)
   let current = path.resolve(firstCreated);
 
   await syncDirectory(path.dirname(current));
-  while (current !== final) {
+
+  while (true) {
     await syncDirectory(current);
+    if (current === final) break;
+
     const relative = path.relative(current, final);
+    if (
+      !relative ||
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative) ||
+      /^[a-zA-Z]:/.test(relative)
+    ) {
+      break;
+    }
+
     const next = relative.split(path.sep)[0];
-    if (!next || next === "..") break;
+    if (!next || next === ".." || path.isAbsolute(next) || /^[a-zA-Z]:/.test(next)) {
+      break;
+    }
+
     current = path.join(current, next);
   }
 }
