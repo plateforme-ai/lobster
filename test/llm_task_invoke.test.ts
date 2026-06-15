@@ -95,7 +95,8 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
     assert.equal(bodyLog[0].action, "invoke");
     assert.equal(bodyLog[0].args.prompt, "Summarize");
     assert.equal(bodyLog[0].args.model, "claude-3-sonnet");
-    assert.equal(bodyLog[0].args.artifacts.length, 1);
+    assert.equal(bodyLog[0].args.input, "doc");
+    assert.equal("artifacts" in bodyLog[0].args, false);
     assert.equal(bodyLog[0].args.artifactHashes.length, 1);
   } finally {
     await rm(cacheDir, { recursive: true, force: true });
@@ -448,6 +449,8 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
     assert.equal(bodyLog[0].tool, "llm-task");
     assert.equal(bodyLog[0].action, "invoke");
     assert.equal(bodyLog[0].args.prompt, "Summarize");
+    assert.equal(bodyLog[0].args.input, "doc");
+    assert.equal("artifacts" in bodyLog[0].args, false);
     assert.ok(Array.isArray(bodyLog[0].args.artifactHashes));
   } finally {
     await rm(cacheDir, { recursive: true, force: true });

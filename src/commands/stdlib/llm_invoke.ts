@@ -103,8 +103,10 @@ const responseSchema = {
 const validatePayload = ajv.compile(payloadSchema);
 const validateResponseEnvelope = ajv.compile(responseSchema);
 
-const DEFAULT_MAX_VALIDATION_RETRIES = 1;
 const STATE_VERSION = 1;
+
+const DEFAULT_MAX_VALIDATION_RETRIES = 1;
+const DEFAULT_OPENCLAW_URL = "http://127.0.0.1:18789";
 
 type BuiltInProvider = "openclaw" | "pi" | "http";
 type SupportedProvider = BuiltInProvider | string;
@@ -523,9 +525,7 @@ function resolveProvider(
   if (String(env.LOBSTER_PI_LLM_ADAPTER_URL ?? "").trim()) return "pi";
   if (String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? "").trim()) return "openclaw";
   if (String(env.LOBSTER_LLM_ADAPTER_URL ?? "").trim()) return "http";
-  throw new Error(
-    "llm.invoke could not resolve a provider. Set --provider or LOBSTER_LLM_PROVIDER",
-  );
+  return "openclaw";
 }
 
 function resolveAdapter({
@@ -554,10 +554,7 @@ function resolveAdapter({
   }
 
   if (provider === "openclaw") {
-    const openclawUrl = String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? "").trim();
-    if (!openclawUrl) {
-      throw new Error(`${config.name} requires OPENCLAW_URL (or CLAWD_URL) for provider=openclaw`);
-    }
+    const openclawUrl = String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? DEFAULT_OPENCLAW_URL).trim();
     const endpoint = new URL("/tools/invoke", openclawUrl);
     const token = String(args.token ?? env.OPENCLAW_TOKEN ?? env.CLAWD_TOKEN ?? "").trim();
     return {
@@ -626,6 +623,7 @@ async function invokeOpenClawAdapter({
   token: string;
   payload: any;
 }) {
+  const args = toOpenClawToolArgs(payload);
   const res = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -635,7 +633,7 @@ async function invokeOpenClawAdapter({
     body: JSON.stringify({
       tool: "llm-task",
       action: "invoke",
-      args: payload,
+      args,
     }),
   });
 
@@ -668,6 +666,36 @@ async function invokeOpenClawAdapter({
   }
 
   return { ok: true, result: parsed } as LlmResponseEnvelope;
+}
+
+function toOpenClawToolArgs(payload: Record<string, any>) {
+  const { artifacts, ...args } = payload;
+  const input = openClawInputFromArtifacts(artifacts);
+  if (input !== undefined) args.input = input;
+  return args;
+}
+
+function openClawInputFromArtifacts(artifacts: unknown) {
+  if (!Array.isArray(artifacts) || artifacts.length === 0) return undefined;
+  if (artifacts.length === 1) return openClawInputFromArtifact(artifacts[0]);
+  return artifacts.map(openClawInputFromArtifact);
+}
+
+function openClawInputFromArtifact(artifact: unknown) {
+  if (artifact && typeof artifact === "object" && !Array.isArray(artifact)) {
+    const item = artifact as Record<string, unknown>;
+    if (typeof item.text === "string") return parseJsonTextOrRaw(item.text);
+    if ("data" in item) return item.data;
+  }
+  return artifact;
+}
+
+function parseJsonTextOrRaw(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 function normalizeOpenClawToolResult(result: any): LlmResponse {

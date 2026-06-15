@@ -83,6 +83,87 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
     assert.equal(bodyLog.length, 1);
     assert.equal(bodyLog[0].tool, "llm-task");
     assert.equal(bodyLog[0].args.prompt, "Summarize");
+    assert.equal(bodyLog[0].args.input, "doc");
+    assert.equal("artifacts" in bodyLog[0].args, false);
+    assert.equal(bodyLog[0].args.artifactHashes.length, 1);
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+    await closeServer(server);
+  }
+});
+
+test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async () => {
+  const registry = createDefaultRegistry();
+  const cmd = registry.get("llm.invoke");
+  assert.ok(cmd);
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+
+  const bodyLog: any[] = [];
+  const server = http.createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/tools/invoke") {
+      res.writeHead(404);
+      res.end("nope");
+      return;
+    }
+    let buf = "";
+    req.setEncoding("utf8");
+    req.on("data", (d) => (buf += d));
+    req.on("end", () => {
+      const parsed = JSON.parse(buf || "{}");
+      bodyLog.push(parsed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          result: {
+            ok: true,
+            result: {
+              runId: "local_openclaw_1",
+              prompt: parsed.args?.prompt,
+              output: { data: { received: parsed.args?.input } },
+            },
+          },
+        }),
+      );
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(18789, "127.0.0.1", resolve);
+  });
+
+  try {
+    const result = await cmd.run({
+      input: streamOf([{ kind: "text", text: '{"ok":true}' }]),
+      args: {
+        _: [],
+        prompt: "Echo input",
+        refresh: true,
+      },
+      ctx: baseCtx(
+        {
+          OPENCLAW_URL: undefined,
+          CLAWD_URL: undefined,
+          LOBSTER_LLM_PROVIDER: undefined,
+          LOBSTER_PI_LLM_ADAPTER_URL: undefined,
+          LOBSTER_LLM_ADAPTER_URL: undefined,
+          LOBSTER_CACHE_DIR: cacheDir,
+        },
+        registry,
+      ),
+    } as any);
+
+    const items = await collect(result.output!);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].kind, "llm.invoke");
+    assert.equal(items[0].source, "openclaw");
+    assert.deepEqual(items[0].output.data.received, { ok: true });
+    assert.equal(bodyLog.length, 1);
+    assert.equal(bodyLog[0].args.prompt, "Echo input");
+    assert.deepEqual(bodyLog[0].args.input, { ok: true });
+    assert.equal("artifacts" in bodyLog[0].args, false);
+    assert.equal(bodyLog[0].args.artifactHashes.length, 1);
   } finally {
     await rm(cacheDir, { recursive: true, force: true });
     await closeServer(server);
@@ -167,7 +248,7 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
   }
 });
 
-function baseCtx(envOverrides: Record<string, string>, registry?: any) {
+function baseCtx(envOverrides: Record<string, string | undefined>, registry?: any) {
   return {
     stdin: process.stdin,
     stdout: process.stdout,

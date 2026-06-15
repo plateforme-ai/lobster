@@ -121,7 +121,7 @@ lobster.cmd run --file test-llm-task.lobster
 
 ## Publish
 
-Ensure publishing is scoped, update `package.json`:
+Ensure publishing is scoped in `package.json`:
 
 ```json
 {
@@ -132,28 +132,14 @@ Ensure publishing is scoped, update `package.json`:
 Login to npm:
 
 ```powershell
-# When 2FA is enabled, login with npm credentials
 npm login
-
-# Otherwise, set NPM_TOKEN environment variable
-$env:NPM_TOKEN = "npm_xxx"
-```
-
-Ensure logged in is successful:
-
-```powershell
 npm whoami
 ```
 
-Use forked version or optionally version bump:
+Bump version and publish:
 
 ```powershell
-npm version patch
-```
-
-Then publish:
-
-```powershell
+npm version yyyy.mm.dd-x
 npm publish --access public
 ```
 
