@@ -4,13 +4,13 @@
 
 An OpenClaw-native workflow shell: typed (JSON-first) pipelines, jobs, and approval gates.
 
+Forked from [https://github.com/openclaw/lobster](https://github.com/openclaw/lobster)
+
 | Source | Version |
 |--------|---------|
-| forked | [![forked version](https://img.shields.io/npm/v/%40clawdbot%2Flobster?label=npm)](https://www.npmjs.com/package/@plateforme-ai/lobster) |
+| source | [![source version](https://img.shields.io/npm/v/%40clawdbot%2Flobster?label=npm)](https://www.npmjs.com/package/@plateforme-ai/lobster) |
 | synced | [![synced version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fplateforme-ai%2Flobster%2Fmain%2Fpackage.json&query=%24.version&label=npm&prefix=v)](https://github.com/plateforme-ai/lobster/tree/main) |
-| release | [![patched version](https://img.shields.io/npm/v/%40plateforme-ai%2Flobster?label=npm)](https://www.npmjs.com/package/@plateforme-ai/lobster) |
-
-Forked from [https://github.com/openclaw/lobster](https://github.com/openclaw/lobster)
+| released | [![released version](https://img.shields.io/npm/v/%40plateforme-ai%2Flobster?label=npm)](https://www.npmjs.com/package/@plateforme-ai/lobster) |
 
 ## Example of Lobster at work
 OpenClaw (or any other AI agent) can use `lobster` as a workflow engine and avoid re-planning every step — saving tokens while improving determinism and resumability.
