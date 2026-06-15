@@ -1,6 +1,6 @@
 {
   "name": "@plateforme-ai/lobster",
-  "version": "2026.6.14",
+  "version": "2026.6.15",
   "description": "Workflow runtime for AI agents - deterministic pipelines with approval gates",
   "keywords": [
     "ai-agent",
