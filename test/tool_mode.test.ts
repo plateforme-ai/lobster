@@ -13,7 +13,7 @@ function streamOf(items) {
 test("approve halts pipeline in tool mode", async () => {
   const registry = createDefaultRegistry();
   const pipeline = parsePipeline(
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{a:1}]))'\" | approve --prompt 'send?' | exec --shell 'exit 1'",
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "send?" | exec --shell "exit 1"',
   );
 
   const output = await runPipeline({

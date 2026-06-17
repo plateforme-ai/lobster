@@ -20,7 +20,7 @@ test("approval gate returns approvalId alongside resumeToken", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{a:1}]))'\" | approve --prompt 'ok?' | pick a";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "ok?" | pick a';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   assert.equal(first.status, 0);
@@ -42,7 +42,7 @@ test("resume with --id works as alternative to --token", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{b:2}]))'\" | approve --prompt 'ok?' | pick b";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{b:2}]))" | approve --prompt "ok?" | pick b';
 
   // Step 1: Run pipeline, get approval ID
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
@@ -72,7 +72,7 @@ test("resume with --id cancellation works", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{c:3}]))'\" | approve --prompt 'ok?' | pick c";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{c:3}]))" | approve --prompt "ok?" | pick c';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   const firstJson = JSON.parse(first.stdout);
@@ -107,7 +107,7 @@ test("--token resume cleans up orphaned approval index", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{e:5}]))'\" | approve --prompt 'ok?' | pick e";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{e:5}]))" | approve --prompt "ok?" | pick e';
 
   // Step 1: Run pipeline, get both approvalId and resumeToken
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
@@ -140,7 +140,7 @@ test("double-resume with same --id returns clear error", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{f:6}]))'\" | approve --prompt 'ok?' | pick f";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{f:6}]))" | approve --prompt "ok?" | pick f';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   const firstJson = JSON.parse(first.stdout);
@@ -171,7 +171,7 @@ test("backward compat: --token still works when approvalId is present", async ()
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{d:4}]))'\" | approve --prompt 'ok?' | pick d";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{d:4}]))" | approve --prompt "ok?" | pick d';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   const firstJson = JSON.parse(first.stdout);

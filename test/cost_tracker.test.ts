@@ -8,6 +8,10 @@ import { PassThrough } from "node:stream";
 import { CostTracker } from "../src/core/cost_tracker.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
 
+function printLine(text: string) {
+  return `node -e "process.stdout.write('${text}\\n')"`;
+}
+
 test("CostTracker records usage and computes totals", () => {
   const tracker = new CostTracker();
   tracker.recordUsage("step1", "gpt-4o", { inputTokens: 1000, outputTokens: 500 });
@@ -178,7 +182,7 @@ test("workflow result includes _meta.cost when usage is present", async () => {
 
 test("workflow result omits _meta.cost when no usage exists", async () => {
   const { result } = await runWorkflow({
-    steps: [{ id: "plain", command: 'echo "hello"' }],
+    steps: [{ id: "plain", command: printLine("hello") }],
   });
   assert.equal(result.status, "ok");
   assert.equal(result._meta, undefined);
@@ -193,7 +197,7 @@ test("cost_limit warn logs warning and continues", async () => {
         command:
           "node -e \"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}))\"",
       },
-      { id: "after", command: "echo done" },
+      { id: "after", command: printLine("done") },
     ],
   });
   assert.equal(result.status, "ok");

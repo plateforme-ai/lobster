@@ -11,9 +11,11 @@ export function resolveInlineShellCommand({
   const isWindows = platform === "win32";
 
   if (shellOverride) {
+    const shellArgs = buildShellArgs({ shellCommand: shellOverride, command, isWindows });
     return {
       command: shellOverride,
-      argv: buildShellArgs({ shellCommand: shellOverride, command, isWindows }),
+      argv: shellArgs.argv,
+      windowsVerbatimArguments: shellArgs.windowsVerbatimArguments,
     };
   }
 
@@ -21,7 +23,8 @@ export function resolveInlineShellCommand({
     const comspec = String(env?.ComSpec ?? env?.COMSPEC ?? "cmd.exe").trim() || "cmd.exe";
     return {
       command: comspec,
-      argv: ["/d", "/s", "/c", command],
+      argv: ["/d", "/c", command],
+      windowsVerbatimArguments: true,
     };
   }
 
@@ -30,6 +33,7 @@ export function resolveInlineShellCommand({
   return {
     command: shell,
     argv: ["-lc", command],
+    windowsVerbatimArguments: false,
   };
 }
 
@@ -51,10 +55,10 @@ function buildShellArgs({
     lowered.endsWith("pwsh.exe");
 
   if (looksLikePowerShell) {
-    return ["-NoProfile", "-Command", command];
+    return { argv: ["-NoProfile", "-Command", command], windowsVerbatimArguments: false };
   }
   if (looksLikeCmd || isWindows) {
-    return ["/d", "/s", "/c", command];
+    return { argv: ["/d", "/c", command], windowsVerbatimArguments: true };
   }
-  return ["-lc", command];
+  return { argv: ["-lc", command], windowsVerbatimArguments: false };
 }

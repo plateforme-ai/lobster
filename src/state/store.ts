@@ -60,6 +60,24 @@ async function syncParentDir(filePath: string) {
   await syncDirectory(path.dirname(filePath));
 }
 
+async function renameWithRetry(renameFile: typeof fsp.rename, from: string, to: string) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await renameFile(from, to);
+      return;
+    } catch (err) {
+      if (
+        process.platform !== "win32" ||
+        !["EACCES", "EPERM"].includes(err?.code) ||
+        attempt >= 20
+      ) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
 async function syncDirectory(dir: string) {
   let handle;
   try {
@@ -164,7 +182,7 @@ export async function writeFileAtomic(filePath, data, options: AtomicWriteOption
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await renameFile(tmpPath, filePath);
+    await renameWithRetry(renameFile, tmpPath, filePath);
     await syncDir(filePath);
     cleanup = false;
   } finally {

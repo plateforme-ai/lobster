@@ -19,11 +19,12 @@ import { resolveInlineShellCommand } from "../../shell.js";
  * @param {Object} options
  * @returns {Promise<{stdout: string, stderr: string}>}
  */
-function runProcess(command, argv, { env, cwd }) {
+function runProcess(command, argv, { env, cwd, windowsVerbatimArguments = false }) {
   return new Promise<any>((resolve, reject) => {
     const child = spawn(command, argv, {
       env,
       cwd,
+      windowsVerbatimArguments,
       stdio: ["ignore", "pipe", "pipe"],
       shell: false,
     });
@@ -139,7 +140,11 @@ export function exec(cmdString, options: any = {}) {
       if (useShell) {
         // Shell execution
         const shell = resolveInlineShellCommand({ command: cmdString, env });
-        const result = await runProcess(shell.command, shell.argv, { env, cwd });
+        const result = await runProcess(shell.command, shell.argv, {
+          env,
+          cwd,
+          windowsVerbatimArguments: shell.windowsVerbatimArguments,
+        });
         stdout = result.stdout;
       } else {
         // Direct execution

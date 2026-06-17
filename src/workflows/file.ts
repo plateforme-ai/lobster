@@ -2785,6 +2785,7 @@ async function runShellCommand({
       cwd,
       signal,
       killSignal,
+      windowsVerbatimArguments: shell.windowsVerbatimArguments,
       stdio: ["pipe", "pipe", "pipe"],
     });
 

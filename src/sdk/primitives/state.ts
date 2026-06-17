@@ -21,6 +21,29 @@ import os from "node:os";
 import path from "node:path";
 
 /**
+ * Rename a file with retry.
+ * @param {string} from
+ * @param {string} to
+ */
+async function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fsp.rename(from, to);
+      return;
+    } catch (err) {
+      if (
+        process.platform !== "win32" ||
+        !["EACCES", "EPERM"].includes(err?.code) ||
+        attempt >= 20
+      ) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+}
+
+/**
  * Write a file atomically (stage to a sibling temp file, fsync, then rename).
  * `rename(2)` is atomic on a single filesystem, so a concurrent reader or a
  * crash never observes a truncated/partial file. Plain `fsp.writeFile`
@@ -51,7 +74,7 @@ async function writeFileAtomic(filePath, data) {
     await handle.close();
     handle = undefined;
     await fsp.chmod(tmpPath, mode);
-    await fsp.rename(tmpPath, filePath);
+    await renameWithRetry(tmpPath, filePath);
     cleanup = false;
   } finally {
     if (handle) await handle.close().catch(() => {});

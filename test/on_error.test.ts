@@ -7,6 +7,10 @@ import path from "node:path";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
 
+function printLine(text: string) {
+  return `node -e "process.stdout.write('${text}\\n')"`;
+}
+
 async function runWorkflow(workflow: unknown) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-onerror-"));
   const stateDir = path.join(tmpDir, "state");
@@ -56,7 +60,7 @@ test("on_error: continue records error and proceeds", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "fail", command: 'node -e "process.exit(1)"', on_error: "continue" },
-      { id: "after", command: 'echo "ran"' },
+      { id: "after", command: printLine("ran") },
     ],
   });
   assert.equal(result.status, "ok");
@@ -94,8 +98,8 @@ test("on_error: continue supports condition branching on error state", async () 
   const result = await runWorkflow({
     steps: [
       { id: "risky", command: 'node -e "process.exit(1)"', on_error: "continue" },
-      { id: "success_path", command: "echo success", when: "$risky.error != true" },
-      { id: "failure_path", command: "echo failure", when: "$risky.error == true" },
+      { id: "success_path", command: printLine("success"), when: "$risky.error != true" },
+      { id: "failure_path", command: printLine("failure"), when: "$risky.error == true" },
     ],
   });
   assert.equal(result.status, "ok");

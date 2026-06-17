@@ -344,7 +344,9 @@ test("llm_task.invoke treats corrupt file cache as a miss and rewrites it atomic
     const cacheFiles = (await readdir(namespaceDir)).filter((name) => name.endsWith(".json"));
     assert.equal(cacheFiles.length, 1);
     const cachePath = path.join(namespaceDir, cacheFiles[0]);
-    assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+    }
     await writeFile(cachePath, '{"items"', "utf8");
 
     const second = await cmd.run({

@@ -21,7 +21,7 @@ test("state-backed resume token roundtrip and resume pipeline continues", async 
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{a:1}]))'\" | approve --prompt 'ok?' | pick a";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "ok?" | pick a';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   assert.equal(first.status, 0);
@@ -61,7 +61,7 @@ test("resume cancellation cleans up pipeline resume state", async () => {
   const stateDir = path.join(tmpDir, "state");
 
   const pipeline =
-    "exec --json --shell \"node -e 'process.stdout.write(JSON.stringify([{a:1}]))'\" | approve --prompt 'ok?' | pick a";
+    'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "ok?" | pick a';
 
   const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
   assert.equal(first.status, 0);

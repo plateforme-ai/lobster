@@ -22,7 +22,7 @@ test("resolveInlineShellCommand uses cmd on Windows", () => {
   });
 
   assert.equal(resolved.command, "C:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(resolved.argv, ["/d", "/s", "/c", "echo hello"]);
+  assert.deepEqual(resolved.argv, ["/d", "/c", "echo hello"]);
 });
 
 test("resolveInlineShellCommand respects powershell override", () => {

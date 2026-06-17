@@ -86,12 +86,13 @@ export const execCommand = {
   },
 };
 
-function runProcess(command, argv, { env, cwd, stdin, signal }) {
+function runProcess(command, argv, { env, cwd, stdin, signal, windowsVerbatimArguments = false }) {
   return new Promise<any>((resolve, reject) => {
     const child = spawn(command, argv, {
       env,
       cwd,
       signal,
+      windowsVerbatimArguments,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -124,7 +125,13 @@ function runProcess(command, argv, { env, cwd, stdin, signal }) {
 
 function runShellLine(commandLine, { env, cwd, stdin, signal }) {
   const shell = resolveInlineShellCommand({ command: commandLine, env });
-  return runProcess(shell.command, shell.argv, { env, cwd, stdin, signal });
+  return runProcess(shell.command, shell.argv, {
+    env,
+    cwd,
+    stdin,
+    signal,
+    windowsVerbatimArguments: shell.windowsVerbatimArguments,
+  });
 }
 
 function encodeStdin(items, mode) {

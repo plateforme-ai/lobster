@@ -1485,7 +1485,7 @@ test("workflow pipeline llm_task.invoke consumes stdin artifacts from previous s
     steps: [
       {
         id: "make_words",
-        run: 'echo "One two three four five six"',
+        run: "node -e \"process.stdout.write('One two three four five six\\n')\"",
       },
       {
         id: "count_words",
@@ -1545,7 +1545,7 @@ test("workflow pipeline steps respect cwd and feed later shell steps via stdout 
     steps: [
       {
         id: "pwd",
-        pipeline: "exec pwd",
+        pipeline: 'exec node -e "process.stdout.write(process.cwd())"',
       },
       {
         id: "capture",

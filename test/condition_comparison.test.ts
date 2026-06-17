@@ -6,6 +6,10 @@ import path from "node:path";
 
 import { runWorkflowFile } from "../src/workflows/file.js";
 
+function printLine(text: string) {
+  return `node -e "process.stdout.write('${text}\\n')"`;
+}
+
 async function runWorkflow(workflow: unknown) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cond-"));
   const stateDir = path.join(tmpDir, "state");
@@ -28,7 +32,7 @@ test("condition > works with numbers", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({count:5}))"' },
-      { id: "check", command: 'echo "big"', when: "$data.json.count > 3" },
+      { id: "check", command: printLine("big"), when: "$data.json.count > 3" },
     ],
   });
   assert.equal(result.status, "ok");
@@ -39,8 +43,8 @@ test("condition > skips when false", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({count:1}))"' },
-      { id: "check", command: 'echo "big"', when: "$data.json.count > 3" },
-      { id: "fallback", command: 'echo "small"' },
+      { id: "check", command: printLine("big"), when: "$data.json.count > 3" },
+      { id: "fallback", command: printLine("small") },
     ],
   });
   assert.equal(result.status, "ok");
@@ -51,7 +55,7 @@ test("condition < works", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:2}))"' },
-      { id: "check", command: 'echo "low"', when: "$data.json.val < 10" },
+      { id: "check", command: printLine("low"), when: "$data.json.val < 10" },
     ],
   });
   assert.equal(result.status, "ok");
@@ -62,7 +66,7 @@ test("condition >= works at boundary", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:5}))"' },
-      { id: "check", command: 'echo "yes"', when: "$data.json.val >= 5" },
+      { id: "check", command: printLine("yes"), when: "$data.json.val >= 5" },
     ],
   });
   assert.equal(result.status, "ok");
@@ -73,7 +77,7 @@ test("condition <= works at boundary", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:5}))"' },
-      { id: "check", command: 'echo "yes"', when: "$data.json.val <= 5" },
+      { id: "check", command: printLine("yes"), when: "$data.json.val <= 5" },
     ],
   });
   assert.equal(result.status, "ok");
@@ -84,7 +88,11 @@ test("comparison operators combine with boolean operators", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({a:5,b:20}))"' },
-      { id: "check", command: 'echo "in range"', when: "$data.json.a >= 1 && $data.json.b < 100" },
+      {
+        id: "check",
+        command: printLine("in range"),
+        when: "$data.json.a >= 1 && $data.json.b < 100",
+      },
     ],
   });
   assert.equal(result.status, "ok");
@@ -95,8 +103,8 @@ test("comparison with non-numeric string returns false", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:\\"hello\\"}))"' },
-      { id: "check", command: 'echo "yes"', when: "$data.json.val > 3" },
-      { id: "fallback", command: 'echo "no"' },
+      { id: "check", command: printLine("yes"), when: "$data.json.val > 3" },
+      { id: "fallback", command: printLine("no") },
     ],
   });
   assert.equal(result.status, "ok");
@@ -107,8 +115,8 @@ test("comparison rejects boolean as non-numeric", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:true}))"' },
-      { id: "check", command: 'echo "yes"', when: "$data.json.val > 0" },
-      { id: "fallback", command: 'echo "no"' },
+      { id: "check", command: printLine("yes"), when: "$data.json.val > 0" },
+      { id: "fallback", command: printLine("no") },
     ],
   });
   assert.equal(result.status, "ok");
@@ -119,8 +127,8 @@ test("comparison rejects null as non-numeric", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:null}))"' },
-      { id: "check", command: 'echo "yes"', when: "$data.json.val >= 0" },
-      { id: "fallback", command: 'echo "no"' },
+      { id: "check", command: printLine("yes"), when: "$data.json.val >= 0" },
+      { id: "fallback", command: printLine("no") },
     ],
   });
   assert.equal(result.status, "ok");
@@ -131,7 +139,7 @@ test("existing == and != still work with new operators", async () => {
   const result = await runWorkflow({
     steps: [
       { id: "data", command: 'node -e "process.stdout.write(JSON.stringify({status:\\"ok\\"}))"' },
-      { id: "check", command: 'echo "good"', when: '$data.json.status == "ok"' },
+      { id: "check", command: printLine("good"), when: '$data.json.status == "ok"' },
     ],
   });
   assert.equal(result.status, "ok");

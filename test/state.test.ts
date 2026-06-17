@@ -132,12 +132,16 @@ test("writeFileAtomic creates private files and preserves existing modes", async
   const existingPath = path.join(tmp, "existing.json");
 
   await writeFileAtomic(freshPath, '{"ok":true}\n');
-  assert.equal((await fsp.stat(freshPath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await fsp.stat(freshPath)).mode & 0o777, 0o600);
+  }
 
   await fsp.writeFile(existingPath, '{"old":true}\n', { mode: 0o640 });
   await fsp.chmod(existingPath, 0o640);
   await writeFileAtomic(existingPath, '{"ok":true}\n');
-  assert.equal((await fsp.stat(existingPath)).mode & 0o777, 0o640);
+  if (process.platform !== "win32") {
+    assert.equal((await fsp.stat(existingPath)).mode & 0o777, 0o640);
+  }
 });
 
 test("writeFileAtomic removes temp files when replacement fails", async () => {
@@ -204,7 +208,9 @@ test("writeFileAtomicExclusive creates private files without replacing existing 
   const target = path.join(tmp, "approval_deadbeef.json");
 
   await writeFileAtomicExclusive(target, '{"stateKey":"original"}\n');
-  assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
+  }
 
   await assert.rejects(
     () => writeFileAtomicExclusive(target, '{"stateKey":"replacement"}\n'),
@@ -411,7 +417,9 @@ test("SDK writeState preserves restricted state-file mode", async () => {
 
   await writeState("sdk-state", { ok: true }, ctx);
 
-  assert.equal((await fsp.stat(filePath)).mode & 0o777, 0o600);
+  if (process.platform !== "win32") {
+    assert.equal((await fsp.stat(filePath)).mode & 0o777, 0o600);
+  }
   assert.deepEqual(await readState("sdk-state", ctx), { ok: true });
 });
 

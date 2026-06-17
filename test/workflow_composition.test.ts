@@ -199,7 +199,7 @@ test("indirect cycle is detected", async () => {
 test("sub-workflow string output remains raw in stdout", async () => {
   const { stateDir, paths } = await setupWorkflows({
     "child.lobster": {
-      steps: [{ id: "out", command: 'echo "plain text"' }],
+      steps: [{ id: "out", command: "node -e \"process.stdout.write('plain text\\n')\"" }],
     },
     "parent.lobster": {
       steps: [

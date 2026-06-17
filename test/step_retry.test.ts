@@ -216,6 +216,7 @@ test("step retries and succeeds after transient failure", async () => {
   // Script that fails twice then succeeds on third run using a counter file
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-retry-"));
   const counterFile = path.join(tmpDir, "counter");
+  const counterPathLiteral = JSON.stringify(counterFile).replaceAll('"', "'");
   await fsp.writeFile(counterFile, "0", "utf8");
 
   const workflow = {
@@ -223,7 +224,7 @@ test("step retries and succeeds after transient failure", async () => {
     steps: [
       {
         id: "flaky",
-        command: `node -e "const fs=require('fs');const c=Number(fs.readFileSync('${counterFile}','utf8'))+1;fs.writeFileSync('${counterFile}',String(c));if(c<3){process.exit(1);}process.stdout.write(JSON.stringify({attempt:c}))"`,
+        command: `node -e "const fs=require('fs');const file=${counterPathLiteral};const c=Number(fs.readFileSync(file,'utf8'))+1;fs.writeFileSync(file,String(c));if(c<3){process.exit(1);}process.stdout.write(JSON.stringify({attempt:c}))"`,
         retry: { max: 3, delay_ms: 50 },
       },
     ],
@@ -242,6 +243,7 @@ test("step with timeout_ms + retry retries on per-attempt timeout (issue #105)",
   // any AbortError, so retry.max was inert for timed-out steps and this ran once.
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-retry-"));
   const counterFile = path.join(tmpDir, "counter");
+  const counterPathLiteral = JSON.stringify(counterFile).replaceAll('"', "'");
   await fsp.writeFile(counterFile, "0", "utf8");
 
   // The counter is incremented synchronously before the hang, so each timed-out
@@ -253,7 +255,7 @@ test("step with timeout_ms + retry retries on per-attempt timeout (issue #105)",
     steps: [
       {
         id: "slow",
-        command: `node -e "const fs=require('fs');const c=Number(fs.readFileSync('${counterFile}','utf8'))+1;fs.writeFileSync('${counterFile}',String(c));if(c<3){setTimeout(()=>{},6000);}else{process.stdout.write(JSON.stringify({attempt:c}));}"`,
+        command: `node -e "const fs=require('fs');const file=${counterPathLiteral};const c=Number(fs.readFileSync(file,'utf8'))+1;fs.writeFileSync(file,String(c));if(c<3){setTimeout(()=>{},6000);}else{process.stdout.write(JSON.stringify({attempt:c}));}"`,
         timeout_ms: 3000,
         retry: { max: 3, delay_ms: 50 },
       },
