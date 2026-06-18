@@ -6,6 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { decodeResumeToken } from "../src/resume.js";
 
 async function setupWorkflows(files: Record<string, unknown>) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-compose-"));
@@ -276,7 +277,7 @@ test("nested workflow composition works", async () => {
   assert.deepEqual(result.output, [{ middle: true, leaf: true }]);
 });
 
-test("sub-workflow approval gates are rejected in composition", async () => {
+test("sub-workflow approval gates bubble up and resume parent composition", async () => {
   const { stateDir, paths } = await setupWorkflows({
     "child.lobster": {
       steps: [
@@ -292,8 +293,187 @@ test("sub-workflow approval gates are rejected in composition", async () => {
     },
   });
 
-  await assert.rejects(
-    () => runWorkflow(paths["parent.lobster"], stateDir),
-    /Sub-workflow approval\/input gates are not supported in composition/,
-  );
+  const first = await runWorkflow(paths["parent.lobster"], stateDir);
+  assert.equal(first.status, "needs_approval");
+  assert.equal(first.requiresApproval?.prompt, "Approve x?");
+  assert.ok(first.requiresApproval?.resumeToken);
+
+  const resume = decodeResumeToken(first.requiresApproval.resumeToken);
+  assert.equal(resume.kind, "workflow-file");
+  const resumed = await runWorkflowFile({
+    filePath: paths["parent.lobster"],
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      mode: "tool",
+    },
+    resume,
+    approved: true,
+  });
+  assert.equal(resumed.status, "ok");
+  assert.deepEqual(resumed.output, [{ v: 1 }]);
+});
+
+test("sub-workflow approval reject cancels parent composition", async () => {
+  const { stateDir, paths } = await setupWorkflows({
+    "child.lobster": {
+      steps: [
+        {
+          id: "x",
+          command: 'node -e "process.stdout.write(JSON.stringify({v:1}))"',
+          approval: true,
+        },
+      ],
+    },
+    "parent.lobster": {
+      steps: [{ id: "sub", workflow: "child.lobster" }],
+    },
+  });
+
+  const first = await runWorkflow(paths["parent.lobster"], stateDir);
+  assert.equal(first.status, "needs_approval");
+  const resume = decodeResumeToken(first.requiresApproval!.resumeToken!);
+  assert.equal(resume.kind, "workflow-file");
+
+  const rejected = await runWorkflowFile({
+    filePath: paths["parent.lobster"],
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      mode: "tool",
+    },
+    resume,
+    approved: false,
+  });
+  assert.equal(rejected.status, "cancelled");
+});
+
+test("two-level nested approval bubbles up through both parents and resumes", async () => {
+  const { stateDir, paths } = await setupWorkflows({
+    "leaf.lobster": {
+      steps: [
+        {
+          id: "x",
+          command: 'node -e "process.stdout.write(JSON.stringify({v:1}))"',
+          approval: true,
+        },
+      ],
+    },
+    "middle.lobster": {
+      steps: [{ id: "callLeaf", workflow: "leaf.lobster" }],
+    },
+    "top.lobster": {
+      steps: [{ id: "callMiddle", workflow: "middle.lobster" }],
+    },
+  });
+
+  const first = await runWorkflow(paths["top.lobster"], stateDir);
+  assert.equal(first.status, "needs_approval");
+  assert.equal(first.requiresApproval?.prompt, "Approve x?");
+  assert.ok(first.requiresApproval?.resumeToken);
+
+  const resume = decodeResumeToken(first.requiresApproval!.resumeToken!);
+  assert.equal(resume.kind, "workflow-file");
+
+  const resumed = await runWorkflowFile({
+    filePath: paths["top.lobster"],
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      mode: "tool",
+    },
+    resume,
+    approved: true,
+  });
+  assert.equal(resumed.status, "ok");
+  assert.deepEqual(resumed.output, [{ v: 1 }]);
+});
+
+test("two-level nested approval reject cancels the whole composition", async () => {
+  const { stateDir, paths } = await setupWorkflows({
+    "leaf.lobster": {
+      steps: [
+        {
+          id: "x",
+          command: 'node -e "process.stdout.write(JSON.stringify({v:1}))"',
+          approval: true,
+        },
+      ],
+    },
+    "middle.lobster": {
+      steps: [{ id: "callLeaf", workflow: "leaf.lobster" }],
+    },
+    "top.lobster": {
+      steps: [{ id: "callMiddle", workflow: "middle.lobster" }],
+    },
+  });
+
+  const first = await runWorkflow(paths["top.lobster"], stateDir);
+  assert.equal(first.status, "needs_approval");
+  const resume = decodeResumeToken(first.requiresApproval!.resumeToken!);
+  assert.equal(resume.kind, "workflow-file");
+
+  const rejected = await runWorkflowFile({
+    filePath: paths["top.lobster"],
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      mode: "tool",
+    },
+    resume,
+    approved: false,
+  });
+  assert.equal(rejected.status, "cancelled");
+});
+
+test("sub-workflow input gates bubble up and resume parent composition", async () => {
+  const { stateDir, paths } = await setupWorkflows({
+    "child.lobster": {
+      steps: [
+        {
+          id: "ask",
+          input: {
+            prompt: "Child value?",
+            responseSchema: {
+              type: "object",
+              properties: { value: { type: "string" } },
+              required: ["value"],
+            },
+          },
+        },
+      ],
+    },
+    "parent.lobster": {
+      steps: [{ id: "sub", workflow: "child.lobster" }],
+    },
+  });
+
+  const first = await runWorkflow(paths["parent.lobster"], stateDir);
+  assert.equal(first.status, "needs_input");
+  assert.equal(first.requiresInput?.prompt, "Child value?");
+  const resume = decodeResumeToken(first.requiresInput!.resumeToken!);
+  assert.equal(resume.kind, "workflow-file");
+
+  const resumed = await runWorkflowFile({
+    filePath: paths["parent.lobster"],
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      mode: "tool",
+    },
+    resume,
+    response: { value: "ok" },
+  });
+  assert.equal(resumed.status, "ok");
+  assert.deepEqual(resumed.output, [{ value: "ok" }]);
 });

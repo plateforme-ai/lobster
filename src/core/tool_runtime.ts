@@ -18,6 +18,23 @@ import {
   loadPipelineResumeState,
   validatePipelineInputResponse,
 } from "../pipeline_resume_state.js";
+import {
+  checkpointsEnabled,
+  createCheckpointRun,
+  createRun,
+  getCheckpoint as getStoredCheckpoint,
+  getJob as getStoredJob,
+  getRun as getStoredRun,
+  listJobCheckpoints as listStoredJobCheckpoints,
+  listJobRuns as listStoredJobRuns,
+  listJobs as listStoredJobs,
+  listPendingApprovals as listStoredPendingApprovals,
+  listRunCheckpoints as listStoredRunCheckpoints,
+  getCheckpointIO as getStoredCheckpointIO,
+  resolveApprovalRecord,
+  updateRun,
+} from "../store/runtime_store.js";
+import type { WorkflowExecutionContext } from "../checkpoints/types.js";
 
 type ToolRunContext = {
   cwd?: string;
@@ -36,6 +53,12 @@ type ToolEnvelope = {
   ok: boolean;
   status?: "ok" | "needs_approval" | "needs_input" | "cancelled";
   output?: unknown[];
+  jobId?: string;
+  runId?: string;
+  rootRunId?: string;
+  parentRunId?: string | null;
+  checkpointId?: string | null;
+  latestCheckpointId?: string | null;
   requiresApproval?: {
     type?: "approval_request";
     prompt: string;
@@ -63,13 +86,21 @@ export async function runToolRequest({
   filePath,
   args,
   ctx = {},
+  lineage = {},
 }: {
   pipeline?: string;
   filePath?: string;
   args?: Record<string, unknown>;
   ctx?: ToolRunContext;
+  lineage?: {
+    parentRunId?: string | null;
+    rerunOfJobId?: string | null;
+    rewindOfJobId?: string | null;
+    rewindOfCheckpointId?: string | null;
+  };
 }): Promise<ToolEnvelope> {
   const runtime = createToolContext(ctx);
+  let checkpointRun: WorkflowExecutionContext | undefined;
   const hasPipeline = typeof pipeline === "string" && pipeline.trim().length > 0;
   const hasFile = typeof filePath === "string" && filePath.trim().length > 0;
 
@@ -89,23 +120,41 @@ export async function runToolRequest({
     }
 
     try {
+      checkpointRun = await maybeCreateRun({
+        runtime,
+        sourceType: "workflow_file",
+        workflowFile: resolvedFilePath,
+        args,
+        lineage,
+      });
       const output = await runWorkflowFile({
         filePath: resolvedFilePath,
         args,
-        ctx: runtime,
+        ctx: { ...runtime, checkpointRun },
       });
 
       if (output.status === "needs_approval") {
-        return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null);
+        await maybeUpdateRun(runtime, checkpointRun, "waiting");
+        return okEnvelope(
+          "needs_approval",
+          [],
+          output.requiresApproval ?? null,
+          null,
+          checkpointRun,
+        );
       }
       if (output.status === "needs_input") {
-        return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
+        await maybeUpdateRun(runtime, checkpointRun, "waiting");
+        return okEnvelope("needs_input", [], null, output.requiresInput ?? null, checkpointRun);
       }
       if (output.status === "cancelled") {
-        return okEnvelope("cancelled", [], null, null);
+        await maybeUpdateRun(runtime, checkpointRun, "cancelled");
+        return okEnvelope("cancelled", [], null, null, checkpointRun);
       }
-      return okEnvelope("ok", output.output, null, null);
+      await maybeUpdateRun(runtime, checkpointRun, "succeeded", output.output);
+      return okEnvelope("ok", output.output, null, null, checkpointRun);
     } catch (err: any) {
+      await maybeUpdateRun(runtime, checkpointRun, "failed");
       return errorEnvelope("runtime_error", err?.message ?? String(err));
     }
   }
@@ -118,6 +167,13 @@ export async function runToolRequest({
   }
 
   try {
+    checkpointRun = await maybeCreateRun({
+      runtime,
+      sourceType: "pipeline",
+      pipelineText: String(pipeline),
+      args,
+      lineage,
+    });
     const output = await runPipeline({
       pipeline: parsed,
       registry: runtime.registry,
@@ -130,20 +186,30 @@ export async function runToolRequest({
       cwd: runtime.cwd,
       llmAdapters: runtime.llmAdapters,
       signal: runtime.signal,
+      checkpointRun,
     });
 
     const finalized = await finalizePipelineToolRun({
       env: runtime.env,
       pipeline: parsed,
       output,
+      checkpointRun,
     });
+    await maybeUpdateRun(
+      runtime,
+      checkpointRun,
+      finalized.status === "ok" ? "succeeded" : "waiting",
+      finalized.output,
+    );
     return okEnvelope(
       finalized.status,
       finalized.output,
       finalized.requiresApproval,
       finalized.requiresInput,
+      checkpointRun,
     );
   } catch (err: any) {
+    await maybeUpdateRun(runtime, checkpointRun, "failed");
     return errorEnvelope("runtime_error", err?.message ?? String(err));
   }
 }
@@ -203,6 +269,13 @@ export async function resumeToolRequest({
 
   if (cancel === true) {
     await cleanupIndex();
+    await resolveApprovalRecord({
+      env: runtime.env,
+      approvalId: resolvedApprovalId,
+      stateKey: payload?.stateKey,
+      status: "cancelled",
+      decision: "cancelled",
+    });
     if (payload.kind === "workflow-file" && payload.stateKey) {
       await deleteStateJson({ env: runtime.env, key: payload.stateKey });
     }
@@ -214,9 +287,12 @@ export async function resumeToolRequest({
 
   if (payload.kind === "workflow-file") {
     try {
+      const loadedRun = payload.stateKey
+        ? await loadWorkflowRunContext(runtime.env, payload.stateKey)
+        : undefined;
       const output = await runWorkflowFile({
         filePath: payload.filePath,
-        ctx: runtime,
+        ctx: { ...runtime, checkpointRun: loadedRun },
         resume: payload,
         approved,
         response,
@@ -225,16 +301,34 @@ export async function resumeToolRequest({
 
       if (output.status === "needs_approval") {
         // Don't clean up index — next gate will issue a new approvalId
-        return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null);
+        await maybeUpdateRun(runtime, loadedRun, "waiting");
+        return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null, loadedRun);
       }
       if (output.status === "needs_input") {
-        return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
+        await maybeUpdateRun(runtime, loadedRun, "waiting");
+        return okEnvelope("needs_input", [], null, output.requiresInput ?? null, loadedRun);
       }
       await cleanupIndex();
+      await resolveApprovalRecord({
+        env: runtime.env,
+        approvalId: resolvedApprovalId,
+        stateKey: payload.stateKey,
+        status:
+          approved === false
+            ? "rejected"
+            : output.status === "cancelled"
+              ? "cancelled"
+              : "approved",
+        decision:
+          approved === false ? "reject" : output.status === "cancelled" ? "cancelled" : "approve",
+        approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
+      });
       if (output.status === "cancelled") {
-        return okEnvelope("cancelled", [], null, null);
+        await maybeUpdateRun(runtime, loadedRun, "cancelled");
+        return okEnvelope("cancelled", [], null, null, loadedRun);
       }
-      return okEnvelope("ok", output.output, null, null);
+      await maybeUpdateRun(runtime, loadedRun, "succeeded", output.output);
+      return okEnvelope("ok", output.output, null, null, loadedRun);
     } catch (err: any) {
       if (err instanceof WorkflowResumeArgumentError) {
         return errorEnvelope("parse_error", err.message);
@@ -250,6 +344,15 @@ export async function resumeToolRequest({
   } catch (err: any) {
     return errorEnvelope("runtime_error", err?.message ?? String(err));
   }
+  const pipelineCheckpointRun = resumeState.runId
+    ? createCheckpointRun(resumeState.runId, {
+        jobId: resumeState.jobId,
+        rootRunId: resumeState.rootRunId,
+        parentRunId: resumeState.parentRunId,
+        stepPathPrefix: resumeState.stepPathPrefix,
+        depth: resumeState.depth,
+      })
+    : undefined;
 
   if (resumeState.haltType === "input_request") {
     if (approved !== undefined) {
@@ -273,7 +376,15 @@ export async function resumeToolRequest({
     if (approved !== true) {
       await cleanupIndex();
       await deleteStateJson({ env: runtime.env, key: payload.stateKey });
-      return okEnvelope("cancelled", [], null, null);
+      await resolveApprovalRecord({
+        env: runtime.env,
+        approvalId: resolvedApprovalId,
+        stateKey: payload.stateKey,
+        status: "rejected",
+        decision: "reject",
+      });
+      await maybeUpdateRun(runtime, pipelineCheckpointRun, "cancelled");
+      return okEnvelope("cancelled", [], null, null, pipelineCheckpointRun);
     }
   }
 
@@ -310,20 +421,37 @@ export async function resumeToolRequest({
       signal: runtime.signal,
       input,
       requestInputResume,
+      checkpointRun: pipelineCheckpointRun,
     });
 
     await cleanupIndex();
+    await resolveApprovalRecord({
+      env: runtime.env,
+      approvalId: resolvedApprovalId,
+      stateKey: payload.stateKey,
+      status: approved === true ? "approved" : "cancelled",
+      decision: approved === true ? "approve" : response !== undefined ? "response" : null,
+      approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
+    });
     const finalized = await finalizePipelineToolRun({
       env: runtime.env,
       pipeline: remaining,
       output,
       previousStateKey: payload.stateKey,
+      checkpointRun: pipelineCheckpointRun,
     });
+    await maybeUpdateRun(
+      runtime,
+      pipelineCheckpointRun,
+      finalized.status === "ok" ? "succeeded" : "waiting",
+      finalized.output,
+    );
     return okEnvelope(
       finalized.status,
       finalized.output,
       finalized.requiresApproval,
       finalized.requiresInput,
+      pipelineCheckpointRun,
     );
   } catch (err: any) {
     // Don't clean up index on error — allow retry by --id
@@ -358,12 +486,22 @@ function okEnvelope(
   output: unknown[],
   requiresApproval: ToolEnvelope["requiresApproval"],
   requiresInput: ToolEnvelope["requiresInput"],
+  checkpointRun?: WorkflowExecutionContext,
 ) {
   return {
     protocolVersion: 1 as const,
     ok: true,
     status,
     output,
+    ...(checkpointRun
+      ? {
+          jobId: checkpointRun.jobId,
+          runId: checkpointRun.runId,
+          rootRunId: checkpointRun.rootRunId,
+          parentRunId: checkpointRun.parentRunId ?? null,
+          latestCheckpointId: checkpointRun.latestCheckpointId ?? null,
+        }
+      : null),
     requiresApproval,
     requiresInput,
   };
@@ -387,4 +525,267 @@ async function resolveWorkflowFile(candidate: string, cwd: string) {
     throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
   }
   return resolved;
+}
+
+export async function getJob(params: { jobId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return getStoredJob(runtime.env, params.jobId);
+}
+
+export async function getRun(params: { runId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return getStoredRun(runtime.env, params.runId);
+}
+
+export async function listJobs(params: {
+  status?: "running" | "waiting" | "succeeded" | "failed" | "cancelled";
+  limit?: number;
+  cursor?: string | null;
+  ctx?: ToolRunContext;
+}) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredJobs({
+    env: runtime.env,
+    status: params.status,
+    limit: params.limit,
+    cursor: params.cursor,
+  });
+}
+
+export async function listJobRuns(params: { jobId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredJobRuns({ env: runtime.env, jobId: params.jobId });
+}
+
+export async function listPendingApprovals(params: {
+  jobId?: string | null;
+  runId?: string | null;
+  limit?: number;
+  cursor?: string | null;
+  ctx?: ToolRunContext;
+}) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredPendingApprovals({
+    env: runtime.env,
+    jobId: params.jobId,
+    runId: params.runId,
+    limit: params.limit,
+    cursor: params.cursor,
+  });
+}
+
+export async function listRunCheckpoints(params: { runId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredRunCheckpoints({ env: runtime.env, runId: params.runId });
+}
+
+export async function listJobCheckpoints(params: { jobId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredJobCheckpoints({ env: runtime.env, jobId: params.jobId });
+}
+
+export async function getCheckpointIO(params: { checkpointId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return getStoredCheckpointIO({ env: runtime.env, checkpointId: params.checkpointId });
+}
+
+export async function getCheckpoint(params: { checkpointId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return getStoredCheckpoint({ env: runtime.env, checkpointId: params.checkpointId });
+}
+
+export async function rerunToolRequest({
+  jobId,
+  argsPatch,
+  inputOverride,
+  ctx = {},
+}: {
+  jobId: string;
+  argsPatch?: Record<string, unknown>;
+  inputOverride?: unknown;
+  ctx?: ToolRunContext;
+}) {
+  void inputOverride;
+  const runtime = createToolContext(ctx);
+  const job = await getStoredJob(runtime.env, jobId);
+  if (!job?.rootRunId) return errorEnvelope("not_found", `Job "${jobId}" not found`);
+  const run = await getStoredRun(runtime.env, job.rootRunId);
+  if (!run) return errorEnvelope("not_found", `Root run for job "${jobId}" not found`);
+  const args = mergePatch(run.args, argsPatch);
+  if (run.sourceType === "workflow_file" && run.workflowFile) {
+    return runToolRequest({
+      filePath: run.workflowFile,
+      args,
+      ctx,
+      lineage: { rerunOfJobId: job.jobId },
+    });
+  }
+  if (run.sourceType === "pipeline" && run.pipelineText) {
+    return runToolRequest({
+      pipeline: run.pipelineText,
+      args,
+      ctx,
+      lineage: { rerunOfJobId: job.jobId },
+    });
+  }
+  return errorEnvelope(
+    "replay_not_supported",
+    "Run does not contain replayable workflow or pipeline source",
+  );
+}
+
+export async function rewindToolRequest({
+  jobId,
+  checkpointId,
+  argsPatch,
+  inputOverride,
+  envPatch,
+  ctx = {},
+}: {
+  jobId: string;
+  checkpointId: string;
+  argsPatch?: Record<string, unknown>;
+  inputOverride?: unknown;
+  envPatch?: Record<string, string | undefined>;
+  ctx?: ToolRunContext;
+}) {
+  void inputOverride;
+  const runtime = createToolContext({ ...ctx, env: { ...ctx.env, ...envPatch } });
+  const job = await getStoredJob(runtime.env, jobId);
+  if (!job?.rootRunId) return errorEnvelope("not_found", `Job "${jobId}" not found`);
+  const run = await getStoredRun(runtime.env, job.rootRunId);
+  if (!run) return errorEnvelope("not_found", `Root run for job "${jobId}" not found`);
+  const checkpoint = await getStoredCheckpoint({ env: runtime.env, checkpointId });
+  if (!checkpoint || checkpoint.jobId !== jobId) {
+    return errorEnvelope("not_found", `Checkpoint "${checkpointId}" not found for job "${jobId}"`);
+  }
+  const targetRun =
+    checkpoint.runId === run.runId ? run : await getStoredRun(runtime.env, checkpoint.runId);
+  if (!targetRun) {
+    return errorEnvelope("not_found", `Run "${checkpoint.runId}" not found for checkpoint`);
+  }
+  if (targetRun.sourceType !== "workflow_file" || !targetRun.workflowFile) {
+    return errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only");
+  }
+  const metadata = checkpoint.metadata as any;
+  if (!metadata?.resultsSnapshot || typeof checkpoint.stepIndex !== "number") {
+    return errorEnvelope(
+      "replay_not_supported",
+      "Checkpoint does not contain workflow replay state",
+    );
+  }
+  const checkpointRun = await createRun({
+    env: runtime.env,
+    sourceType: "workflow_file",
+    workflowFile: targetRun.workflowFile,
+    args: mergePatch(targetRun.args, argsPatch),
+    rewindOfJobId: job.jobId,
+    rewindOfCheckpointId: checkpoint.checkpointId,
+  });
+  try {
+    const output = await runWorkflowFile({
+      filePath: targetRun.workflowFile,
+      ctx: { ...runtime, checkpointRun },
+      resume: {
+        protocolVersion: 1,
+        v: 1,
+        kind: "workflow-file",
+        filePath: targetRun.workflowFile,
+        resumeAtIndex:
+          checkpoint.status === "succeeded" || checkpoint.status === "skipped"
+            ? checkpoint.stepIndex + 1
+            : checkpoint.stepIndex,
+        steps: metadata.resultsSnapshot,
+        args: mergePatch(targetRun.args, argsPatch),
+      },
+    });
+    if (output.status === "needs_approval") {
+      await maybeUpdateRun(runtime, checkpointRun, "waiting");
+      return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null, checkpointRun);
+    }
+    if (output.status === "needs_input") {
+      await maybeUpdateRun(runtime, checkpointRun, "waiting");
+      return okEnvelope("needs_input", [], null, output.requiresInput ?? null, checkpointRun);
+    }
+    if (output.status === "cancelled") {
+      await maybeUpdateRun(runtime, checkpointRun, "cancelled");
+      return okEnvelope("cancelled", [], null, null, checkpointRun);
+    }
+    await maybeUpdateRun(runtime, checkpointRun, "succeeded", output.output);
+    return okEnvelope("ok", output.output, null, null, checkpointRun);
+  } catch (err: any) {
+    await maybeUpdateRun(runtime, checkpointRun, "failed");
+    return errorEnvelope("runtime_error", err?.message ?? String(err));
+  }
+}
+
+async function maybeCreateRun(params: {
+  runtime: ReturnType<typeof createToolContext>;
+  sourceType: "workflow_file" | "pipeline";
+  workflowFile?: string;
+  pipelineText?: string;
+  args?: unknown;
+  lineage?: {
+    parentRunId?: string | null;
+    rerunOfJobId?: string | null;
+    rewindOfJobId?: string | null;
+    rewindOfCheckpointId?: string | null;
+  };
+}) {
+  const hasLineage = Boolean(
+    params.lineage?.parentRunId ||
+    params.lineage?.rerunOfJobId ||
+    params.lineage?.rewindOfJobId ||
+    params.lineage?.rewindOfCheckpointId,
+  );
+  if (!checkpointsEnabled(params.runtime.env) && !hasLineage) return undefined;
+  return createRun({
+    env: params.runtime.env,
+    sourceType: params.sourceType,
+    workflowFile: params.workflowFile,
+    pipelineText: params.pipelineText,
+    args: params.args,
+    rerunOfJobId: params.lineage?.rerunOfJobId,
+    rewindOfJobId: params.lineage?.rewindOfJobId,
+    rewindOfCheckpointId: params.lineage?.rewindOfCheckpointId,
+  });
+}
+
+async function maybeUpdateRun(
+  runtime: ReturnType<typeof createToolContext>,
+  checkpointRun: WorkflowExecutionContext | undefined,
+  status: "running" | "waiting" | "succeeded" | "failed" | "cancelled",
+  finalOutput?: unknown,
+) {
+  if (!checkpointRun) return;
+  await updateRun({
+    env: runtime.env,
+    runId: checkpointRun.runId,
+    status,
+    latestCheckpointId: checkpointRun.latestCheckpointId ?? null,
+    finalOutput,
+  });
+}
+
+async function loadWorkflowRunContext(
+  env: Record<string, string | undefined>,
+  stateKey: string,
+): Promise<WorkflowExecutionContext | undefined> {
+  const { readStateJson } = await import("../state/store.js");
+  const stored = await readStateJson({ env, key: stateKey }).catch(() => null);
+  const runId = typeof stored?.runId === "string" ? stored.runId : null;
+  return runId
+    ? createCheckpointRun(runId, {
+        jobId: typeof stored?.jobId === "string" ? stored.jobId : runId,
+        rootRunId: typeof stored?.rootRunId === "string" ? stored.rootRunId : runId,
+        parentRunId: typeof stored?.parentRunId === "string" ? stored.parentRunId : null,
+        stepPathPrefix: typeof stored?.stepPathPrefix === "string" ? stored.stepPathPrefix : "root",
+        depth: typeof stored?.depth === "number" ? stored.depth : 0,
+      })
+    : undefined;
+}
+
+function mergePatch(base: unknown, patch: Record<string, unknown> | undefined) {
+  const baseObj = base && typeof base === "object" && !Array.isArray(base) ? base : {};
+  return { ...(baseObj as Record<string, unknown>), ...patch };
 }

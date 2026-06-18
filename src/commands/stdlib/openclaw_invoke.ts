@@ -85,6 +85,12 @@ function createInvokeCommand(commandName: string) {
           headers: {
             "content-type": "application/json",
             ...(token ? { authorization: `Bearer ${token}` } : null),
+            ...(ctx.checkpointRun?.runId
+              ? { "x-lobster-run-id": String(ctx.checkpointRun.runId) }
+              : null),
+            ...(ctx.checkpointRun?.latestCheckpointId
+              ? { "x-lobster-checkpoint-id": String(ctx.checkpointRun.latestCheckpointId) }
+              : null),
           },
           body: JSON.stringify({
             tool: String(tool),

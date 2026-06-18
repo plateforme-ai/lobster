@@ -103,6 +103,29 @@ lobster.cmd 'llm.invoke --prompt "Say hello in one short sentence."'
 
 Expected: no `invalid response envelope` error.
 
+Checkpoint/cache validation:
+
+```powershell
+$env:LOBSTER_CHECKPOINTS_ENABLED="true"
+$env:LOBSTER_STORE="sqlite"
+$env:LOBSTER_STATE_DIR="$PWD\.lobster-state"
+lobster run --mode tool 'exec --json node -e "process.stdout.write(JSON.stringify({ok:true}))"'
+```
+
+Expected: the tool envelope includes a `jobId`, `runId`, and `rootRunId`, and
+`$env:LOBSTER_STATE_DIR\lobster.db` is created. LLM cache entries are stored in
+the same SQLite runtime store with TTL metadata; large payloads are stored under
+`$env:LOBSTER_STATE_DIR\blobs`.
+
+Nested workflow validation should show one `jobId` shared by root and child
+workflow invocations, with a distinct `runId` per invocation and stable
+`stepPath` values such as `root.sub.childStep`.
+
+Dashboard/plugin query validation should use the public `@plateforme-ai/lobster/core`
+APIs (`getJob`, `getRun`, `listJobs`, `listJobRuns`, `listPendingApprovals`) rather
+than importing from internal store modules. These APIs should return pending approvals
+for approval inboxes and root/child runs for nested workflow job detail pages.
+
 Also test the lower-level supported tool path:
 
 ```yaml

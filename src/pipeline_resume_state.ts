@@ -10,8 +10,16 @@ import {
 } from "./state/store.js";
 import { compileCached } from "./validation.js";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
+import type { WorkflowExecutionContext } from "./checkpoints/types.js";
+import { createApprovalRecord } from "./store/runtime_store.js";
 
 export type PipelineResumeState = {
+  jobId?: string;
+  runId?: string;
+  rootRunId?: string;
+  parentRunId?: string | null;
+  stepPathPrefix?: string;
+  depth?: number;
   pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
   resumeAtIndex: number;
   items: unknown[];
@@ -97,11 +105,18 @@ export async function finalizePipelineToolRun(params: {
   pipeline: PipelineResumeState["pipeline"];
   output: PipelineRunOutput;
   previousStateKey?: string;
+  checkpointRun?: WorkflowExecutionContext;
 }): Promise<PipelineToolRunResolution> {
   const { approval, inputRequest } = extractPipelineHalt(params.output);
   if (approval) {
     const nextStateKey = await savePipelineResumeState(params.env, {
       pipeline: params.pipeline,
+      jobId: params.checkpointRun?.jobId,
+      runId: params.checkpointRun?.runId,
+      rootRunId: params.checkpointRun?.rootRunId,
+      parentRunId: params.checkpointRun?.parentRunId,
+      stepPathPrefix: params.checkpointRun?.stepPathPrefix,
+      depth: params.checkpointRun?.depth,
       resumeAtIndex: (params.output.haltedAt?.index ?? -1) + 1,
       items: approval.items,
       haltType: "approval_request",
@@ -118,6 +133,16 @@ export async function finalizePipelineToolRun(params: {
     } catch (err) {
       await deleteStateJson({ env: params.env, key: nextStateKey }).catch(() => {});
       throw err;
+    }
+    if (approvalId) {
+      await createApprovalRecord({
+        env: params.env,
+        approvalId,
+        run: params.checkpointRun,
+        stateKey: nextStateKey,
+        prompt: approval.prompt,
+        metadata: approval,
+      });
     }
     const resumeToken = encodeToken({
       protocolVersion: 1,
@@ -141,6 +166,12 @@ export async function finalizePipelineToolRun(params: {
     const resumeMode = inputRequest.commandInput ? "same_stage" : "next_stage";
     const nextStateKey = await savePipelineResumeState(params.env, {
       pipeline: params.pipeline,
+      jobId: params.checkpointRun?.jobId,
+      runId: params.checkpointRun?.runId,
+      rootRunId: params.checkpointRun?.rootRunId,
+      parentRunId: params.checkpointRun?.parentRunId,
+      stepPathPrefix: params.checkpointRun?.stepPathPrefix,
+      depth: params.checkpointRun?.depth,
       resumeAtIndex:
         resumeMode === "same_stage"
           ? (params.output.haltedAt?.index ?? -1)

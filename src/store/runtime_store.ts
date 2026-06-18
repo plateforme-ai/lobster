@@ -1,0 +1,918 @@
+import { randomUUID } from "node:crypto";
+
+import type {
+  ApprovalRecord,
+  BlobRecord,
+  CacheEntry,
+  CacheEntryRecord,
+  CheckpointIORecord,
+  CheckpointRecord,
+  JobRecord,
+  WorkflowExecutionContext,
+  RunRecord,
+  RunStatus,
+} from "../checkpoints/types.js";
+import { storePayload, readBlobJson } from "./blob_store.js";
+import { parseJsonSafe, stringifySafe } from "./serialization.js";
+import { withRuntimeDb } from "./sqlite.js";
+
+const DEFAULT_CHECKPOINT_INLINE_BYTES = 64_000;
+const DEFAULT_CHECKPOINT_PREVIEW_BYTES = 16_384;
+const DEFAULT_CACHE_INLINE_BYTES = 65_536;
+const DEFAULT_CACHE_TTL_DAYS = 30;
+const DEFAULT_QUERY_LIMIT = 50;
+const MAX_QUERY_LIMIT = 200;
+
+export function checkpointsEnabled(env: Record<string, string | undefined>) {
+  return String(env.LOBSTER_CHECKPOINTS_ENABLED ?? "").toLowerCase() === "true";
+}
+
+export function createCheckpointRun(
+  runId: string,
+  options?: Partial<WorkflowExecutionContext>,
+): WorkflowExecutionContext {
+  return {
+    jobId: options?.jobId ?? runId,
+    runId,
+    rootRunId: options?.rootRunId ?? runId,
+    parentRunId: options?.parentRunId ?? null,
+    parentStepId: options?.parentStepId ?? null,
+    parentStepPath: options?.parentStepPath ?? null,
+    stepPathPrefix: options?.stepPathPrefix ?? "root",
+    depth: options?.depth ?? 0,
+    latestCheckpointId: options?.latestCheckpointId ?? null,
+  };
+}
+
+export async function createRun(params: {
+  env: Record<string, string | undefined>;
+  sourceType: "workflow_file" | "pipeline";
+  workflowFile?: string | null;
+  workflowName?: string | null;
+  pipelineText?: string | null;
+  args?: unknown;
+  rerunOfJobId?: string | null;
+  rewindOfJobId?: string | null;
+  rewindOfCheckpointId?: string | null;
+}) {
+  const now = new Date().toISOString();
+  const jobId = randomUUID();
+  const runId = randomUUID();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT INTO jobs (
+        job_id, root_run_id, status, source_type, rerun_of_job_id, rewind_of_job_id,
+        rewind_of_checkpoint_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      jobId,
+      runId,
+      "running",
+      params.sourceType,
+      params.rerunOfJobId ?? null,
+      params.rewindOfJobId ?? null,
+      params.rewindOfCheckpointId ?? null,
+      now,
+      now,
+    );
+    db.prepare(
+      `INSERT INTO runs (
+        run_id, job_id, root_run_id, parent_run_id, parent_step_id, parent_step_path,
+        status, source_type, workflow_file, workflow_name, pipeline_text, args_json,
+        latest_checkpoint_id, depth, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      jobId,
+      runId,
+      null,
+      null,
+      null,
+      "running",
+      params.sourceType,
+      params.workflowFile ?? null,
+      params.workflowName ?? null,
+      params.pipelineText ?? null,
+      params.args === undefined ? null : stringifySafe(params.args),
+      null,
+      0,
+      now,
+      now,
+    );
+  });
+  return createCheckpointRun(runId, { jobId, rootRunId: runId, stepPathPrefix: "root" });
+}
+
+export async function createChildRun(params: {
+  env: Record<string, string | undefined>;
+  parent: WorkflowExecutionContext;
+  parentStepId: string;
+  parentStepPath: string;
+  workflowFile: string;
+  workflowName?: string | null;
+  args?: unknown;
+}) {
+  const now = new Date().toISOString();
+  const runId = randomUUID();
+  const stepPathPrefix = params.parentStepPath;
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT INTO runs (
+        run_id, job_id, root_run_id, parent_run_id, parent_step_id, parent_step_path,
+        status, source_type, workflow_file, workflow_name, args_json,
+        latest_checkpoint_id, depth, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      params.parent.jobId,
+      params.parent.rootRunId,
+      params.parent.runId,
+      params.parentStepId,
+      params.parentStepPath,
+      "running",
+      "workflow_file",
+      params.workflowFile,
+      params.workflowName ?? null,
+      params.args === undefined ? null : stringifySafe(params.args),
+      null,
+      params.parent.depth + 1,
+      now,
+      now,
+    );
+  });
+  return createCheckpointRun(runId, {
+    jobId: params.parent.jobId,
+    rootRunId: params.parent.rootRunId,
+    parentRunId: params.parent.runId,
+    parentStepId: params.parentStepId,
+    parentStepPath: params.parentStepPath,
+    stepPathPrefix,
+    depth: params.parent.depth + 1,
+  });
+}
+
+export async function updateRun(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+  status?: RunStatus;
+  latestCheckpointId?: string | null;
+  finalOutput?: unknown;
+}) {
+  const now = new Date().toISOString();
+  const finalPayload =
+    params.finalOutput === undefined
+      ? null
+      : await storePayload({
+          env: params.env,
+          value: params.finalOutput,
+          inlineMaxBytes: resolveCheckpointInlineBytes(params.env),
+          previewBytes: resolveCheckpointPreviewBytes(params.env),
+        });
+  const current = (await getRun(params.env, params.runId)) as RunRecord | null;
+  if (finalPayload?.blob) await upsertBlob(params.env, finalPayload.blob);
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `UPDATE runs
+       SET status = ?, latest_checkpoint_id = ?, updated_at = ?
+       WHERE run_id = ?`,
+    ).run(
+      params.status ?? current?.status ?? "running",
+      params.latestCheckpointId ?? current?.latestCheckpointId ?? null,
+      now,
+      params.runId,
+    );
+    if (current?.rootRunId === params.runId || current?.runId === current?.rootRunId) {
+      db.prepare(
+        `UPDATE jobs
+         SET status = ?, latest_checkpoint_id = ?, final_output_json = ?,
+             final_output_blob_id = ?, updated_at = ?
+         WHERE job_id = ?`,
+      ).run(
+        params.status ?? current?.status ?? "running",
+        params.latestCheckpointId ?? current?.latestCheckpointId ?? null,
+        finalPayload
+          ? finalPayload.inlineJson
+          : current?.finalOutput
+            ? stringifySafe(current.finalOutput)
+            : null,
+        finalPayload ? finalPayload.blobId : (current?.finalOutputBlobId ?? null),
+        now,
+        current.jobId,
+      );
+    }
+  });
+}
+
+export async function getRun(
+  env: Record<string, string | undefined>,
+  runId: string,
+): Promise<RunRecord | null> {
+  const row = await withRuntimeDb(
+    env,
+    (db) =>
+      db
+        .prepare(
+          `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id
+           FROM runs JOIN jobs ON jobs.job_id = runs.job_id
+           WHERE runs.run_id = ?`,
+        )
+        .get(runId) as any,
+  );
+  if (!row) return null;
+  return rowToRun(env, row);
+}
+
+export async function getJob(
+  env: Record<string, string | undefined>,
+  jobId: string,
+): Promise<JobRecord | null> {
+  const row = await withRuntimeDb(
+    env,
+    (db) => db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as any,
+  );
+  if (!row) return null;
+  return rowToJob(env, row);
+}
+
+export async function listJobs(params: {
+  env: Record<string, string | undefined>;
+  status?: RunStatus;
+  limit?: number;
+  cursor?: string | null;
+}): Promise<{ jobs: JobRecord[]; nextCursor: string | null }> {
+  const limit = normalizeQueryLimit(params.limit);
+  const cursor = decodeQueryCursor(params.cursor);
+  const where: string[] = [];
+  const values: unknown[] = [];
+  if (params.status) {
+    where.push("status = ?");
+    values.push(params.status);
+  }
+  if (cursor) {
+    where.push("(created_at < ? OR (created_at = ? AND job_id < ?))");
+    values.push(cursor.createdAt, cursor.createdAt, cursor.id);
+  }
+  const rows = await withRuntimeDb(params.env, (db) => {
+    const sql = `SELECT * FROM jobs${
+      where.length ? ` WHERE ${where.join(" AND ")}` : ""
+    } ORDER BY created_at DESC, job_id DESC LIMIT ?`;
+    return db.prepare(sql).all(...values, limit + 1) as any[];
+  });
+  const pageRows = rows.slice(0, limit);
+  const jobs = await Promise.all(pageRows.map((row) => rowToJob(params.env, row)));
+  const next = rows.length > limit ? pageRows.at(-1) : null;
+  return {
+    jobs,
+    nextCursor: next ? encodeQueryCursor({ createdAt: next.created_at, id: next.job_id }) : null,
+  };
+}
+
+export async function listJobRuns(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+}): Promise<RunRecord[]> {
+  const rows = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare(
+          `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id
+           FROM runs JOIN jobs ON jobs.job_id = runs.job_id
+           WHERE runs.job_id = ?
+           ORDER BY runs.depth, runs.created_at, runs.run_id`,
+        )
+        .all(params.jobId) as any[],
+  );
+  return Promise.all(rows.map((row) => rowToRun(params.env, row)));
+}
+
+export async function listPendingApprovals(params: {
+  env: Record<string, string | undefined>;
+  jobId?: string | null;
+  runId?: string | null;
+  limit?: number;
+  cursor?: string | null;
+}): Promise<{ approvals: ApprovalRecord[]; nextCursor: string | null }> {
+  const limit = normalizeQueryLimit(params.limit);
+  const cursor = decodeQueryCursor(params.cursor);
+  const where = ["status = 'waiting'"];
+  const values: unknown[] = [];
+  if (params.jobId) {
+    where.push("job_id = ?");
+    values.push(params.jobId);
+  }
+  if (params.runId) {
+    where.push("run_id = ?");
+    values.push(params.runId);
+  }
+  if (cursor) {
+    where.push("(created_at < ? OR (created_at = ? AND approval_id < ?))");
+    values.push(cursor.createdAt, cursor.createdAt, cursor.id);
+  }
+  const rows = await withRuntimeDb(params.env, (db) => {
+    const sql = `SELECT * FROM approvals WHERE ${where.join(
+      " AND ",
+    )} ORDER BY created_at DESC, approval_id DESC LIMIT ?`;
+    return db.prepare(sql).all(...values, limit + 1) as any[];
+  });
+  const pageRows = rows.slice(0, limit);
+  return {
+    approvals: pageRows.map(rowToApproval),
+    nextCursor:
+      rows.length > limit
+        ? encodeQueryCursor({
+            createdAt: pageRows.at(-1)!.created_at,
+            id: pageRows.at(-1)!.approval_id,
+          })
+        : null,
+  };
+}
+
+export async function appendCheckpoint(params: {
+  env: Record<string, string | undefined>;
+  run?: WorkflowExecutionContext | null;
+  runId?: string;
+  jobId?: string;
+  rootRunId?: string;
+  parentRunId?: string | null;
+  stepId?: string | null;
+  stepPath?: string | null;
+  stepIndex?: number | null;
+  stepType?: string | null;
+  attempt?: number | null;
+  status: CheckpointRecord["status"];
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  condition?: unknown;
+  dependencyEdges?: unknown;
+  metadata?: unknown;
+  error?: unknown;
+  exitStatus?: number | null;
+  io?: CheckpointIORecord;
+}) {
+  const runId = params.runId ?? params.run?.runId;
+  if (!runId) return null;
+  const jobId = params.jobId ?? params.run?.jobId ?? runId;
+  const rootRunId = params.rootRunId ?? params.run?.rootRunId ?? runId;
+  const parentRunId = params.parentRunId ?? params.run?.parentRunId ?? null;
+  const stepPath = params.stepPath ?? joinStepPath(params.run?.stepPathPrefix, params.stepId);
+  const checkpointId = randomUUID();
+  const createdAt = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT INTO checkpoints (
+        checkpoint_id, job_id, run_id, root_run_id, parent_run_id,
+        parent_checkpoint_id, step_id, step_path, step_index, step_type,
+        attempt, status, started_at, finished_at, condition_json, dependency_edges_json,
+        metadata_json, error_json, exit_status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      checkpointId,
+      jobId,
+      runId,
+      rootRunId,
+      parentRunId,
+      params.run?.latestCheckpointId ?? null,
+      params.stepId ?? null,
+      stepPath,
+      params.stepIndex ?? null,
+      params.stepType ?? null,
+      params.attempt ?? null,
+      params.status,
+      params.startedAt ?? createdAt,
+      params.finishedAt ?? null,
+      params.condition === undefined ? null : stringifySafe(params.condition),
+      params.dependencyEdges === undefined ? null : stringifySafe(params.dependencyEdges),
+      params.metadata === undefined ? null : stringifySafe(params.metadata),
+      params.error === undefined ? null : stringifySafe(params.error),
+      params.exitStatus ?? null,
+      createdAt,
+    );
+  });
+
+  if (params.io) await writeCheckpointIO(params.env, checkpointId, params.io);
+  if (params.run) params.run.latestCheckpointId = checkpointId;
+  await updateRun({ env: params.env, runId, latestCheckpointId: checkpointId });
+  return checkpointId;
+}
+
+export async function listRunCheckpoints(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}) {
+  const rows = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY step_index, created_at")
+        .all(params.runId) as any[],
+  );
+  return rows.map(rowToCheckpoint);
+}
+
+export async function listJobCheckpoints(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+}) {
+  const rows = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT * FROM checkpoints WHERE job_id = ? ORDER BY created_at")
+        .all(params.jobId) as any[],
+  );
+  return rows.map(rowToCheckpoint);
+}
+
+export async function getCheckpoint(params: {
+  env: Record<string, string | undefined>;
+  checkpointId: string;
+}) {
+  const row = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT * FROM checkpoints WHERE checkpoint_id = ?")
+        .get(params.checkpointId) as any,
+  );
+  return row ? rowToCheckpoint(row) : null;
+}
+
+export async function getCheckpointIO(params: {
+  env: Record<string, string | undefined>;
+  checkpointId: string;
+}) {
+  const row = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT * FROM checkpoint_io WHERE checkpoint_id = ?")
+        .get(params.checkpointId) as any,
+  );
+  if (!row) return null;
+  return {
+    checkpointId: params.checkpointId,
+    stdin: await readInlineOrBlob(params.env, row.stdin_preview_json, row.stdin_blob_id),
+    stdout: await readInlineOrBlob(params.env, row.stdout_preview_json, row.stdout_blob_id),
+    stderr: await readInlineOrBlob(params.env, row.stderr_preview_json, row.stderr_blob_id),
+    jsonInput: await readInlineOrBlob(
+      params.env,
+      row.json_input_preview_json,
+      row.json_input_blob_id,
+    ),
+    jsonOutput: await readInlineOrBlob(
+      params.env,
+      row.json_output_preview_json,
+      row.json_output_blob_id,
+    ),
+  };
+}
+
+export async function createApprovalRecord(params: {
+  env: Record<string, string | undefined>;
+  approvalId: string;
+  run?: WorkflowExecutionContext | null;
+  jobId?: string | null;
+  runId?: string | null;
+  rootRunId?: string | null;
+  parentRunId?: string | null;
+  checkpointId?: string | null;
+  stepPath?: string | null;
+  stateKey?: string | null;
+  prompt?: string | null;
+  metadata?: unknown;
+  initiatedBy?: string | null;
+  requiredApprover?: string | null;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT OR REPLACE INTO approvals (
+        approval_id, job_id, run_id, root_run_id, parent_run_id, checkpoint_id,
+        step_path, state_key, status, prompt, metadata_json,
+        initiated_by, required_approver, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      params.approvalId,
+      params.jobId ?? params.run?.jobId ?? null,
+      params.runId ?? params.run?.runId ?? null,
+      params.rootRunId ?? params.run?.rootRunId ?? null,
+      params.parentRunId ?? params.run?.parentRunId ?? null,
+      params.checkpointId ?? params.run?.latestCheckpointId ?? null,
+      params.stepPath ?? null,
+      params.stateKey ?? null,
+      "waiting",
+      params.prompt ?? null,
+      params.metadata === undefined ? null : stringifySafe(params.metadata),
+      params.initiatedBy ?? null,
+      params.requiredApprover ?? null,
+      now,
+    );
+  });
+}
+
+export async function resolveApprovalRecord(params: {
+  env: Record<string, string | undefined>;
+  approvalId?: string | null;
+  stateKey?: string | null;
+  status: ApprovalRecord["status"];
+  decision?: string | null;
+  approvedBy?: string | null;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    if (params.approvalId) {
+      db.prepare(
+        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ?
+         WHERE approval_id = ?`,
+      ).run(
+        params.status,
+        params.decision ?? null,
+        params.approvedBy ?? null,
+        now,
+        params.approvalId,
+      );
+      return;
+    }
+    if (params.stateKey) {
+      db.prepare(
+        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ?
+         WHERE state_key = ? AND status = 'waiting'`,
+      ).run(
+        params.status,
+        params.decision ?? null,
+        params.approvedBy ?? null,
+        now,
+        params.stateKey,
+      );
+    }
+  });
+}
+
+export async function readCacheEntry(params: {
+  env: Record<string, string | undefined>;
+  namespace: string;
+  cacheKey: string;
+}): Promise<CacheEntryRecord | null> {
+  const now = new Date().toISOString();
+  const row = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT * FROM cache_entries WHERE namespace = ? AND cache_key = ?")
+        .get(params.namespace, params.cacheKey) as any,
+  );
+  if (!row) return null;
+  if (row.expires_at && row.expires_at <= now) return null;
+
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `UPDATE cache_entries
+       SET last_accessed_at = ?, hit_count = hit_count + 1
+       WHERE namespace = ? AND cache_key = ?`,
+    ).run(now, params.namespace, params.cacheKey);
+  });
+
+  const output =
+    row.output_inline_json !== null && row.output_inline_json !== undefined
+      ? parseJsonSafe(row.output_inline_json)
+      : row.output_blob_id
+        ? await readBlobJson({ env: params.env, blobId: row.output_blob_id })
+        : [];
+  return {
+    namespace: row.namespace,
+    cacheKey: row.cache_key,
+    items: Array.isArray(output) ? output : [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastAccessedAt: now,
+    expiresAt: row.expires_at,
+    hitCount: Number(row.hit_count ?? 0) + 1,
+  };
+}
+
+export async function writeCacheEntry(params: {
+  env: Record<string, string | undefined>;
+  entry: CacheEntry;
+}) {
+  const now = new Date().toISOString();
+  const inlineMaxBytes = resolveCacheInlineBytes(params.env);
+  const inputPayload = await storePayload({
+    env: params.env,
+    value: params.entry.input ?? null,
+    inlineMaxBytes,
+  });
+  const outputPayload = await storePayload({
+    env: params.env,
+    value: params.entry.items,
+    inlineMaxBytes,
+  });
+  if (inputPayload.blob) await upsertBlob(params.env, inputPayload.blob);
+  if (outputPayload.blob) await upsertBlob(params.env, outputPayload.blob);
+
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT INTO cache_entries (
+        namespace, cache_key, input_hash, output_hash, input_inline_json, output_inline_json,
+        input_preview_json, output_preview_json, input_blob_id, output_blob_id,
+        provider, model, tool, action, schema_hash, status,
+        created_at, updated_at, last_accessed_at, expires_at, hit_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(namespace, cache_key) DO UPDATE SET
+        input_hash = excluded.input_hash,
+        output_hash = excluded.output_hash,
+        input_inline_json = excluded.input_inline_json,
+        output_inline_json = excluded.output_inline_json,
+        input_preview_json = excluded.input_preview_json,
+        output_preview_json = excluded.output_preview_json,
+        input_blob_id = excluded.input_blob_id,
+        output_blob_id = excluded.output_blob_id,
+        provider = excluded.provider,
+        model = excluded.model,
+        tool = excluded.tool,
+        action = excluded.action,
+        schema_hash = excluded.schema_hash,
+        status = excluded.status,
+        updated_at = excluded.updated_at,
+        last_accessed_at = excluded.last_accessed_at,
+        expires_at = excluded.expires_at`,
+    ).run(
+      params.entry.namespace,
+      params.entry.cacheKey,
+      inputPayload.sha256,
+      outputPayload.sha256,
+      inputPayload.inlineJson,
+      outputPayload.inlineJson,
+      inputPayload.previewJson,
+      outputPayload.previewJson,
+      inputPayload.blobId,
+      outputPayload.blobId,
+      params.entry.provider ?? null,
+      params.entry.model ?? null,
+      params.entry.tool ?? null,
+      params.entry.action ?? null,
+      params.entry.schemaHash ?? null,
+      params.entry.status ?? "ok",
+      now,
+      now,
+      now,
+      params.entry.expiresAt ?? defaultCacheExpiresAt(params.env, now),
+      0,
+    );
+  });
+}
+
+export async function expireCacheEntries(params: {
+  env: Record<string, string | undefined>;
+  now?: string;
+}) {
+  const now = params.now ?? new Date().toISOString();
+  return withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("DELETE FROM cache_entries WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .run(now).changes,
+  );
+}
+
+async function writeCheckpointIO(
+  env: Record<string, string | undefined>,
+  checkpointId: string,
+  io: CheckpointIORecord,
+) {
+  const inlineMaxBytes = resolveCheckpointInlineBytes(env);
+  const previewBytes = resolveCheckpointPreviewBytes(env);
+  const stdinPayload = await optionalPayload(env, io.stdin, inlineMaxBytes, previewBytes);
+  const stdoutPayload = await optionalPayload(env, io.stdout, inlineMaxBytes, previewBytes);
+  const stderrPayload = await optionalPayload(env, io.stderr, inlineMaxBytes, previewBytes);
+  const jsonInputPayload = await optionalPayload(env, io.jsonInput, inlineMaxBytes, previewBytes);
+  const jsonOutputPayload = await optionalPayload(env, io.jsonOutput, inlineMaxBytes, previewBytes);
+
+  for (const payload of [
+    stdinPayload,
+    stdoutPayload,
+    stderrPayload,
+    jsonInputPayload,
+    jsonOutputPayload,
+  ]) {
+    if (payload?.blob) await upsertBlob(env, payload.blob);
+  }
+
+  await withRuntimeDb(env, (db) => {
+    db.prepare(
+      `INSERT OR REPLACE INTO checkpoint_io (
+        checkpoint_id, stdin_preview_json, stdin_blob_id, stdout_preview_json, stdout_blob_id,
+        stderr_preview_json, stderr_blob_id, json_input_preview_json, json_input_blob_id,
+        json_output_preview_json, json_output_blob_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      checkpointId,
+      stdinPayload?.previewJson ?? null,
+      stdinPayload?.blobId ?? null,
+      stdoutPayload?.previewJson ?? null,
+      stdoutPayload?.blobId ?? null,
+      stderrPayload?.previewJson ?? null,
+      stderrPayload?.blobId ?? null,
+      jsonInputPayload?.previewJson ?? null,
+      jsonInputPayload?.blobId ?? null,
+      jsonOutputPayload?.previewJson ?? null,
+      jsonOutputPayload?.blobId ?? null,
+      new Date().toISOString(),
+    );
+  });
+}
+
+async function optionalPayload(
+  env: Record<string, string | undefined>,
+  value: unknown,
+  inlineMaxBytes: number,
+  previewBytes: number,
+) {
+  if (value === undefined) return null;
+  return storePayload({ env, value, inlineMaxBytes, previewBytes });
+}
+
+async function upsertBlob(env: Record<string, string | undefined>, blob: BlobRecord) {
+  await withRuntimeDb(env, (db) => {
+    db.prepare(
+      `INSERT OR IGNORE INTO blobs
+        (blob_id, sha256, byte_length, content_type, storage_path, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      blob.blobId,
+      blob.sha256,
+      blob.byteLength,
+      blob.contentType,
+      blob.storagePath,
+      blob.createdAt,
+    );
+  });
+}
+
+async function readInlineOrBlob(
+  env: Record<string, string | undefined>,
+  previewJson: string | null,
+  blobId: string | null,
+) {
+  if (blobId) return readBlobJson({ env, blobId });
+  return parseJsonSafe(previewJson);
+}
+
+async function rowToJob(env: Record<string, string | undefined>, row: any): Promise<JobRecord> {
+  const finalOutput =
+    row.final_output_json !== null && row.final_output_json !== undefined
+      ? parseJsonSafe(row.final_output_json)
+      : row.final_output_blob_id
+        ? await readBlobJson({ env, blobId: row.final_output_blob_id })
+        : undefined;
+  return {
+    jobId: row.job_id,
+    rootRunId: row.root_run_id,
+    status: row.status,
+    sourceType: row.source_type,
+    rerunOfJobId: row.rerun_of_job_id,
+    rewindOfJobId: row.rewind_of_job_id,
+    rewindOfCheckpointId: row.rewind_of_checkpoint_id,
+    finalOutput,
+    finalOutputBlobId: row.final_output_blob_id,
+    latestCheckpointId: row.latest_checkpoint_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToCheckpoint(row: any): CheckpointRecord {
+  return {
+    checkpointId: row.checkpoint_id,
+    jobId: row.job_id,
+    runId: row.run_id,
+    rootRunId: row.root_run_id,
+    parentRunId: row.parent_run_id,
+    parentCheckpointId: row.parent_checkpoint_id,
+    stepId: row.step_id,
+    stepPath: row.step_path,
+    stepIndex: row.step_index,
+    stepType: row.step_type,
+    attempt: row.attempt,
+    status: row.status,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    condition: parseJsonSafe(row.condition_json),
+    dependencyEdges: parseJsonSafe(row.dependency_edges_json),
+    metadata: parseJsonSafe(row.metadata_json),
+    error: parseJsonSafe(row.error_json),
+    exitStatus: row.exit_status,
+    createdAt: row.created_at,
+  };
+}
+
+async function rowToRun(env: Record<string, string | undefined>, row: any): Promise<RunRecord> {
+  const finalOutput =
+    row.final_output_json !== null && row.final_output_json !== undefined
+      ? parseJsonSafe(row.final_output_json)
+      : row.final_output_blob_id
+        ? await readBlobJson({ env, blobId: row.final_output_blob_id })
+        : undefined;
+  return {
+    jobId: row.job_id,
+    runId: row.run_id,
+    rootRunId: row.root_run_id,
+    parentRunId: row.parent_run_id,
+    parentStepId: row.parent_step_id,
+    parentStepPath: row.parent_step_path,
+    status: row.status,
+    sourceType: row.source_type,
+    workflowFile: row.workflow_file,
+    workflowName: row.workflow_name,
+    pipelineText: row.pipeline_text,
+    args: parseJsonSafe(row.args_json),
+    depth: Number(row.depth ?? 0),
+    finalOutput,
+    finalOutputBlobId: row.final_output_blob_id,
+    latestCheckpointId: row.latest_checkpoint_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function rowToApproval(row: any): ApprovalRecord {
+  return {
+    approvalId: row.approval_id,
+    jobId: row.job_id,
+    runId: row.run_id,
+    rootRunId: row.root_run_id,
+    parentRunId: row.parent_run_id,
+    checkpointId: row.checkpoint_id,
+    stepPath: row.step_path,
+    stateKey: row.state_key,
+    status: row.status,
+    prompt: row.prompt,
+    metadata: parseJsonSafe(row.metadata_json),
+    decision: row.decision,
+    initiatedBy: row.initiated_by,
+    requiredApprover: row.required_approver,
+    approvedBy: row.approved_by,
+    createdAt: row.created_at,
+    resolvedAt: row.resolved_at,
+  };
+}
+
+type QueryCursor = { createdAt: string; id: string };
+
+function encodeQueryCursor(cursor: QueryCursor) {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeQueryCursor(cursor: string | null | undefined): QueryCursor | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.createdAt === "string" &&
+      typeof parsed.id === "string"
+    ) {
+      return parsed;
+    }
+  } catch {
+    // Throw a consistent public error below.
+  }
+  throw new Error("Invalid pagination cursor");
+}
+
+function normalizeQueryLimit(limit: number | undefined) {
+  if (limit === undefined) return DEFAULT_QUERY_LIMIT;
+  if (!Number.isFinite(limit) || limit < 1) return DEFAULT_QUERY_LIMIT;
+  return Math.min(Math.floor(limit), MAX_QUERY_LIMIT);
+}
+
+function joinStepPath(prefix: string | null | undefined, stepId: string | null | undefined) {
+  if (!stepId) return prefix ?? null;
+  return prefix ? `${prefix}.${stepId}` : stepId;
+}
+
+function resolveCheckpointInlineBytes(env: Record<string, string | undefined>) {
+  return parsePositiveInt(env.LOBSTER_CHECKPOINT_INLINE_MAX_BYTES, DEFAULT_CHECKPOINT_INLINE_BYTES);
+}
+
+function resolveCheckpointPreviewBytes(env: Record<string, string | undefined>) {
+  return parsePositiveInt(env.LOBSTER_CHECKPOINT_MAX_BYTES, DEFAULT_CHECKPOINT_PREVIEW_BYTES);
+}
+
+function resolveCacheInlineBytes(env: Record<string, string | undefined>) {
+  return parsePositiveInt(env.LOBSTER_CACHE_INLINE_MAX_BYTES, DEFAULT_CACHE_INLINE_BYTES);
+}
+
+function defaultCacheExpiresAt(env: Record<string, string | undefined>, now: string) {
+  const days = Number(env.LOBSTER_CACHE_TTL_DAYS ?? DEFAULT_CACHE_TTL_DAYS);
+  if (!Number.isFinite(days) || days <= 0) return null;
+  return new Date(Date.parse(now) + Math.floor(days * 24 * 60 * 60 * 1000)).toISOString();
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.floor(parsed);
+}

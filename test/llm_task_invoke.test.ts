@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -299,8 +299,8 @@ test("llm_task.invoke reuses file cache when URL unavailable", async () => {
   }
 });
 
-test("llm_task.invoke treats corrupt file cache as a miss and rewrites it atomically (#111)", async () => {
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-corrupt-"));
+test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites them", async () => {
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-expire-"));
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -327,7 +327,11 @@ test("llm_task.invoke treats corrupt file cache as a miss and rewrites it atomic
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
-  const ctxEnv = { LOBSTER_CACHE_DIR: cacheDir, CLAWD_URL: `http://localhost:${port}` };
+  const ctxEnv = {
+    LOBSTER_CACHE_DIR: cacheDir,
+    LOBSTER_CACHE_TTL_DAYS: "0.000001",
+    CLAWD_URL: `http://localhost:${port}`,
+  };
 
   try {
     const args = { _: [], model: "claude", prompt: "Repair corrupt cache" };
@@ -340,14 +344,7 @@ test("llm_task.invoke treats corrupt file cache as a miss and rewrites it atomic
     assert.equal(firstItems[0].runId, "cache_repair_1");
     assert.equal(calls, 1);
 
-    const namespaceDir = path.join(cacheDir, "llm_task.invoke");
-    const cacheFiles = (await readdir(namespaceDir)).filter((name) => name.endsWith(".json"));
-    assert.equal(cacheFiles.length, 1);
-    const cachePath = path.join(namespaceDir, cacheFiles[0]);
-    if (process.platform !== "win32") {
-      assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
-    }
-    await writeFile(cachePath, '{"items"', "utf8");
+    await new Promise((resolve) => setTimeout(resolve, 120));
 
     const second = await cmd.run({
       input: streamOf([]),
@@ -360,14 +357,8 @@ test("llm_task.invoke treats corrupt file cache as a miss and rewrites it atomic
     assert.equal(secondItems[0].cached, false);
     assert.equal(calls, 2);
 
-    const repaired = JSON.parse(await readFile(cachePath, "utf8"));
-    assert.equal(repaired.items[0].runId, "cache_repair_2");
+    await new Promise((resolve) => setTimeout(resolve, 120));
 
-    await writeFile(
-      cachePath,
-      JSON.stringify({ cacheKey: repaired.cacheKey, items: null }),
-      "utf8",
-    );
     const third = await cmd.run({
       input: streamOf([]),
       args,

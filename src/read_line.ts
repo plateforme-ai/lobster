@@ -1,5 +1,7 @@
 export function readLineFromStream(stream: NodeJS.ReadableStream, opts?: { timeoutMs?: number }) {
   const timeoutMs = Number(opts?.timeoutMs ?? 0);
+  const ttyStream = stream as NodeJS.ReadableStream & { isTTY?: boolean };
+  const shouldPauseOnCleanup = Boolean(ttyStream.isTTY && typeof ttyStream.pause === "function");
 
   return new Promise<string>((resolve, reject) => {
     let settled = false;
@@ -12,6 +14,7 @@ export function readLineFromStream(stream: NodeJS.ReadableStream, opts?: { timeo
       stream.off("close", onClose);
       stream.off("error", onError);
       if (timer) clearTimeout(timer);
+      if (shouldPauseOnCleanup) ttyStream.pause();
     };
 
     const finish = (value: string) => {
@@ -50,5 +53,6 @@ export function readLineFromStream(stream: NodeJS.ReadableStream, opts?: { timeo
     stream.on("end", onEnd);
     stream.on("close", onClose);
     stream.on("error", onError);
+    if (ttyStream.isTTY && typeof ttyStream.resume === "function") ttyStream.resume();
   });
 }

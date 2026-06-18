@@ -1,0 +1,146 @@
+export type RunStatus = "running" | "waiting" | "succeeded" | "failed" | "cancelled";
+
+export type JobRecord = {
+  jobId: string;
+  rootRunId?: string | null;
+  status: RunStatus;
+  sourceType: "workflow_file" | "pipeline";
+  rerunOfJobId?: string | null;
+  rewindOfJobId?: string | null;
+  rewindOfCheckpointId?: string | null;
+  finalOutput?: unknown;
+  finalOutputBlobId?: string | null;
+  latestCheckpointId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RunRecord = {
+  jobId: string;
+  runId: string;
+  rootRunId: string;
+  parentRunId?: string | null;
+  parentStepId?: string | null;
+  parentStepPath?: string | null;
+  status: RunStatus;
+  sourceType: "workflow_file" | "pipeline";
+  workflowFile?: string | null;
+  workflowName?: string | null;
+  pipelineText?: string | null;
+  args?: unknown;
+  depth: number;
+  finalOutput?: unknown;
+  finalOutputBlobId?: string | null;
+  latestCheckpointId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CheckpointStatus =
+  | "started"
+  | "waiting"
+  | "resumed"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+export type CheckpointRecord = {
+  checkpointId: string;
+  jobId: string;
+  runId: string;
+  rootRunId: string;
+  parentRunId?: string | null;
+  parentCheckpointId?: string | null;
+  stepId?: string | null;
+  stepPath?: string | null;
+  stepIndex?: number | null;
+  stepType?: string | null;
+  attempt?: number | null;
+  status: CheckpointStatus;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  condition?: unknown;
+  dependencyEdges?: unknown;
+  metadata?: unknown;
+  error?: unknown;
+  exitStatus?: number | null;
+  createdAt: string;
+};
+
+export type CheckpointIORecord = {
+  checkpointId?: string;
+  stdin?: unknown;
+  stdout?: unknown;
+  stderr?: unknown;
+  jsonInput?: unknown;
+  jsonOutput?: unknown;
+};
+
+export type ApprovalStatus = "waiting" | "approved" | "rejected" | "cancelled" | "expired";
+
+export type ApprovalRecord = {
+  approvalId: string;
+  jobId?: string | null;
+  runId?: string | null;
+  rootRunId?: string | null;
+  parentRunId?: string | null;
+  checkpointId?: string | null;
+  stepPath?: string | null;
+  stateKey?: string | null;
+  status: ApprovalStatus;
+  prompt?: string | null;
+  metadata?: unknown;
+  decision?: string | null;
+  initiatedBy?: string | null;
+  requiredApprover?: string | null;
+  approvedBy?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+};
+
+export type BlobRecord = {
+  blobId: string;
+  sha256: string;
+  byteLength: number;
+  contentType: string;
+  storagePath: string;
+  createdAt: string;
+};
+
+export type CacheEntry = {
+  namespace: string;
+  cacheKey: string;
+  items: unknown[];
+  input?: unknown;
+  provider?: string | null;
+  model?: string | null;
+  tool?: string | null;
+  action?: string | null;
+  schemaHash?: string | null;
+  status?: string | null;
+  expiresAt?: string | null;
+};
+
+export type CacheEntryRecord = {
+  namespace: string;
+  cacheKey: string;
+  items: unknown[];
+  createdAt: string;
+  updatedAt: string;
+  lastAccessedAt: string;
+  expiresAt?: string | null;
+  hitCount: number;
+};
+
+export type WorkflowExecutionContext = {
+  jobId: string;
+  runId: string;
+  rootRunId: string;
+  parentRunId?: string | null;
+  parentStepId?: string | null;
+  parentStepPath?: string | null;
+  stepPathPrefix: string;
+  depth: number;
+  latestCheckpointId?: string | null;
+};

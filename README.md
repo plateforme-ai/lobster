@@ -13,9 +13,11 @@ Forked from [https://github.com/openclaw/lobster](https://github.com/openclaw/lo
 | released | [![released version](https://img.shields.io/npm/v/%40plateforme-ai%2Flobster?label=npm)](https://www.npmjs.com/package/@plateforme-ai/lobster) |
 
 ## Example of Lobster at work
+
 OpenClaw (or any other AI agent) can use `lobster` as a workflow engine and avoid re-planning every step — saving tokens while improving determinism and resumability.
 
 ### Watching a PR that hasn't had changes
+
 ```
 node bin/lobster.js "workflows.run --name github.pr.monitor --args-json '{\"repo\":\"openclaw/openclaw\",\"pr\":1152}'"
 [
@@ -50,6 +52,7 @@ node bin/lobster.js "workflows.run --name github.pr.monitor --args-json '{\"repo
   }
 ]
 ```
+
 ### And a PR that has a state change (in this case an approved PR)
 
 ```
@@ -141,7 +144,6 @@ node bin/lobster.js "workflows.run --name github.pr.monitor --args-json '{\"repo
 
 ## Goals
 
-
 - Typed pipelines (objects/arrays), not text pipes.
 - Local-first execution.
 - No new auth surface: Lobster must not own OAuth/tokens.
@@ -162,6 +164,7 @@ From this folder:
 
 - `pnpm test` runs `tsc` and then executes tests against `dist/`.
 - `bin/lobster.js` prefers the compiled entrypoint in `dist/` when present.
+
 ## Commands
 
 - `exec`: run OS commands
@@ -173,6 +176,61 @@ From this folder:
 ## Next steps
 
 - OpenClaw integration: ship as an optional OpenClaw plugin tool.
+
+## Durable OpenClaw Runtime Store
+
+This fork can persist OpenClaw-oriented run history in SQLite using Node's built-in
+`node:sqlite` runtime. Enable checkpoint capture with:
+
+```txt
+LOBSTER_CHECKPOINTS_ENABLED=true
+LOBSTER_STORE=sqlite
+LOBSTER_SQLITE_PATH=<LOBSTER_STATE_DIR>/lobster.db
+```
+
+The SQLite store owns durable job, run, checkpoint, approval, cache index, and
+blob metadata records. Jobs, workflow runs, checkpoints, and approval history
+are retained by default so OpenClaw can list jobs, inspect step history, rerun
+from the start, and rewind from supported checkpoints.
+
+Runtime identifiers use these meanings:
+
+- `jobId`: one customer/root request.
+- `runId`: one concrete workflow invocation. A nested workflow gets its own
+  `runId`.
+- `rootRunId`: the root workflow invocation for the job.
+- `parentRunId`: the caller workflow invocation for nested workflows.
+- `stepPath`: stable nested path, for example `root.review.childStep`.
+
+Nested workflows share the same `jobId` and get separate child `runId` rows.
+Child workflow approval/input waits bubble up to the caller envelope and resume
+through a persisted call stack, so approving a child workflow can continue the
+child and then the parent workflow.
+
+Current rewind support is strongest for linear root and child workflow
+checkpoints. Rewind inside `parallel`, `for_each`, or command-level pipeline
+suspension may return `replay_not_supported` until those replay boundaries are
+fully captured.
+
+Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are
+stored inline; larger cached inputs/outputs are written as content-addressed
+blobs under `LOBSTER_STATE_DIR/blobs/` and referenced from SQLite.
+
+Useful cache settings:
+
+```txt
+LOBSTER_CACHE_STORE=sqlite
+LOBSTER_CACHE_TTL_DAYS=30
+LOBSTER_CACHE_INLINE_MAX_BYTES=65536
+```
+
+Public dashboard/plugin APIs are exported from `@plateforme-ai/lobster/core`:
+
+- `getJob({ jobId })` and `getRun({ runId })` fetch durable job/run status.
+- `listJobs({ status, limit, cursor })` returns cursor-paginated dashboard job rows.
+- `listJobRuns({ jobId })` returns root and nested workflow invocations for a job.
+- `listPendingApprovals({ jobId, runId, limit, cursor })` powers global or job-scoped approval inboxes.
+- `listJobCheckpoints({ jobId })`, `getCheckpointIO({ checkpointId })`, `rerunToolRequest({ jobId })`, and `rewindToolRequest({ jobId, checkpointId })` complete the inspect/rerun/rewind dashboard flow.
 
 ## Workflow files
 

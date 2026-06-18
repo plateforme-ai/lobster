@@ -1,17 +1,17 @@
-import path from "node:path";
-import { promises as fsp } from "node:fs";
 import { createHash } from "node:crypto";
 import { Ajv } from "ajv";
 import type { ErrorObject } from "ajv";
 
 import {
-  ensureDirectory,
   isJsonSyntaxError,
   readStateJson,
   stableStringify,
-  writeFileAtomic,
   writeStateJson,
 } from "../../state/store.js";
+import {
+  readCacheEntry as readSqliteCacheEntry,
+  writeCacheEntry as writeSqliteCacheEntry,
+} from "../../store/runtime_store.js";
 import { createCompileCached } from "../../validation.js";
 import type { LobsterCommand } from "../types.js";
 
@@ -446,7 +446,9 @@ async function runLlmInvoke({
     }
 
     if (!validateResponseEnvelope(responseEnvelope)) {
-      throw new Error(`${config.name} received invalid response envelope: ${JSON.stringify(responseEnvelope)}`);
+      throw new Error(
+        `${config.name} received invalid response envelope: ${JSON.stringify(responseEnvelope)}`,
+      );
     }
 
     if (responseEnvelope.ok !== true) {
@@ -472,7 +474,14 @@ async function runLlmInvoke({
         items: normalized,
         stateType: config.stateType,
       });
-      if (!disableCache) await writeCacheEntry(env, cacheKey, normalized, config.cacheNamespace);
+      if (!disableCache) {
+        await writeCacheEntry(env, cacheKey, normalized, config.cacheNamespace, {
+          input: payload,
+          provider,
+          model,
+          status: normalized[0]?.status,
+        });
+      }
       return { output: streamOf(normalized) };
     }
 
@@ -485,7 +494,14 @@ async function runLlmInvoke({
         items: normalized,
         stateType: config.stateType,
       });
-      if (!disableCache) await writeCacheEntry(env, cacheKey, normalized, config.cacheNamespace);
+      if (!disableCache) {
+        await writeCacheEntry(env, cacheKey, normalized, config.cacheNamespace, {
+          input: payload,
+          provider,
+          model,
+          status: normalized[0]?.status,
+        });
+      }
       return { output: streamOf(normalized) };
     }
 
@@ -731,7 +747,7 @@ function normalizeOpenClawToolResult(result: any): LlmResponse {
       format: data !== undefined ? "json" : "text",
     },
     metadata: {
-      ...(result.metadata ?? {}),
+      ...result.metadata,
       ...(details?.provider ? { provider: details.provider } : null),
       ...(details ? { details } : null),
     },
@@ -993,17 +1009,13 @@ async function readCacheEntry(
   key: string,
   cacheNamespace: string,
 ): Promise<CacheEntry | null> {
-  const filePath = path.join(getCacheDir(env), cacheNamespace, `${key}.json`);
-  try {
-    const text = await fsp.readFile(filePath, "utf8");
-    const parsed = JSON.parse(text) as Partial<CacheEntry>;
-    if (parsed?.cacheKey !== key || !Array.isArray(parsed.items)) return null;
-    return parsed as CacheEntry;
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return null;
-    if (isJsonSyntaxError(err)) return null;
-    throw err;
-  }
+  const entry = await readSqliteCacheEntry({ env, namespace: cacheNamespace, cacheKey: key });
+  if (!entry) return null;
+  return {
+    cacheKey: entry.cacheKey,
+    items: entry.items as NormalizedInvocationItem[],
+    storedAt: entry.updatedAt,
+  };
 }
 
 async function writeCacheEntry(
@@ -1011,19 +1023,25 @@ async function writeCacheEntry(
   key: string,
   items: NormalizedInvocationItem[],
   cacheNamespace: string,
+  metadata: {
+    input?: unknown;
+    provider?: string | null;
+    model?: string | null;
+    status?: string | null;
+  } = {},
 ) {
-  const dir = path.join(getCacheDir(env), cacheNamespace);
-  await ensureDirectory(dir);
-  const filePath = path.join(dir, `${key}.json`);
-  await writeFileAtomic(
-    filePath,
-    JSON.stringify({ items, cacheKey: key, storedAt: new Date().toISOString() }, null, 2) + "\n",
-  );
-}
-
-function getCacheDir(env: any) {
-  if (env?.LOBSTER_CACHE_DIR) return String(env.LOBSTER_CACHE_DIR);
-  return path.join(process.cwd(), ".lobster-cache");
+  await writeSqliteCacheEntry({
+    env,
+    entry: {
+      namespace: cacheNamespace,
+      cacheKey: key,
+      items,
+      input: metadata.input,
+      provider: metadata.provider,
+      model: metadata.model,
+      status: metadata.status,
+    },
+  });
 }
 
 async function* streamOf(items: any[]) {

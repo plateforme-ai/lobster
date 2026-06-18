@@ -1,4 +1,6 @@
 import { createJsonRenderer } from "./renderers/json.js";
+import type { WorkflowExecutionContext } from "./checkpoints/types.js";
+import { appendCheckpoint } from "./store/runtime_store.js";
 import {
   InputRequestSuspension,
   RequestInputResumeError,
@@ -23,6 +25,7 @@ export async function runPipeline({
   dryRun = false,
   requestInputResume = undefined,
   requestInputEnabled = true,
+  checkpointRun = undefined,
 }: {
   pipeline: any[];
   registry: any;
@@ -38,6 +41,7 @@ export async function runPipeline({
   dryRun?: boolean;
   requestInputResume?: CommandInputResume | undefined;
   requestInputEnabled?: boolean;
+  checkpointRun?: WorkflowExecutionContext | undefined;
 }) {
   if (dryRun) {
     return dryRunPipeline({ pipeline, registry, stderr });
@@ -63,10 +67,21 @@ export async function runPipeline({
 
   for (let idx = 0; idx < pipeline.length; idx++) {
     const stage = pipeline[idx];
+    const stageStartedAt = new Date().toISOString();
     const command = registry.get(stage.name);
     if (!command) {
       throw new Error(`Unknown command: ${stage.name}`);
     }
+    await appendCheckpoint({
+      env,
+      run: checkpointRun,
+      stepId: stage.name,
+      stepIndex: idx,
+      stepType: "pipeline_stage",
+      status: "started",
+      startedAt: stageStartedAt,
+      metadata: { stage },
+    });
 
     const inputTracker = createInputTracker(stream);
     const stageResume = idx === 0 ? requestInputResume : undefined;
@@ -111,7 +126,31 @@ export async function runPipeline({
       result = await command.run({ input: inputTracker.iterable, args: stage.args, ctx: stageCtx });
     } catch (err) {
       await finishStage({ assertResume: false, suppressCloseErrors: true });
-      if (haltForInputRequest(err)) break;
+      if (haltForInputRequest(err)) {
+        await appendCheckpoint({
+          env,
+          run: checkpointRun,
+          stepId: stage.name,
+          stepIndex: idx,
+          stepType: "pipeline_stage",
+          status: "waiting",
+          startedAt: stageStartedAt,
+          finishedAt: new Date().toISOString(),
+          metadata: { stage, haltType: "input_request" },
+        });
+        break;
+      }
+      await appendCheckpoint({
+        env,
+        run: checkpointRun,
+        stepId: stage.name,
+        stepIndex: idx,
+        stepType: "pipeline_stage",
+        status: "failed",
+        startedAt: stageStartedAt,
+        finishedAt: new Date().toISOString(),
+        error: { message: err?.message ?? String(err) },
+      });
       assertNoUnconsumedResumeAfterError(stageResume, err);
       throw err;
     }
@@ -155,8 +194,33 @@ export async function runPipeline({
     if (result?.halt) {
       halted = true;
       haltedAt = { index: idx, stage };
+      await appendCheckpoint({
+        env,
+        run: checkpointRun,
+        stepId: stage.name,
+        stepIndex: idx,
+        stepType: "pipeline_stage",
+        status: "waiting",
+        startedAt: stageStartedAt,
+        finishedAt: new Date().toISOString(),
+        metadata: { stage, halt: true },
+        io: { jsonOutput: Array.isArray(result?.output) ? result.output : undefined },
+      });
       break;
     }
+
+    await appendCheckpoint({
+      env,
+      run: checkpointRun,
+      stepId: stage.name,
+      stepIndex: idx,
+      stepType: "pipeline_stage",
+      status: "succeeded",
+      startedAt: stageStartedAt,
+      finishedAt: new Date().toISOString(),
+      metadata: { stage, rendered: Boolean(result?.rendered) },
+      io: { jsonOutput: Array.isArray(result?.output) ? result.output : undefined },
+    });
   }
 
   const items = [];
@@ -171,6 +235,17 @@ export async function runPipeline({
     }
   }
   assertRequestInputResumeConsumed(requestInputResume);
+
+  await appendCheckpoint({
+    env,
+    run: checkpointRun,
+    stepId: "pipeline_output",
+    stepIndex: pipeline.length,
+    stepType: "pipeline_result",
+    status: halted ? "waiting" : "succeeded",
+    finishedAt: new Date().toISOString(),
+    io: { jsonOutput: items },
+  });
 
   return { items, rendered, halted, haltedAt };
 
