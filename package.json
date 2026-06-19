@@ -23,7 +23,8 @@
   "bin": {
     "clawd.invoke": "bin/clawd.invoke.js",
     "lobster": "bin/lobster.js",
-    "openclaw.invoke": "bin/openclaw.invoke.js"
+    "openclaw.invoke": "bin/openclaw.invoke.js",
+    "openclaw.lobster": "bin/openclaw.lobster.js"
   },
   "files": [
     "bin",

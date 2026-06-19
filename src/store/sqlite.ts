@@ -162,6 +162,32 @@ const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_cache_namespace_accessed ON cache_entries(namespace, last_accessed_at);
     `,
   },
+  {
+    id: 2,
+    sql: `
+      ALTER TABLE jobs ADD COLUMN external_session_id TEXT;
+      ALTER TABLE jobs ADD COLUMN external_session_provider TEXT;
+
+      CREATE TABLE IF NOT EXISTS run_controls (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        desired TEXT NOT NULL DEFAULT 'none',
+        step_mode INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES runs(run_id),
+        FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_run_controls_job ON run_controls(job_id);
+    `,
+  },
+  {
+    id: 3,
+    sql: `
+      ALTER TABLE jobs ADD COLUMN agent TEXT;
+      ALTER TABLE jobs ADD COLUMN model TEXT;
+    `,
+  },
 ];
 
 export async function openRuntimeDb(env: Record<string, string | undefined>) {

@@ -6,16 +6,21 @@ import path from "node:path";
 
 import {
   appendCheckpoint,
+  clearRunControlDesired,
   createApprovalRecord,
   createRun,
   getCheckpoint,
   getCheckpointIO,
+  getJob,
+  getRunControl,
   listJobRuns,
   listJobCheckpoints,
   listJobs,
   listPendingApprovals,
   listRunCheckpoints,
   readCacheEntry,
+  setJobExternalSession,
+  setRunControl,
   writeCacheEntry,
 } from "../src/store/runtime_store.js";
 import { withRuntimeDb } from "../src/store/sqlite.js";
@@ -124,6 +129,95 @@ test("sqlite runtime store persists runs, checkpoints, approvals, and cache entr
   const cache = await readCacheEntry({ env, namespace: "test", cacheKey: "k1" });
   assert.deepEqual(cache?.items, [{ answer: 42 }]);
   assert.equal(cache?.hitCount, 1);
+});
+
+test("migration id 2 adds session columns and the run_controls table", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration2-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+
+  const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
+
+  const jobColumns = await withRuntimeDb(
+    env,
+    (db) => db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>,
+  );
+  const jobColumnNames = jobColumns.map((row) => row.name);
+  assert.ok(jobColumnNames.includes("external_session_id"));
+  assert.ok(jobColumnNames.includes("external_session_provider"));
+
+  const controlTable = await withRuntimeDb(
+    env,
+    (db) =>
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_controls'")
+        .get() as { name: string } | undefined,
+  );
+  assert.equal(controlTable?.name, "run_controls");
+
+  // setJobExternalSession round-trips through getJob/listJobs.
+  await setJobExternalSession({
+    env,
+    jobId: run.jobId,
+    sessionId: "sess-xyz",
+    provider: "openclaw",
+  });
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.externalSessionId, "sess-xyz");
+  assert.equal(job?.externalSessionProvider, "openclaw");
+  const { jobs } = await listJobs({ env });
+  assert.equal(jobs.find((entry) => entry.jobId === run.jobId)?.externalSessionId, "sess-xyz");
+
+  // run control upsert + clear semantics.
+  await setRunControl({ env, runId: run.runId, jobId: run.jobId, stepMode: true });
+  let control = await getRunControl({ env, runId: run.runId });
+  assert.equal(control?.stepMode, true);
+  assert.equal(control?.desired, "none");
+
+  await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "pause" });
+  control = await getRunControl({ env, runId: run.runId });
+  assert.equal(control?.desired, "pause");
+  assert.equal(control?.stepMode, true, "stepMode should persist across desired updates");
+
+  await clearRunControlDesired({ env, runId: run.runId });
+  control = await getRunControl({ env, runId: run.runId });
+  assert.equal(control?.desired, "none");
+  assert.equal(control?.stepMode, true);
+});
+
+test("migration id 3 adds agent/model columns and they round-trip through createRun", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration3-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+
+  const run = await createRun({
+    env,
+    sourceType: "workflow_file",
+    workflowFile: "wf.lobster",
+    agent: "researcher",
+    model: "gpt-5",
+  });
+
+  const jobColumns = await withRuntimeDb(
+    env,
+    (db) => db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>,
+  );
+  const jobColumnNames = jobColumns.map((row) => row.name);
+  assert.ok(jobColumnNames.includes("agent"));
+  assert.ok(jobColumnNames.includes("model"));
+
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.agent, "researcher");
+  assert.equal(job?.model, "gpt-5");
+
+  const { jobs } = await listJobs({ env });
+  const listed = jobs.find((entry) => entry.jobId === run.jobId);
+  assert.equal(listed?.agent, "researcher");
+  assert.equal(listed?.model, "gpt-5");
+
+  // agent/model are optional and default to null.
+  const bare = await createRun({ env, sourceType: "pipeline", pipelineText: "json" });
+  const bareJob = await getJob(env, bare.jobId);
+  assert.equal(bareJob?.agent, null);
+  assert.equal(bareJob?.model, null);
 });
 
 test("large payloads spill to content-addressed blobs and round-trip through the store", async () => {

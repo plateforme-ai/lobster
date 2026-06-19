@@ -2,4 +2,4 @@
 
 import { runBin } from './wrapper.js';
 
-runBin('openclaw.invoke');
+runBin('openclaw.lobster');

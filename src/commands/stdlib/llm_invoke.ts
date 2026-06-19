@@ -12,6 +12,8 @@ import {
   readCacheEntry as readSqliteCacheEntry,
   writeCacheEntry as writeSqliteCacheEntry,
 } from "../../store/runtime_store.js";
+import { DEFAULT_OPENCLAW_URL } from "../providers.js";
+import type { SupportedProvider } from "../providers.js";
 import { createCompileCached } from "../../validation.js";
 import type { LobsterCommand } from "../types.js";
 
@@ -104,12 +106,7 @@ const validatePayload = ajv.compile(payloadSchema);
 const validateResponseEnvelope = ajv.compile(responseSchema);
 
 const STATE_VERSION = 1;
-
 const DEFAULT_MAX_VALIDATION_RETRIES = 1;
-const DEFAULT_OPENCLAW_URL = "http://127.0.0.1:18789";
-
-type BuiltInProvider = "openclaw" | "pi" | "http";
-type SupportedProvider = BuiltInProvider | string;
 
 type LlmResponseEnvelope = {
   ok: boolean;
@@ -573,11 +570,14 @@ function resolveAdapter({
     const openclawUrl = String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? DEFAULT_OPENCLAW_URL).trim();
     const endpoint = new URL("/tools/invoke", openclawUrl);
     const token = String(args.token ?? env.OPENCLAW_TOKEN ?? env.CLAWD_TOKEN ?? "").trim();
+    const sessionKey =
+      args.sessionKey ?? args["session-key"] ?? env.LOBSTER_JOB_SESSION_KEY ?? null;
+    const agent = args.agent ?? env.LOBSTER_JOB_AGENT ?? null;
     return {
       provider,
       source: config.sourceForProvider?.(provider) ?? "openclaw",
       async invoke({ payload }) {
-        return invokeOpenClawAdapter({ endpoint, token, payload });
+        return invokeOpenClawAdapter({ endpoint, token, payload, sessionKey, agent });
       },
     };
   }
@@ -634,10 +634,14 @@ async function invokeOpenClawAdapter({
   endpoint,
   token,
   payload,
+  sessionKey,
+  agent,
 }: {
   endpoint: URL;
   token: string;
   payload: any;
+  sessionKey?: string | null;
+  agent?: string | null;
 }) {
   const args = toOpenClawToolArgs(payload);
   const res = await fetch(endpoint, {
@@ -650,6 +654,8 @@ async function invokeOpenClawAdapter({
       tool: "llm-task",
       action: "invoke",
       args,
+      ...(sessionKey ? { sessionKey: String(sessionKey) } : null),
+      ...(agent ? { agent: String(agent) } : null),
     }),
   });
 
@@ -793,7 +799,7 @@ async function invokeHttpAdapter({
 function resolveModel(args: any, env: any, legacyEnvCompat: boolean | undefined) {
   return resolveEnvString(
     args.model,
-    ["LOBSTER_LLM_MODEL", ...(legacyEnvCompat ? ["LLM_TASK_MODEL"] : [])],
+    ["LOBSTER_LLM_MODEL", "LOBSTER_JOB_MODEL", ...(legacyEnvCompat ? ["LLM_TASK_MODEL"] : [])],
     env,
     "",
   );

@@ -11,7 +11,21 @@ export type JobRecord = {
   finalOutput?: unknown;
   finalOutputBlobId?: string | null;
   latestCheckpointId?: string | null;
+  externalSessionId?: string | null;
+  externalSessionProvider?: string | null;
+  agent?: string | null;
+  model?: string | null;
   createdAt: string;
+  updatedAt: string;
+};
+
+export type RunControlState = "none" | "pause" | "cancel";
+
+export type RunControlRecord = {
+  runId: string;
+  jobId: string;
+  desired: RunControlState;
+  stepMode: boolean;
   updatedAt: string;
 };
 

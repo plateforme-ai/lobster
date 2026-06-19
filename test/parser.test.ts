@@ -43,3 +43,12 @@ test("parsePipeline preserves escaped apostrophes in single-quoted args", () => 
   const parsed = JSON.parse(raw);
   assert.equal(parsed.prompt, "don't");
 });
+
+test("parsePipeline parses openclaw.lobster action as positional", () => {
+  const p = parsePipeline('openclaw.lobster run --args-json \'{"filePath":"x.lobster"}\'');
+  assert.equal(p.length, 1);
+  assert.equal(p[0].name, "openclaw.lobster");
+  assert.deepEqual(p[0].args._, ["run"]);
+  assert.equal((p[0].args as any).action, undefined);
+  assert.equal(p[0].args["args-json"], '{"filePath":"x.lobster"}');
+});

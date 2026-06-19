@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   listRunCheckpoints,
   rerunToolRequest,
+  resumeToolRequest,
   rewindToolRequest,
   runToolRequest,
 } from "../src/core/index.js";
@@ -69,4 +70,176 @@ test("rerun creates a linked run and rewind creates a child run from checkpoint 
   assert.ok(rewind.runId);
   assert.notEqual(rewind.jobId, first.jobId);
   assert.deepEqual(rewind.output, [{ n: 2 }]);
+});
+
+test("rewind applies per-step input overrides to downstream steps", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-rewind-input-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          { id: "one", run: 'node -e "process.stdout.write(JSON.stringify({n:1}))"' },
+          { id: "two", run: 'node -e "process.stdin.pipe(process.stdout)"', stdin: "$one.json" },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
+  assert.equal(first.status, "ok");
+  assert.deepEqual(first.output, [{ n: 1 }]);
+
+  const checkpoints = await listRunCheckpoints({ runId: first.runId!, ctx: { env } });
+  const one = checkpoints.find(
+    (checkpoint) => checkpoint.stepId === "one" && checkpoint.status === "succeeded",
+  );
+  assert.ok(one);
+
+  const rewind = await rewindToolRequest({
+    jobId: first.jobId!,
+    checkpointId: one!.checkpointId,
+    inputOverride: { one: { json: { n: 99 } } },
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(rewind.status, "ok");
+  assert.deepEqual(rewind.output, [{ n: 99 }]);
+});
+
+test("rewind rejects an input override for an unknown step", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-rewind-badinput-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [{ id: "one", run: 'node -e "process.stdout.write(JSON.stringify({n:1}))"' }],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
+  const checkpoints = await listRunCheckpoints({ runId: first.runId!, ctx: { env } });
+  const one = checkpoints.find(
+    (checkpoint) => checkpoint.stepId === "one" && checkpoint.status === "succeeded",
+  );
+
+  const rewind = await rewindToolRequest({
+    jobId: first.jobId!,
+    checkpointId: one!.checkpointId,
+    inputOverride: { missing: { json: { n: 1 } } },
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(rewind.ok, false);
+  assert.equal((rewind as { error?: { type?: string } }).error?.type, "invalid_input_override");
+});
+
+test("resume can edit workflow args via argsPatch", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-resume-args-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        args: { greeting: { default: "hi" } },
+        steps: [
+          {
+            id: "gate",
+            run: 'node -e "process.stdout.write(JSON.stringify({ok:1}))"',
+            approval: true,
+          },
+          {
+            id: "say",
+            run: 'node -e "process.stdout.write(JSON.stringify({g: process.env.LOBSTER_ARG_GREETING}))"',
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
+  assert.equal(first.status, "needs_approval");
+  assert.ok(first.requiresApproval?.resumeToken);
+
+  const resumed = await resumeToolRequest({
+    token: first.requiresApproval!.resumeToken,
+    approved: true,
+    argsPatch: { greeting: "bye" },
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(resumed.status, "ok");
+  assert.deepEqual(resumed.output, [{ g: "bye" }]);
+});
+
+test("resume can edit the approved payload (edit-then-approve)", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-resume-approve-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          {
+            id: "gate",
+            run: 'node -e "process.stdout.write(JSON.stringify({v:1}))"',
+            approval: true,
+          },
+          {
+            id: "use",
+            run: 'node -e "process.stdin.pipe(process.stdout)"',
+            stdin: "$gate.json",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
+  assert.equal(first.status, "needs_approval");
+
+  const resumed = await resumeToolRequest({
+    token: first.requiresApproval!.resumeToken,
+    approved: true,
+    approvedPayloadOverride: { v: 42 },
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(resumed.status, "ok");
+  assert.deepEqual(resumed.output, [{ v: 42 }]);
 });

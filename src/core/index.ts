@@ -18,4 +18,8 @@ export {
   getCheckpointIO,
   rerunToolRequest,
   rewindToolRequest,
+  pauseRun,
+  cancelRun,
+  setStepMode,
+  setJobExternalSession,
 } from "./tool_runtime.js";

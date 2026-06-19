@@ -8,6 +8,8 @@ import type {
   CheckpointIORecord,
   CheckpointRecord,
   JobRecord,
+  RunControlRecord,
+  RunControlState,
   WorkflowExecutionContext,
   RunRecord,
   RunStatus,
@@ -51,6 +53,8 @@ export async function createRun(params: {
   workflowName?: string | null;
   pipelineText?: string | null;
   args?: unknown;
+  agent?: string | null;
+  model?: string | null;
   rerunOfJobId?: string | null;
   rewindOfJobId?: string | null;
   rewindOfCheckpointId?: string | null;
@@ -62,8 +66,8 @@ export async function createRun(params: {
     db.prepare(
       `INSERT INTO jobs (
         job_id, root_run_id, status, source_type, rerun_of_job_id, rewind_of_job_id,
-        rewind_of_checkpoint_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        rewind_of_checkpoint_id, agent, model, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       jobId,
       runId,
@@ -72,6 +76,8 @@ export async function createRun(params: {
       params.rerunOfJobId ?? null,
       params.rewindOfJobId ?? null,
       params.rewindOfCheckpointId ?? null,
+      params.agent ?? null,
+      params.model ?? null,
       now,
       now,
     );
@@ -173,8 +179,8 @@ export async function updateRun(params: {
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
       `UPDATE runs
-       SET status = ?, latest_checkpoint_id = ?, updated_at = ?
-       WHERE run_id = ?`,
+      SET status = ?, latest_checkpoint_id = ?, updated_at = ?
+      WHERE run_id = ?`,
     ).run(
       params.status ?? current?.status ?? "running",
       params.latestCheckpointId ?? current?.latestCheckpointId ?? null,
@@ -184,9 +190,9 @@ export async function updateRun(params: {
     if (current?.rootRunId === params.runId || current?.runId === current?.rootRunId) {
       db.prepare(
         `UPDATE jobs
-         SET status = ?, latest_checkpoint_id = ?, final_output_json = ?,
-             final_output_blob_id = ?, updated_at = ?
-         WHERE job_id = ?`,
+        SET status = ?, latest_checkpoint_id = ?, final_output_json = ?,
+          final_output_blob_id = ?, updated_at = ?
+        WHERE job_id = ?`,
       ).run(
         params.status ?? current?.status ?? "running",
         params.latestCheckpointId ?? current?.latestCheckpointId ?? null,
@@ -213,8 +219,8 @@ export async function getRun(
       db
         .prepare(
           `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id
-           FROM runs JOIN jobs ON jobs.job_id = runs.job_id
-           WHERE runs.run_id = ?`,
+          FROM runs JOIN jobs ON jobs.job_id = runs.job_id
+          WHERE runs.run_id = ?`,
         )
         .get(runId) as any,
   );
@@ -232,6 +238,127 @@ export async function getJob(
   );
   if (!row) return null;
   return rowToJob(env, row);
+}
+
+export async function setJobExternalSession(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+  sessionId: string | null;
+  provider?: string | null;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `UPDATE jobs SET external_session_id = ?, external_session_provider = ?, updated_at = ? WHERE job_id = ?`,
+    ).run(params.sessionId ?? null, params.provider ?? null, now, params.jobId);
+  });
+}
+
+export async function getRunControl(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}): Promise<RunControlRecord | null> {
+  const row = await withRuntimeDb(
+    params.env,
+    (db) => db.prepare("SELECT * FROM run_controls WHERE run_id = ?").get(params.runId) as any,
+  );
+  if (!row) return null;
+  return {
+    runId: row.run_id,
+    jobId: row.job_id,
+    desired: (row.desired as RunControlState) ?? "none",
+    stepMode: Boolean(row.step_mode),
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function setRunControl(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+  jobId: string;
+  desired?: RunControlState;
+  stepMode?: boolean;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    const existing = db
+      .prepare("SELECT desired, step_mode FROM run_controls WHERE run_id = ?")
+      .get(params.runId) as { desired?: string; step_mode?: number } | undefined;
+    const desired = params.desired ?? (existing?.desired as RunControlState) ?? "none";
+    const stepMode = params.stepMode ?? (existing ? Boolean(existing.step_mode) : false);
+    db.prepare(
+      `INSERT INTO run_controls (run_id, job_id, desired, step_mode, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        job_id = excluded.job_id,
+        desired = excluded.desired,
+        step_mode = excluded.step_mode,
+        updated_at = excluded.updated_at`,
+    ).run(params.runId, params.jobId, desired, stepMode ? 1 : 0, now);
+  });
+}
+
+export async function clearRunControlDesired(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare("UPDATE run_controls SET desired = 'none', updated_at = ? WHERE run_id = ?").run(
+      now,
+      params.runId,
+    );
+  });
+}
+
+/**
+ * Resolve the most recent waiting resume point for a run/job and return its resume `stateKey`. Used to resume a
+ * paused/gated run by jobId/runId when no token is supplied. Approval and input gates carry `state_key` on the
+ * approvals row; pause/input/approval gates also persist `metadata.stateKey` on a `waiting` checkpoint, so we fall back
+ * to the latest such checkpoint.
+ */
+export async function findLatestResumeStateKey(params: {
+  env: Record<string, string | undefined>;
+  jobId?: string | null;
+  runId?: string | null;
+}): Promise<string | null> {
+  if (!params.jobId && !params.runId) return null;
+  return withRuntimeDb(params.env, (db) => {
+    const approvalRow = (
+      params.runId
+        ? db
+            .prepare(
+              "SELECT state_key FROM approvals WHERE status = 'waiting' AND run_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .get(params.runId)
+        : db
+            .prepare(
+              "SELECT state_key FROM approvals WHERE status = 'waiting' AND job_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .get(params.jobId)
+    ) as { state_key?: string | null } | undefined;
+    if (approvalRow?.state_key) return approvalRow.state_key;
+
+    const checkpointRows = (
+      params.runId
+        ? db
+            .prepare(
+              "SELECT metadata_json FROM checkpoints WHERE status = 'waiting' AND run_id = ? ORDER BY created_at DESC",
+            )
+            .all(params.runId)
+        : db
+            .prepare(
+              "SELECT metadata_json FROM checkpoints WHERE status = 'waiting' AND job_id = ? ORDER BY created_at DESC",
+            )
+            .all(params.jobId)
+    ) as Array<{ metadata_json?: string | null }>;
+    for (const row of checkpointRows) {
+      const metadata = parseJsonSafe(row.metadata_json ?? null) as { stateKey?: unknown } | null;
+      if (metadata && typeof metadata.stateKey === "string" && metadata.stateKey) {
+        return metadata.stateKey;
+      }
+    }
+    return null;
+  });
 }
 
 export async function listJobs(params: {
@@ -523,8 +650,7 @@ export async function resolveApprovalRecord(params: {
   await withRuntimeDb(params.env, (db) => {
     if (params.approvalId) {
       db.prepare(
-        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ?
-         WHERE approval_id = ?`,
+        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ? WHERE approval_id = ?`,
       ).run(
         params.status,
         params.decision ?? null,
@@ -536,8 +662,7 @@ export async function resolveApprovalRecord(params: {
     }
     if (params.stateKey) {
       db.prepare(
-        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ?
-         WHERE state_key = ? AND status = 'waiting'`,
+        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ? WHERE state_key = ? AND status = 'waiting'`,
       ).run(
         params.status,
         params.decision ?? null,
@@ -567,9 +692,7 @@ export async function readCacheEntry(params: {
 
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
-      `UPDATE cache_entries
-       SET last_accessed_at = ?, hit_count = hit_count + 1
-       WHERE namespace = ? AND cache_key = ?`,
+      `UPDATE cache_entries SET last_accessed_at = ?, hit_count = hit_count + 1 WHERE namespace = ? AND cache_key = ?`,
     ).run(now, params.namespace, params.cacheKey);
   });
 
@@ -736,9 +859,7 @@ async function optionalPayload(
 async function upsertBlob(env: Record<string, string | undefined>, blob: BlobRecord) {
   await withRuntimeDb(env, (db) => {
     db.prepare(
-      `INSERT OR IGNORE INTO blobs
-        (blob_id, sha256, byte_length, content_type, storage_path, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO blobs (blob_id, sha256, byte_length, content_type, storage_path, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(
       blob.blobId,
       blob.sha256,
@@ -777,6 +898,10 @@ async function rowToJob(env: Record<string, string | undefined>, row: any): Prom
     finalOutput,
     finalOutputBlobId: row.final_output_blob_id,
     latestCheckpointId: row.latest_checkpoint_id,
+    externalSessionId: row.external_session_id ?? null,
+    externalSessionProvider: row.external_session_provider ?? null,
+    agent: row.agent ?? null,
+    model: row.model ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

@@ -22,6 +22,7 @@ import {
   checkpointsEnabled,
   createCheckpointRun,
   createRun,
+  findLatestResumeStateKey,
   getCheckpoint as getStoredCheckpoint,
   getJob as getStoredJob,
   getRun as getStoredRun,
@@ -32,6 +33,8 @@ import {
   listRunCheckpoints as listStoredRunCheckpoints,
   getCheckpointIO as getStoredCheckpointIO,
   resolveApprovalRecord,
+  setJobExternalSession as setStoredJobExternalSession,
+  setRunControl,
   updateRun,
 } from "../store/runtime_store.js";
 import type { WorkflowExecutionContext } from "../checkpoints/types.js";
@@ -48,10 +51,18 @@ type ToolRunContext = {
   llmAdapters?: Record<string, any>;
 };
 
+type PausedInfo = {
+  stepId: string;
+  stepIndex: number;
+  nextStepId?: string | null;
+  resumeToken: string;
+  reason: "pause_requested" | "step_mode";
+};
+
 type ToolEnvelope = {
   protocolVersion: 1;
   ok: boolean;
-  status?: "ok" | "needs_approval" | "needs_input" | "cancelled";
+  status?: "ok" | "needs_approval" | "needs_input" | "cancelled" | "paused";
   output?: unknown[];
   jobId?: string;
   runId?: string;
@@ -59,6 +70,9 @@ type ToolEnvelope = {
   parentRunId?: string | null;
   checkpointId?: string | null;
   latestCheckpointId?: string | null;
+  externalSessionId?: string | null;
+  externalSessionProvider?: string | null;
+  paused?: PausedInfo | null;
   requiresApproval?: {
     type?: "approval_request";
     prompt: string;
@@ -85,12 +99,18 @@ export async function runToolRequest({
   pipeline,
   filePath,
   args,
+  stepMode,
+  agent,
+  model,
   ctx = {},
   lineage = {},
 }: {
   pipeline?: string;
   filePath?: string;
   args?: Record<string, unknown>;
+  stepMode?: boolean;
+  agent?: string | null;
+  model?: string | null;
   ctx?: ToolRunContext;
   lineage?: {
     parentRunId?: string | null;
@@ -125,14 +145,25 @@ export async function runToolRequest({
         sourceType: "workflow_file",
         workflowFile: resolvedFilePath,
         args,
+        agent,
+        model,
         lineage,
       });
+      if (stepMode && checkpointRun?.runId) {
+        await setRunControl({
+          env: runtime.env,
+          runId: checkpointRun.runId,
+          jobId: checkpointRun.jobId,
+          stepMode: true,
+        });
+      }
       const output = await runWorkflowFile({
         filePath: resolvedFilePath,
         args,
         ctx: { ...runtime, checkpointRun },
       });
 
+      const sessionExtra = await sessionExtraForRun(runtime, checkpointRun);
       if (output.status === "needs_approval") {
         await maybeUpdateRun(runtime, checkpointRun, "waiting");
         return okEnvelope(
@@ -141,18 +172,33 @@ export async function runToolRequest({
           output.requiresApproval ?? null,
           null,
           checkpointRun,
+          sessionExtra,
         );
       }
       if (output.status === "needs_input") {
         await maybeUpdateRun(runtime, checkpointRun, "waiting");
-        return okEnvelope("needs_input", [], null, output.requiresInput ?? null, checkpointRun);
+        return okEnvelope(
+          "needs_input",
+          [],
+          null,
+          output.requiresInput ?? null,
+          checkpointRun,
+          sessionExtra,
+        );
+      }
+      if (output.status === "paused") {
+        await maybeUpdateRun(runtime, checkpointRun, "waiting");
+        return okEnvelope("paused", [], null, null, checkpointRun, {
+          ...sessionExtra,
+          ...pausedExtra(output),
+        });
       }
       if (output.status === "cancelled") {
         await maybeUpdateRun(runtime, checkpointRun, "cancelled");
-        return okEnvelope("cancelled", [], null, null, checkpointRun);
+        return okEnvelope("cancelled", [], null, null, checkpointRun, sessionExtra);
       }
       await maybeUpdateRun(runtime, checkpointRun, "succeeded", output.output);
-      return okEnvelope("ok", output.output, null, null, checkpointRun);
+      return okEnvelope("ok", output.output, null, null, checkpointRun, sessionExtra);
     } catch (err: any) {
       await maybeUpdateRun(runtime, checkpointRun, "failed");
       return errorEnvelope("runtime_error", err?.message ?? String(err));
@@ -172,6 +218,8 @@ export async function runToolRequest({
       sourceType: "pipeline",
       pipelineText: String(pipeline),
       args,
+      agent,
+      model,
       lineage,
     });
     const output = await runPipeline({
@@ -217,16 +265,24 @@ export async function runToolRequest({
 export async function resumeToolRequest({
   token,
   approvalId,
+  jobId,
+  runId,
   approved,
   response,
   cancel,
+  argsPatch,
+  approvedPayloadOverride,
   ctx = {},
 }: {
   token?: string;
   approvalId?: string;
+  jobId?: string;
+  runId?: string;
   approved?: boolean;
   response?: unknown;
   cancel?: boolean;
+  argsPatch?: Record<string, unknown>;
+  approvedPayloadOverride?: unknown;
   ctx?: ToolRunContext;
 }): Promise<ToolEnvelope> {
   const runtime = createToolContext(ctx);
@@ -250,8 +306,22 @@ export async function resumeToolRequest({
       });
     } else if (token) {
       resolvedToken = token;
+    } else if (jobId || runId) {
+      const stateKey = await findLatestResumeStateKey({ env: runtime.env, jobId, runId });
+      if (!stateKey) {
+        return errorEnvelope(
+          "no_resumable_state",
+          `No resumable (waiting/paused) state found for ${runId ? `run "${runId}"` : `job "${jobId}"`}`,
+        );
+      }
+      resolvedToken = encodeToken({
+        protocolVersion: 1,
+        v: 1,
+        kind: kindFromStateKey(stateKey),
+        stateKey,
+      });
     } else {
-      return errorEnvelope("parse_error", "resume requires token or approvalId");
+      return errorEnvelope("parse_error", "resume requires token, approvalId, jobId, or runId");
     }
     payload = decodeResumeToken(resolvedToken);
   } catch (err: any) {
@@ -297,16 +367,40 @@ export async function resumeToolRequest({
         approved,
         response,
         cancel,
+        argsOverride: argsPatch,
+        approvedPayloadOverride,
       });
 
+      const sessionExtra = await sessionExtraForRun(runtime, loadedRun);
       if (output.status === "needs_approval") {
         // Don't clean up index — next gate will issue a new approvalId
         await maybeUpdateRun(runtime, loadedRun, "waiting");
-        return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null, loadedRun);
+        return okEnvelope(
+          "needs_approval",
+          [],
+          output.requiresApproval ?? null,
+          null,
+          loadedRun,
+          sessionExtra,
+        );
       }
       if (output.status === "needs_input") {
         await maybeUpdateRun(runtime, loadedRun, "waiting");
-        return okEnvelope("needs_input", [], null, output.requiresInput ?? null, loadedRun);
+        return okEnvelope(
+          "needs_input",
+          [],
+          null,
+          output.requiresInput ?? null,
+          loadedRun,
+          sessionExtra,
+        );
+      }
+      if (output.status === "paused") {
+        await maybeUpdateRun(runtime, loadedRun, "waiting");
+        return okEnvelope("paused", [], null, null, loadedRun, {
+          ...sessionExtra,
+          ...pausedExtra(output),
+        });
       }
       await cleanupIndex();
       await resolveApprovalRecord({
@@ -325,10 +419,10 @@ export async function resumeToolRequest({
       });
       if (output.status === "cancelled") {
         await maybeUpdateRun(runtime, loadedRun, "cancelled");
-        return okEnvelope("cancelled", [], null, null, loadedRun);
+        return okEnvelope("cancelled", [], null, null, loadedRun, sessionExtra);
       }
       await maybeUpdateRun(runtime, loadedRun, "succeeded", output.output);
-      return okEnvelope("ok", output.output, null, null, loadedRun);
+      return okEnvelope("ok", output.output, null, null, loadedRun, sessionExtra);
     } catch (err: any) {
       if (err instanceof WorkflowResumeArgumentError) {
         return errorEnvelope("parse_error", err.message);
@@ -482,11 +576,16 @@ export function createCaptureStream() {
 }
 
 function okEnvelope(
-  status: "ok" | "needs_approval" | "needs_input" | "cancelled",
+  status: "ok" | "needs_approval" | "needs_input" | "cancelled" | "paused",
   output: unknown[],
   requiresApproval: ToolEnvelope["requiresApproval"],
   requiresInput: ToolEnvelope["requiresInput"],
   checkpointRun?: WorkflowExecutionContext,
+  extra?: {
+    paused?: PausedInfo | null;
+    externalSessionId?: string | null;
+    externalSessionProvider?: string | null;
+  },
 ) {
   return {
     protocolVersion: 1 as const,
@@ -502,9 +601,33 @@ function okEnvelope(
           latestCheckpointId: checkpointRun.latestCheckpointId ?? null,
         }
       : null),
+    ...(extra?.externalSessionId !== undefined
+      ? { externalSessionId: extra.externalSessionId }
+      : null),
+    ...(extra?.externalSessionProvider !== undefined
+      ? { externalSessionProvider: extra.externalSessionProvider }
+      : null),
+    ...(extra?.paused !== undefined ? { paused: extra.paused } : null),
     requiresApproval,
     requiresInput,
   };
+}
+
+async function sessionExtraForRun(
+  runtime: ReturnType<typeof createToolContext>,
+  checkpointRun: WorkflowExecutionContext | undefined,
+): Promise<{ externalSessionId?: string | null; externalSessionProvider?: string | null }> {
+  if (!checkpointRun?.jobId) return {};
+  const job = await getStoredJob(runtime.env, checkpointRun.jobId).catch(() => null);
+  if (!job) return {};
+  return {
+    externalSessionId: job.externalSessionId ?? null,
+    externalSessionProvider: job.externalSessionProvider ?? null,
+  };
+}
+
+function pausedExtra(output: { paused?: PausedInfo }): { paused: PausedInfo | null } {
+  return { paused: output.paused ?? null };
 }
 
 function errorEnvelope(type: string, message: string): ToolEnvelope {
@@ -605,7 +728,15 @@ export async function rerunToolRequest({
   inputOverride?: unknown;
   ctx?: ToolRunContext;
 }) {
-  void inputOverride;
+  // rerun starts from index 0 with no checkpoint snapshot, so per-step input
+  // overrides do not apply; edit `argsPatch` (workflow args) instead, or use
+  // rewind with `inputOverride` to edit a specific step's prior output.
+  if (inputOverride !== undefined) {
+    return errorEnvelope(
+      "invalid_input_override",
+      "inputOverride is not supported for rerun; use argsPatch or rewind with inputOverride",
+    );
+  }
   const runtime = createToolContext(ctx);
   const job = await getStoredJob(runtime.env, jobId);
   if (!job?.rootRunId) return errorEnvelope("not_found", `Job "${jobId}" not found`);
@@ -616,6 +747,8 @@ export async function rerunToolRequest({
     return runToolRequest({
       filePath: run.workflowFile,
       args,
+      agent: job.agent ?? null,
+      model: job.model ?? null,
       ctx,
       lineage: { rerunOfJobId: job.jobId },
     });
@@ -624,6 +757,8 @@ export async function rerunToolRequest({
     return runToolRequest({
       pipeline: run.pipelineText,
       args,
+      agent: job.agent ?? null,
+      model: job.model ?? null,
       ctx,
       lineage: { rerunOfJobId: job.jobId },
     });
@@ -645,11 +780,10 @@ export async function rewindToolRequest({
   jobId: string;
   checkpointId: string;
   argsPatch?: Record<string, unknown>;
-  inputOverride?: unknown;
+  inputOverride?: Record<string, Record<string, unknown>>;
   envPatch?: Record<string, string | undefined>;
   ctx?: ToolRunContext;
 }) {
-  void inputOverride;
   const runtime = createToolContext({ ...ctx, env: { ...ctx.env, ...envPatch } });
   const job = await getStoredJob(runtime.env, jobId);
   if (!job?.rootRunId) return errorEnvelope("not_found", `Job "${jobId}" not found`);
@@ -674,11 +808,30 @@ export async function rewindToolRequest({
       "Checkpoint does not contain workflow replay state",
     );
   }
+
+  // Apply per-step input overrides into the replay snapshot so downstream steps
+  // and conditions observe the edited prior outputs.
+  let steps = metadata.resultsSnapshot as Record<string, any>;
+  if (inputOverride && Object.keys(inputOverride).length > 0) {
+    steps = { ...steps };
+    for (const [stepId, patch] of Object.entries(inputOverride)) {
+      if (!(stepId in steps)) {
+        return errorEnvelope(
+          "invalid_input_override",
+          `Step "${stepId}" is not present in the checkpoint snapshot for job "${jobId}"`,
+        );
+      }
+      steps[stepId] = { ...steps[stepId], ...patch };
+    }
+  }
+
   const checkpointRun = await createRun({
     env: runtime.env,
     sourceType: "workflow_file",
     workflowFile: targetRun.workflowFile,
     args: mergePatch(targetRun.args, argsPatch),
+    agent: job.agent ?? null,
+    model: job.model ?? null,
     rewindOfJobId: job.jobId,
     rewindOfCheckpointId: checkpoint.checkpointId,
   });
@@ -695,28 +848,172 @@ export async function rewindToolRequest({
           checkpoint.status === "succeeded" || checkpoint.status === "skipped"
             ? checkpoint.stepIndex + 1
             : checkpoint.stepIndex,
-        steps: metadata.resultsSnapshot,
+        steps,
         args: mergePatch(targetRun.args, argsPatch),
       },
     });
+    const sessionExtra = await sessionExtraForRun(runtime, checkpointRun);
     if (output.status === "needs_approval") {
       await maybeUpdateRun(runtime, checkpointRun, "waiting");
-      return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null, checkpointRun);
+      return okEnvelope(
+        "needs_approval",
+        [],
+        output.requiresApproval ?? null,
+        null,
+        checkpointRun,
+        sessionExtra,
+      );
     }
     if (output.status === "needs_input") {
       await maybeUpdateRun(runtime, checkpointRun, "waiting");
-      return okEnvelope("needs_input", [], null, output.requiresInput ?? null, checkpointRun);
+      return okEnvelope(
+        "needs_input",
+        [],
+        null,
+        output.requiresInput ?? null,
+        checkpointRun,
+        sessionExtra,
+      );
+    }
+    if (output.status === "paused") {
+      await maybeUpdateRun(runtime, checkpointRun, "waiting");
+      return okEnvelope("paused", [], null, null, checkpointRun, {
+        ...sessionExtra,
+        ...pausedExtra(output),
+      });
     }
     if (output.status === "cancelled") {
       await maybeUpdateRun(runtime, checkpointRun, "cancelled");
-      return okEnvelope("cancelled", [], null, null, checkpointRun);
+      return okEnvelope("cancelled", [], null, null, checkpointRun, sessionExtra);
     }
     await maybeUpdateRun(runtime, checkpointRun, "succeeded", output.output);
-    return okEnvelope("ok", output.output, null, null, checkpointRun);
+    return okEnvelope("ok", output.output, null, null, checkpointRun, sessionExtra);
   } catch (err: any) {
     await maybeUpdateRun(runtime, checkpointRun, "failed");
     return errorEnvelope("runtime_error", err?.message ?? String(err));
   }
+}
+
+async function resolveControlTarget(
+  runtime: ReturnType<typeof createToolContext>,
+  params: { jobId?: string | null; runId?: string | null },
+): Promise<{ runId: string; jobId: string } | { error: ToolEnvelope }> {
+  if (params.runId) {
+    const run = await getStoredRun(runtime.env, params.runId);
+    if (!run) {
+      return { error: errorEnvelope("not_found", `Run "${params.runId}" not found`) };
+    }
+    return { runId: run.runId, jobId: run.jobId };
+  }
+  if (params.jobId) {
+    const job = await getStoredJob(runtime.env, params.jobId);
+    if (!job?.rootRunId) {
+      return { error: errorEnvelope("not_found", `Job "${params.jobId}" not found`) };
+    }
+    return { runId: job.rootRunId, jobId: job.jobId };
+  }
+  return {
+    error: errorEnvelope("parse_error", "pause/cancel/setStepMode requires jobId or runId"),
+  };
+}
+
+export async function pauseRun(params: {
+  jobId?: string | null;
+  runId?: string | null;
+  ctx?: ToolRunContext;
+}): Promise<ToolEnvelope> {
+  const runtime = createToolContext(params.ctx);
+  const target = await resolveControlTarget(runtime, params);
+  if ("error" in target) return target.error;
+  await setRunControl({
+    env: runtime.env,
+    runId: target.runId,
+    jobId: target.jobId,
+    desired: "pause",
+  });
+  return {
+    protocolVersion: 1,
+    ok: true,
+    status: "ok",
+    output: [],
+    jobId: target.jobId,
+    runId: target.runId,
+  };
+}
+
+export async function cancelRun(params: {
+  jobId?: string | null;
+  runId?: string | null;
+  ctx?: ToolRunContext;
+}): Promise<ToolEnvelope> {
+  const runtime = createToolContext(params.ctx);
+  const target = await resolveControlTarget(runtime, params);
+  if ("error" in target) return target.error;
+  await setRunControl({
+    env: runtime.env,
+    runId: target.runId,
+    jobId: target.jobId,
+    desired: "cancel",
+  });
+  return {
+    protocolVersion: 1,
+    ok: true,
+    status: "ok",
+    output: [],
+    jobId: target.jobId,
+    runId: target.runId,
+  };
+}
+
+export async function setStepMode(params: {
+  jobId?: string | null;
+  runId?: string | null;
+  stepMode: boolean;
+  ctx?: ToolRunContext;
+}): Promise<ToolEnvelope> {
+  const runtime = createToolContext(params.ctx);
+  const target = await resolveControlTarget(runtime, params);
+  if ("error" in target) return target.error;
+  await setRunControl({
+    env: runtime.env,
+    runId: target.runId,
+    jobId: target.jobId,
+    stepMode: params.stepMode,
+  });
+  return {
+    protocolVersion: 1,
+    ok: true,
+    status: "ok",
+    output: [],
+    jobId: target.jobId,
+    runId: target.runId,
+  };
+}
+
+export async function setJobExternalSession(params: {
+  jobId: string;
+  sessionId: string | null;
+  provider?: string | null;
+  ctx?: ToolRunContext;
+}): Promise<ToolEnvelope> {
+  const runtime = createToolContext(params.ctx);
+  const job = await getStoredJob(runtime.env, params.jobId);
+  if (!job) return errorEnvelope("not_found", `Job "${params.jobId}" not found`);
+  await setStoredJobExternalSession({
+    env: runtime.env,
+    jobId: params.jobId,
+    sessionId: params.sessionId,
+    provider: params.provider ?? "openclaw",
+  });
+  return {
+    protocolVersion: 1,
+    ok: true,
+    status: "ok",
+    output: [],
+    jobId: params.jobId,
+    externalSessionId: params.sessionId,
+    externalSessionProvider: params.provider ?? "openclaw",
+  };
 }
 
 async function maybeCreateRun(params: {
@@ -725,6 +1022,8 @@ async function maybeCreateRun(params: {
   workflowFile?: string;
   pipelineText?: string;
   args?: unknown;
+  agent?: string | null;
+  model?: string | null;
   lineage?: {
     parentRunId?: string | null;
     rerunOfJobId?: string | null;
@@ -745,6 +1044,8 @@ async function maybeCreateRun(params: {
     workflowFile: params.workflowFile,
     pipelineText: params.pipelineText,
     args: params.args,
+    agent: params.agent,
+    model: params.model,
     rerunOfJobId: params.lineage?.rerunOfJobId,
     rewindOfJobId: params.lineage?.rewindOfJobId,
     rewindOfCheckpointId: params.lineage?.rewindOfCheckpointId,

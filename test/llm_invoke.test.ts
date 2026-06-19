@@ -248,6 +248,108 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
   }
 });
 
+test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
+  const registry = createDefaultRegistry();
+  const cmd = registry.get("llm.invoke");
+  assert.ok(cmd);
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const requestLog: any[] = [];
+  const server = http.createServer((req, res) => {
+    let buf = "";
+    req.setEncoding("utf8");
+    req.on("data", (d) => (buf += d));
+    req.on("end", () => {
+      const parsed = JSON.parse(buf || "{}");
+      requestLog.push(parsed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          result: { model: parsed.model, output: { data: { ok: true } } },
+        }),
+      );
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  try {
+    const result = await cmd.run({
+      input: streamOf([]),
+      args: { _: [], provider: "pi", prompt: "Use job model" },
+      ctx: baseCtx(
+        {
+          LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
+          LOBSTER_LLM_MODEL: undefined,
+          LOBSTER_JOB_MODEL: "job/model",
+          LOBSTER_CACHE_DIR: cacheDir,
+        },
+        registry,
+      ),
+    } as any);
+
+    const items = await collect(result.output!);
+    assert.equal(items[0].model, "job/model");
+    assert.equal(requestLog[0].model, "job/model");
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+    await closeServer(server);
+  }
+});
+
+test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => {
+  const registry = createDefaultRegistry();
+  const cmd = registry.get("llm.invoke");
+  assert.ok(cmd);
+  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const requestLog: any[] = [];
+  const server = http.createServer((req, res) => {
+    let buf = "";
+    req.setEncoding("utf8");
+    req.on("data", (d) => (buf += d));
+    req.on("end", () => {
+      const parsed = JSON.parse(buf || "{}");
+      requestLog.push(parsed);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          result: { model: parsed.model, output: { data: { ok: true } } },
+        }),
+      );
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  try {
+    const result = await cmd.run({
+      input: streamOf([]),
+      args: { _: [], provider: "pi", prompt: "Use llm model" },
+      ctx: baseCtx(
+        {
+          LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
+          LOBSTER_LLM_MODEL: "llm/model",
+          LOBSTER_JOB_MODEL: "job/model",
+          LOBSTER_CACHE_DIR: cacheDir,
+        },
+        registry,
+      ),
+    } as any);
+
+    const items = await collect(result.output!);
+    assert.equal(items[0].model, "llm/model");
+    assert.equal(requestLog[0].model, "llm/model");
+  } finally {
+    await rm(cacheDir, { recursive: true, force: true });
+    await closeServer(server);
+  }
+});
+
 function baseCtx(envOverrides: Record<string, string | undefined>, registry?: any) {
   return {
     stdin: process.stdin,

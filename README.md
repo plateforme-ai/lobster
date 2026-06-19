@@ -173,14 +173,9 @@ From this folder:
 - `json`, `table`: renderers
 - `approve`: approval gate (TTY prompt or `--emit` for OpenClaw integration)
 
-## Next steps
-
-- OpenClaw integration: ship as an optional OpenClaw plugin tool.
-
 ## Durable OpenClaw Runtime Store
 
-This fork can persist OpenClaw-oriented run history in SQLite using Node's built-in
-`node:sqlite` runtime. Enable checkpoint capture with:
+This package can persist OpenClaw-oriented run history in SQLite using Node's built-in `node:sqlite` runtime. Enable checkpoint capture with:
 
 ```txt
 LOBSTER_CHECKPOINTS_ENABLED=true
@@ -188,33 +183,21 @@ LOBSTER_STORE=sqlite
 LOBSTER_SQLITE_PATH=<LOBSTER_STATE_DIR>/lobster.db
 ```
 
-The SQLite store owns durable job, run, checkpoint, approval, cache index, and
-blob metadata records. Jobs, workflow runs, checkpoints, and approval history
-are retained by default so OpenClaw can list jobs, inspect step history, rerun
-from the start, and rewind from supported checkpoints.
+The SQLite store owns durable job, run, checkpoint, approval, cache index, and blob metadata records. Jobs, workflow runs, checkpoints, and approval history are retained by default so OpenClaw can list jobs, inspect step history, rerun from the start, and rewind from supported checkpoints.
 
 Runtime identifiers use these meanings:
 
 - `jobId`: one customer/root request.
-- `runId`: one concrete workflow invocation. A nested workflow gets its own
-  `runId`.
+- `runId`: one concrete workflow invocation. A nested workflow gets its own `runId`.
 - `rootRunId`: the root workflow invocation for the job.
 - `parentRunId`: the caller workflow invocation for nested workflows.
 - `stepPath`: stable nested path, for example `root.review.childStep`.
 
-Nested workflows share the same `jobId` and get separate child `runId` rows.
-Child workflow approval/input waits bubble up to the caller envelope and resume
-through a persisted call stack, so approving a child workflow can continue the
-child and then the parent workflow.
+Nested workflows share the same `jobId` and get separate child `runId` rows. Child workflow approval/input waits bubble up to the caller envelope and resume through a persisted call stack, so approving a child workflow can continue the child and then the parent workflow.
 
-Current rewind support is strongest for linear root and child workflow
-checkpoints. Rewind inside `parallel`, `for_each`, or command-level pipeline
-suspension may return `replay_not_supported` until those replay boundaries are
-fully captured.
+Current rewind support is strongest for linear root and child workflow checkpoints. Rewind inside `parallel`, `for_each`, or command-level pipeline suspension may return `replay_not_supported` until those replay boundaries are fully captured.
 
-Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are
-stored inline; larger cached inputs/outputs are written as content-addressed
-blobs under `LOBSTER_STATE_DIR/blobs/` and referenced from SQLite.
+Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are stored inline; larger cached inputs/outputs are written as content-addressed blobs under `LOBSTER_STATE_DIR/blobs/` and referenced from SQLite.
 
 Useful cache settings:
 
@@ -231,6 +214,53 @@ Public dashboard/plugin APIs are exported from `@plateforme-ai/lobster/core`:
 - `listJobRuns({ jobId })` returns root and nested workflow invocations for a job.
 - `listPendingApprovals({ jobId, runId, limit, cursor })` powers global or job-scoped approval inboxes.
 - `listJobCheckpoints({ jobId })`, `getCheckpointIO({ checkpointId })`, `rerunToolRequest({ jobId })`, and `rewindToolRequest({ jobId, checkpointId })` complete the inspect/rerun/rewind dashboard flow.
+
+### Run control (pause / cancel / step-by-step)
+
+Long workflow-file runs can be controlled cooperatively. The runtime checks a persisted control record at each step boundary, so control requests are honored between steps (the currently running step is not interrupted, except best-effort via the existing `AbortSignal`). Control state lives in the `run_controls` table and is keyed by `runId`; resolving a `jobId` targets its root run.
+
+- `runToolRequest({ filePath, stepMode: true })` starts a run that pauses after each step. The first step runs, then the run returns `status: "paused"` with a `paused` payload `{ stepId, stepIndex, nextStepId, resumeToken, reason }`.
+- `pauseRun({ jobId })` / `pauseRun({ runId })` requests a one-shot pause at the next step boundary.
+- `cancelRun({ jobId })` requests cancellation; the run returns `status: "cancelled"` at the next boundary (including a resumed paused run).
+- `setStepMode({ jobId, stepMode })` toggles sticky step-by-step mode.
+- Continue a paused run by calling `resumeToolRequest({ token })` with the `paused.resumeToken` (no `approved`/`response` needed). In step mode each resume advances exactly one step.
+- Continue without a token by passing `resumeToolRequest({ jobId })` (or `{ runId }`). Core resolves the latest `waiting`/paused resume point for that job/run (approval and input gates, plus `pause`/step-mode pauses) and advances it. If nothing is waiting it returns `no_resumable_state`. This lets a job chat resume by saying "continue" without tracking tokens. `approved`/`response`, `argsPatch`, and `approvedPayloadOverride` work the same as the token path.
+
+> `paused` is a non-terminal status (resumable). Terminal statuses are `ok`, `cancelled`, and errors. The CLI exposes `lobster pause --job <id>`, `lobster cancel --job <id>`, and `lobster step-mode --job <id> --on|--off`.
+
+### Editable inputs (rewind / rerun / resume)
+
+- `rewindToolRequest({ jobId, checkpointId, inputOverride })` accepts `inputOverride` as an object keyed by `stepId` whose values are shallow-merged into that step's prior result in the replay snapshot, so downstream steps and conditions observe the edited prior outputs. An unknown `stepId` returns `invalid_input_override`. `argsPatch` and `envPatch` continue to edit workflow args and environment for the replay.
+- `rerunToolRequest({ jobId, argsPatch })` edits workflow args for a fresh run. `inputOverride` is not supported for rerun (it starts from index 0 with no snapshot) and returns `invalid_input_override`.
+- `resumeToolRequest({ token, argsPatch })` edits workflow args before continuing a gated/paused run. `resumeToolRequest({ token, approved: true, approvedPayloadOverride })` performs edit-then-approve at an approval gate by replacing the approval step's `json` payload before continuing.
+
+### Job chat sessions
+
+A job can carry a reference to an external chat session (created by the OpenClaw plugin). Lobster core stores the mapping on the job and surfaces it in run envelopes so a frontend can deep-link to the job chat.
+
+- `setJobExternalSession({ jobId, sessionId, provider })` persists the mapping (`provider` defaults to `"openclaw"`). Pass `sessionId: null` to clear it.
+- `getJob`/`listJobs` return `externalSessionId` and `externalSessionProvider`.
+- `run`/`resume`/`rewind` envelopes include `externalSessionId` / `externalSessionProvider` when the job has a bound session.
+- `runToolRequest({ filePath, agent, model })` persists the job's `agent` and `model` identity on the job record (`getJob`/`listJobs` surface `agent`/`model`). `rerun`/`rewind` carry the source job's `agent`/`model` over to the new job (the per-job session is not carried; the caller decides whether to create one).
+
+#### In-workflow session/agent/model defaulting
+
+When a job has a bound session/agent/model, in-workflow `openclaw.invoke` and `llm.invoke` (OpenClaw adapter) steps default to them so the call runs inside the job's chat session. Resolution precedence is **explicit step value > job's stored value > current default (no session)**. Core injects the job's values into the base step env (`LOBSTER_JOB_SESSION_KEY`, `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`) once per run, so per-step `--session-key`/`--agent`/`--model` (and an already-set ambient env value) still win. `llm.invoke` keeps `LOBSTER_LLM_MODEL` as the preferred LLM-specific default and falls back to `LOBSTER_JOB_MODEL` when no LLM-specific model is set. These are sent best-effort on the `/tools/invoke` body; gateways that do not yet honor them simply ignore the extra fields.
+
+### Launching durable jobs from a command: `openclaw.lobster`
+
+`openclaw.lobster` is `openclaw.invoke` with the tool pinned to `lobster`. It POSTs to the OpenClaw gateway `/tools/invoke` with `tool: "lobster"`, so the workflow runs through the plugin's `runToolRequest` path that creates a durable job (and, with `createSession`, a dedicated chat session) visible in the dashboard.
+
+Use it when an OpenClaw-managed cron is a `command` job: a plain `lobster run …` executes the workflow locally and can hit approvals, but does not register a durable job, so it never appears in the frontend job list. Route the run through the tool instead:
+
+```
+openclaw.lobster run --args-json '{"filePath":"workflows/x.lobster","createSession":true,"stepMode":true}' --agent main --model anthropic/claude-sonnet-4-6
+openclaw.lobster run --args-json '{"filePath":"workflows/x.lobster","createSession":true}' --session-key user:chat:abc
+openclaw.lobster listJobs --args-json '{"status":"waiting"}'
+openclaw.lobster continue --args-json '{"jobId":"<id>"}'
+```
+
+The action is the required first positional argument; `--action` is not accepted by `openclaw.lobster`. Workflow/action params (`filePath`, `argsJson`, `jobId`, `stepMode`, `createSession`, `token`, `approvalId`, ...) travel inside `--args-json`. Job context params (`agent`, `model`, `sessionKey`, and `session-key`) are forbidden in `--args-json`; pass them as `--agent`, `--model`, and `--session-key` on `run` only. `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`, and `LOBSTER_JOB_SESSION_KEY` provide run-only env defaults. `createSession: true` creates a dedicated job chat; `--session-key` binds an existing chat and wins over `createSession`. Transport config matches `openclaw.invoke` (`--url`/`OPENCLAW_URL`, `--token`/`OPENCLAW_TOKEN`). Plain `lobster run` behavior is unchanged.
 
 ## Workflow files
 
@@ -336,6 +366,8 @@ Built-in providers today:
 - `pi` via `LOBSTER_PI_LLM_ADAPTER_URL` (typically supplied by the Pi extension)
 - `http` via `LOBSTER_LLM_ADAPTER_URL`
 
+Model resolution is `--model`, then `LOBSTER_LLM_MODEL`, then `LOBSTER_JOB_MODEL`, then provider defaults. `LOBSTER_LLM_MODEL` remains the LLM-specific override; `LOBSTER_JOB_MODEL` is the inherited durable-job model default.
+
 Workflow `_meta.cost` and `cost_limit` use a static pricing table plus optional overrides from `LOBSTER_LLM_PRICING_JSON`, for example `{"my-model":{"input":1.0,"output":2.0}}` in USD per million tokens. Unknown or missing model IDs still record token counts with zero estimated cost, but Lobster warns on stderr so stale or missing pricing does not fail silently.
 
 `llm_task.invoke` remains available as a backward-compatible alias for the OpenClaw provider.
@@ -372,12 +404,12 @@ These shims forward to the Lobster pipeline command of the same name.
 
 Prereqs:
 
-- `OPENCLAW_URL` points at a running OpenClaw gateway
+- optionally `OPENCLAW_URL` points at a running OpenClaw gateway
 - optionally `OPENCLAW_TOKEN` if auth is enabled
 
 ```bash
 export OPENCLAW_URL=http://127.0.0.1:18789
-# export OPENCLAW_TOKEN=...
+export OPENCLAW_TOKEN=...
 ```
 
 In a workflow:

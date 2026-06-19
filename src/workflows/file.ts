@@ -19,9 +19,13 @@ import {
 import type { WorkflowExecutionContext } from "../checkpoints/types.js";
 import {
   appendCheckpoint,
+  checkpointsEnabled,
+  clearRunControlDesired,
   createApprovalRecord,
   createCheckpointRun,
   createChildRun,
+  getJob,
+  getRunControl,
   resolveApprovalRecord,
   updateRun,
 } from "../store/runtime_store.js";
@@ -138,8 +142,16 @@ export type WorkflowStepResult = {
   errorMessage?: string;
 };
 
+export type WorkflowPausedInfo = {
+  stepId: string;
+  stepIndex: number;
+  nextStepId?: string | null;
+  resumeToken: string;
+  reason: "pause_requested" | "step_mode";
+};
+
 export type WorkflowRunResult = {
-  status: "ok" | "needs_approval" | "needs_input" | "cancelled";
+  status: "ok" | "needs_approval" | "needs_input" | "cancelled" | "paused";
   output: unknown[];
   requiresApproval?: {
     type: "approval_request";
@@ -160,6 +172,7 @@ export type WorkflowRunResult = {
     subject?: unknown;
     resumeToken?: string;
   };
+  paused?: WorkflowPausedInfo;
   _meta?: {
     cost?: CostSummary;
   };
@@ -736,6 +749,8 @@ export async function runWorkflowFile({
   approved,
   response,
   cancel,
+  argsOverride,
+  approvedPayloadOverride,
 }: {
   filePath?: string;
   args?: Record<string, unknown>;
@@ -744,6 +759,8 @@ export async function runWorkflowFile({
   approved?: boolean;
   response?: unknown;
   cancel?: boolean;
+  argsOverride?: Record<string, unknown>;
+  approvedPayloadOverride?: unknown;
 }): Promise<WorkflowRunResult> {
   const consumedResumeStateKey =
     resume?.stateKey && typeof resume.stateKey === "string"
@@ -799,7 +816,12 @@ export async function runWorkflowFile({
   ctx._activeWorkflows.add(canonicalFilePath);
   try {
     const workflow = await loadWorkflowFile(resolvedFilePath);
-    const resolvedArgs = resolveWorkflowArgs(workflow.args, args ?? resumeState?.args);
+    const baseArgs = args ?? resumeState?.args;
+    const mergedArgs =
+      argsOverride && Object.keys(argsOverride).length > 0
+        ? { ...baseArgs, ...argsOverride }
+        : baseArgs;
+    const resolvedArgs = resolveWorkflowArgs(workflow.args, mergedArgs);
     const steps = workflow.steps;
     const stepIndexById = new Map(steps.map((step, idx) => [step.id, idx]));
     const results: Record<string, WorkflowStepResult> = resumeState?.steps
@@ -818,6 +840,26 @@ export async function runWorkflowFile({
           })
         : undefined);
     if (checkpointRun && !ctx.checkpointRun) ctx.checkpointRun = checkpointRun;
+
+    // Feature 2: default in-workflow llm.invoke / openclaw.invoke steps to the
+    // job's session/agent/model. Resolution precedence is
+    // explicit step value > job's stored value > current default (no session).
+    // Inject into the base step env (consumed by mergeEnv); per-step args and
+    // an already-set ambient value still win.
+    if (checkpointRun?.jobId && checkpointsEnabled(ctx.env)) {
+      const job = await getJob(ctx.env, checkpointRun.jobId).catch(() => null);
+      if (job) {
+        if (job.externalSessionId && ctx.env.LOBSTER_JOB_SESSION_KEY === undefined) {
+          ctx.env.LOBSTER_JOB_SESSION_KEY = job.externalSessionId;
+        }
+        if (job.agent && ctx.env.LOBSTER_JOB_AGENT === undefined) {
+          ctx.env.LOBSTER_JOB_AGENT = job.agent;
+        }
+        if (job.model && ctx.env.LOBSTER_JOB_MODEL === undefined) {
+          ctx.env.LOBSTER_JOB_MODEL = job.model;
+        }
+      }
+    }
 
     await appendCheckpoint({
       env: ctx.env,
@@ -897,6 +939,9 @@ export async function runWorkflowFile({
       }
       previous.approved = approved;
       if (approvedBy) previous.approvedBy = approvedBy;
+      if (approved === true && approvedPayloadOverride !== undefined) {
+        previous.json = approvedPayloadOverride;
+      }
       results[resumeState.approvalStepId] = previous;
       await appendCheckpoint({
         env: ctx.env,
@@ -1001,6 +1046,84 @@ export async function runWorkflowFile({
 
     for (let idx = startIndex; idx < steps.length; idx++) {
       const step = steps[idx];
+
+      // Cooperative run control: between-steps pause/cancel/step-by-step.
+      // The step at the resume entry index always runs (so "continue" advances
+      // exactly one step and we never re-pause on the same step forever); pause
+      // and step-mode take effect before any subsequent step. Cancel is honored
+      // at every boundary, including the entry step.
+      if (checkpointRun?.runId && checkpointsEnabled(ctx.env)) {
+        const control = await getRunControl({ env: ctx.env, runId: checkpointRun.runId });
+        if (control?.desired === "cancel") {
+          await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
+          if (consumedResumeStateKey) {
+            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+          }
+          await updateRun({ env: ctx.env, runId: checkpointRun.runId, status: "cancelled" });
+          await appendCheckpoint({
+            env: ctx.env,
+            run: checkpointRun,
+            stepId: step.id,
+            stepIndex: idx,
+            stepType: "control",
+            status: "cancelled",
+            metadata: {
+              reason: "cancel_requested",
+              resultsSnapshot: cloneResults(results),
+            },
+          });
+          return { status: "cancelled", output: [] };
+        }
+        if (idx > startIndex && (control?.desired === "pause" || control?.stepMode)) {
+          const reason: WorkflowPausedInfo["reason"] =
+            control.desired === "pause" ? "pause_requested" : "step_mode";
+          const stateKey = await saveWorkflowResumeState(ctx.env, {
+            ...workflowResumeContext(checkpointRun),
+            runId: checkpointRun.runId,
+            filePath: resolvedFilePath,
+            resumeAtIndex: idx,
+            steps: results,
+            args: resolvedArgs,
+            createdAt: new Date().toISOString(),
+          });
+          if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
+            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+          }
+          if (control.desired === "pause") {
+            await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
+          }
+          const resumeToken = encodeToken({
+            protocolVersion: 1,
+            v: 1,
+            kind: "workflow-file",
+            stateKey,
+          } satisfies WorkflowResumePayload);
+          await appendCheckpoint({
+            env: ctx.env,
+            run: checkpointRun,
+            stepId: step.id,
+            stepIndex: idx,
+            stepType: "pause",
+            status: "waiting",
+            metadata: {
+              reason,
+              stateKey,
+              resultsSnapshot: cloneResults(results),
+            },
+          });
+          return {
+            status: "paused",
+            output: [],
+            paused: {
+              stepId: step.id,
+              stepIndex: idx,
+              nextStepId: step.id,
+              resumeToken,
+              reason,
+            },
+          };
+        }
+      }
 
       if (!evaluateCondition(step.when ?? step.condition, results)) {
         results[step.id] = { id: step.id, skipped: true };

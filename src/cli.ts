@@ -67,8 +67,73 @@ export async function runCli(argv) {
     return;
   }
 
+  if (argv[0] === "pause" || argv[0] === "cancel" || argv[0] === "step-mode") {
+    await handleControl({ command: argv[0], argv: argv.slice(1) });
+    return;
+  }
+
   // Default: treat argv as a pipeline string.
   await handleRun({ argv, registry });
+}
+
+async function handleControl({
+  command,
+  argv,
+}: {
+  command: "pause" | "cancel" | "step-mode";
+  argv: string[];
+}) {
+  const { pauseRun, cancelRun, setStepMode } = await import("./core/tool_runtime.js");
+  let jobId: string | null = null;
+  let runId: string | null = null;
+  let stepMode: boolean | null = null;
+
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i];
+    if (tok === "--job" || tok === "--job-id") {
+      jobId = argv[++i] ?? null;
+    } else if (tok.startsWith("--job=")) {
+      jobId = tok.slice("--job=".length);
+    } else if (tok === "--run" || tok === "--run-id") {
+      runId = argv[++i] ?? null;
+    } else if (tok.startsWith("--run=")) {
+      runId = tok.slice("--run=".length);
+    } else if (tok === "--on") {
+      stepMode = true;
+    } else if (tok === "--off") {
+      stepMode = false;
+    }
+  }
+
+  if (!jobId && !runId) {
+    writeToolEnvelope({
+      ok: false,
+      error: { type: "parse_error", message: `${command} requires --job <id> or --run <id>` },
+    });
+    process.exitCode = 2;
+    return;
+  }
+
+  const ctx = { env: process.env };
+  let envelope;
+  if (command === "pause") {
+    envelope = await pauseRun({ jobId, runId, ctx });
+  } else if (command === "cancel") {
+    envelope = await cancelRun({ jobId, runId, ctx });
+  } else {
+    if (stepMode === null) {
+      writeToolEnvelope({
+        ok: false,
+        error: { type: "parse_error", message: "step-mode requires --on or --off" },
+      });
+      process.exitCode = 2;
+      return;
+    }
+    envelope = await setStepMode({ jobId, runId, stepMode, ctx });
+  }
+
+  writeToolEnvelope(envelope);
+  if (!envelope.ok) process.exitCode = 1;
 }
 
 async function handleGraph({ argv }) {
@@ -195,6 +260,18 @@ async function handleRun({ argv, registry }) {
             output: [],
             requiresApproval: null,
             requiresInput: output.requiresInput ?? null,
+          });
+          return;
+        }
+
+        if (output.status === "paused") {
+          writeToolEnvelope({
+            ok: true,
+            status: "paused",
+            output: [],
+            requiresApproval: null,
+            requiresInput: null,
+            paused: output.paused ?? null,
           });
           return;
         }
@@ -602,6 +679,18 @@ async function handleResume({ argv, registry }) {
         return;
       }
 
+      if (output.status === "paused") {
+        writeToolEnvelope({
+          ok: true,
+          status: "paused",
+          output: [],
+          requiresApproval: null,
+          requiresInput: null,
+          paused: output.paused ?? null,
+        });
+        return;
+      }
+
       await cleanupIndex();
       if (output.status === "cancelled") {
         writeToolEnvelope({
@@ -844,6 +933,9 @@ function helpText() {
     `  lobster resume --token <token> --approve yes|no\n` +
     `  lobster resume --token <token> --response-json '{...}'\n` +
     `  lobster resume --token <token> --cancel\n` +
+    `  lobster pause --job <jobId>\n` +
+    `  lobster cancel --job <jobId>\n` +
+    `  lobster step-mode --job <jobId> --on|--off\n` +
     `  lobster doctor\n` +
     `  lobster version\n` +
     `  lobster help <command>\n\n` +

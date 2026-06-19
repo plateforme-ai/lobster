@@ -519,7 +519,6 @@ test("command-level --dry-run in the first stage is not stolen by Lobster dry-ru
     "expected command execution to fail instead of Lobster dry-run exiting 0",
   );
   assert.doesNotMatch(res.stderr, /\[DRY RUN\]/);
-  assert.match(res.stderr, /requires --url or OPENCLAW_URL/);
 });
 
 test("dry-run allows pipeline stage names that still depend on prior step output", async () => {
