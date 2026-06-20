@@ -8,7 +8,10 @@ import type {
   CheckpointIORecord,
   CheckpointRecord,
   JobRecord,
+  JobWaitKind,
+  JobWaitSnapshot,
   RunControlRecord,
+  RunControlSnapshot,
   RunControlState,
   WorkflowExecutionContext,
   RunRecord,
@@ -18,12 +21,16 @@ import { storePayload, readBlobJson } from "./blob_store.js";
 import { parseJsonSafe, stringifySafe } from "./serialization.js";
 import { withRuntimeDb } from "./sqlite.js";
 
+type WaitGateStepType = (typeof WAIT_GATE_STEP_TYPES)[number];
+
 const DEFAULT_CHECKPOINT_INLINE_BYTES = 64_000;
 const DEFAULT_CHECKPOINT_PREVIEW_BYTES = 16_384;
 const DEFAULT_CACHE_INLINE_BYTES = 65_536;
 const DEFAULT_CACHE_TTL_DAYS = 30;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 200;
+const WAIT_GATE_STEP_TYPES = ["pause", "approval", "input", "pipeline_input"] as const;
+const WAIT_GATE_STEP_TYPE_SQL = WAIT_GATE_STEP_TYPES.map(() => "?").join(", ");
 
 export function checkpointsEnabled(env: Record<string, string | undefined>) {
   return String(env.LOBSTER_CHECKPOINTS_ENABLED ?? "").toLowerCase() === "true";
@@ -218,8 +225,13 @@ export async function getRun(
     (db) =>
       db
         .prepare(
-          `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id
-          FROM runs JOIN jobs ON jobs.job_id = runs.job_id
+          `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id,
+            rc.desired AS control_desired,
+            rc.step_mode AS control_step_mode,
+            rc.updated_at AS control_updated_at
+          FROM runs
+          JOIN jobs ON jobs.job_id = runs.job_id
+          LEFT JOIN run_controls rc ON rc.run_id = runs.root_run_id
           WHERE runs.run_id = ?`,
         )
         .get(runId) as any,
@@ -234,10 +246,23 @@ export async function getJob(
 ): Promise<JobRecord | null> {
   const row = await withRuntimeDb(
     env,
-    (db) => db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(jobId) as any,
+    (db) =>
+      db
+        .prepare(
+          `SELECT jobs.*,
+            rc.desired AS control_desired,
+            rc.step_mode AS control_step_mode,
+            rc.updated_at AS control_updated_at
+          FROM jobs
+          LEFT JOIN run_controls rc ON rc.run_id = jobs.root_run_id
+          WHERE jobs.job_id = ?`,
+        )
+        .get(jobId) as any,
   );
   if (!row) return null;
-  return rowToJob(env, row);
+  const job = await rowToJob(env, row);
+  job.wait = await resolveJobHeadWait({ env, jobId });
+  return job;
 }
 
 export async function setJobExternalSession(params: {
@@ -311,54 +336,205 @@ export async function clearRunControlDesired(params: {
 }
 
 /**
- * Resolve the most recent waiting resume point for a run/job and return its resume `stateKey`. Used to resume a
- * paused/gated run by jobId/runId when no token is supplied. Approval and input gates carry `state_key` on the
- * approvals row; pause/input/approval gates also persist `metadata.stateKey` on a `waiting` checkpoint, so we fall back
- * to the latest such checkpoint.
+ * Resolve the current head wait for a job/run. Job-scoped resume must follow the
+ * durable head instead of any older waiting approval or checkpoint row.
  */
+export async function resolveJobHeadWait(params: {
+  env: Record<string, string | undefined>;
+  jobId?: string | null;
+  runId?: string | null;
+}): Promise<JobWaitSnapshot | null> {
+  if (!params.jobId && !params.runId) return null;
+  return withRuntimeDb(params.env, (db) => {
+    const scope = params.runId
+      ? (db
+          .prepare("SELECT job_id, latest_checkpoint_id, status FROM runs WHERE run_id = ?")
+          .get(params.runId) as
+          | { job_id?: string | null; latest_checkpoint_id?: string | null; status?: string | null }
+          | undefined)
+      : (db
+          .prepare("SELECT job_id, latest_checkpoint_id, status FROM jobs WHERE job_id = ?")
+          .get(params.jobId) as
+          | { job_id?: string | null; latest_checkpoint_id?: string | null; status?: string | null }
+          | undefined);
+    if (!scope || scope.status !== "waiting") return null;
+
+    const headCheckpoint = scope.latest_checkpoint_id
+      ? ((db
+          .prepare("SELECT * FROM checkpoints WHERE checkpoint_id = ?")
+          .get(scope.latest_checkpoint_id) as any) ?? null)
+      : null;
+    const resolvedHead = checkpointRowToWaitSnapshot(db, headCheckpoint);
+    if (resolvedHead) return resolvedHead;
+
+    const fallbackCheckpoint = (
+      params.runId
+        ? db
+            .prepare(
+              `SELECT * FROM checkpoints
+              WHERE status = 'waiting' AND run_id = ? AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+              ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get(params.runId, ...WAIT_GATE_STEP_TYPES)
+        : db
+            .prepare(
+              `SELECT * FROM checkpoints
+              WHERE status = 'waiting' AND job_id = ? AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+              ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get(scope.job_id ?? params.jobId, ...WAIT_GATE_STEP_TYPES)
+    ) as any;
+    const resolvedFallback = checkpointRowToWaitSnapshot(db, fallbackCheckpoint);
+    if (resolvedFallback) return resolvedFallback;
+
+    const approvalRow = (
+      params.runId
+        ? db
+            .prepare(
+              "SELECT * FROM approvals WHERE status = 'waiting' AND run_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .get(params.runId)
+        : db
+            .prepare(
+              "SELECT * FROM approvals WHERE status = 'waiting' AND job_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .get(scope.job_id ?? params.jobId)
+    ) as any;
+    return approvalRowToWaitSnapshot(approvalRow);
+  });
+}
+
+export async function findHeadResumeStateKey(params: {
+  env: Record<string, string | undefined>;
+  jobId?: string | null;
+  runId?: string | null;
+  allowedStepTypes?: readonly WaitGateStepType[];
+}): Promise<string | null> {
+  const wait = await resolveJobHeadWait(params);
+  if (!wait?.stateKey) return null;
+  if (
+    params.allowedStepTypes &&
+    !params.allowedStepTypes.includes(wait.stepType as WaitGateStepType)
+  ) {
+    return null;
+  }
+  return wait.stateKey;
+}
+
 export async function findLatestResumeStateKey(params: {
   env: Record<string, string | undefined>;
   jobId?: string | null;
   runId?: string | null;
 }): Promise<string | null> {
-  if (!params.jobId && !params.runId) return null;
-  return withRuntimeDb(params.env, (db) => {
-    const approvalRow = (
-      params.runId
-        ? db
-            .prepare(
-              "SELECT state_key FROM approvals WHERE status = 'waiting' AND run_id = ? ORDER BY created_at DESC LIMIT 1",
-            )
-            .get(params.runId)
-        : db
-            .prepare(
-              "SELECT state_key FROM approvals WHERE status = 'waiting' AND job_id = ? ORDER BY created_at DESC LIMIT 1",
-            )
-            .get(params.jobId)
-    ) as { state_key?: string | null } | undefined;
-    if (approvalRow?.state_key) return approvalRow.state_key;
+  return findHeadResumeStateKey(params);
+}
 
-    const checkpointRows = (
-      params.runId
-        ? db
-            .prepare(
-              "SELECT metadata_json FROM checkpoints WHERE status = 'waiting' AND run_id = ? ORDER BY created_at DESC",
-            )
-            .all(params.runId)
-        : db
-            .prepare(
-              "SELECT metadata_json FROM checkpoints WHERE status = 'waiting' AND job_id = ? ORDER BY created_at DESC",
-            )
-            .all(params.jobId)
-    ) as Array<{ metadata_json?: string | null }>;
-    for (const row of checkpointRows) {
-      const metadata = parseJsonSafe(row.metadata_json ?? null) as { stateKey?: unknown } | null;
-      if (metadata && typeof metadata.stateKey === "string" && metadata.stateKey) {
-        return metadata.stateKey;
-      }
-    }
-    return null;
+export async function findWaitingCheckpointByStateKey(params: {
+  env: Record<string, string | undefined>;
+  stateKey: string;
+}): Promise<CheckpointRecord | null> {
+  const rows = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare(
+          `SELECT * FROM checkpoints
+          WHERE status = 'waiting' AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+          ORDER BY created_at DESC`,
+        )
+        .all(...WAIT_GATE_STEP_TYPES) as any[],
+  );
+  const row = rows.find((entry) => metadataStateKey(entry.metadata_json) === params.stateKey);
+  return row ? rowToCheckpoint(row) : null;
+}
+
+export async function updateCheckpointStatus(params: {
+  env: Record<string, string | undefined>;
+  checkpointId: string;
+  status: CheckpointRecord["status"];
+  finishedAt?: string | null;
+}) {
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare("UPDATE checkpoints SET status = ?, finished_at = ? WHERE checkpoint_id = ?").run(
+      params.status,
+      params.finishedAt ?? new Date().toISOString(),
+      params.checkpointId,
+    );
   });
+}
+
+function metadataStateKey(metadataJson: string | null | undefined): string | null {
+  const metadata = parseJsonSafe(metadataJson ?? null) as { stateKey?: unknown } | null;
+  return metadata && typeof metadata.stateKey === "string" && metadata.stateKey
+    ? metadata.stateKey
+    : null;
+}
+
+function waitKindFromStepType(stepType: string | null | undefined): JobWaitKind | null {
+  if (stepType === "pause") return "pause";
+  if (stepType === "approval") return "approval";
+  if (stepType === "input" || stepType === "pipeline_input") return "input";
+  return null;
+}
+
+function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobWaitSnapshot | null {
+  if (!row || row.status !== "waiting") return null;
+  const kind = waitKindFromStepType(row.step_type);
+  if (!kind) return null;
+
+  const metadata = parseJsonSafe(row.metadata_json ?? null) as {
+    stateKey?: unknown;
+    approvalId?: unknown;
+    reason?: unknown;
+    nextStepId?: unknown;
+  } | null;
+  const stateKey =
+    metadata && typeof metadata.stateKey === "string" && metadata.stateKey
+      ? metadata.stateKey
+      : null;
+  const approval = (
+    kind === "approval"
+      ? db
+          .prepare(
+            `SELECT approval_id, state_key FROM approvals
+            WHERE status = 'waiting'
+              AND (checkpoint_id = ? OR (state_key IS NOT NULL AND state_key = ?))
+            ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(row.checkpoint_id, stateKey)
+      : null
+  ) as { approval_id?: string | null; state_key?: string | null } | null;
+  const reason =
+    metadata?.reason === "pause_requested" || metadata?.reason === "step_mode"
+      ? metadata.reason
+      : null;
+  const nextStepId =
+    metadata && typeof metadata.nextStepId === "string" ? metadata.nextStepId : row.step_id;
+
+  return {
+    kind,
+    checkpointId: row.checkpoint_id,
+    stepId: row.step_id ?? null,
+    stepType: row.step_type ?? null,
+    stateKey: stateKey ?? approval?.state_key ?? null,
+    approvalId:
+      typeof metadata?.approvalId === "string"
+        ? metadata.approvalId
+        : (approval?.approval_id ?? null),
+    ...(kind === "pause" ? { nextStepId, reason } : {}),
+  };
+}
+
+function approvalRowToWaitSnapshot(row: any | null | undefined): JobWaitSnapshot | null {
+  if (!row || row.status !== "waiting" || !row.state_key) return null;
+  return {
+    kind: "approval",
+    checkpointId: row.checkpoint_id ?? null,
+    stepId: null,
+    stepType: "approval",
+    stateKey: row.state_key,
+    approvalId: row.approval_id ?? null,
+  };
 }
 
 export async function listJobs(params: {
@@ -372,21 +548,32 @@ export async function listJobs(params: {
   const where: string[] = [];
   const values: unknown[] = [];
   if (params.status) {
-    where.push("status = ?");
+    where.push("jobs.status = ?");
     values.push(params.status);
   }
   if (cursor) {
-    where.push("(created_at < ? OR (created_at = ? AND job_id < ?))");
+    where.push("(jobs.created_at < ? OR (jobs.created_at = ? AND jobs.job_id < ?))");
     values.push(cursor.createdAt, cursor.createdAt, cursor.id);
   }
   const rows = await withRuntimeDb(params.env, (db) => {
-    const sql = `SELECT * FROM jobs${
-      where.length ? ` WHERE ${where.join(" AND ")}` : ""
-    } ORDER BY created_at DESC, job_id DESC LIMIT ?`;
+    const sql = `SELECT jobs.*,
+      rc.desired AS control_desired,
+      rc.step_mode AS control_step_mode,
+      rc.updated_at AS control_updated_at
+      FROM jobs
+      LEFT JOIN run_controls rc ON rc.run_id = jobs.root_run_id${
+        where.length ? ` WHERE ${where.join(" AND ")}` : ""
+      } ORDER BY jobs.created_at DESC, jobs.job_id DESC LIMIT ?`;
     return db.prepare(sql).all(...values, limit + 1) as any[];
   });
   const pageRows = rows.slice(0, limit);
-  const jobs = await Promise.all(pageRows.map((row) => rowToJob(params.env, row)));
+  const jobs = await Promise.all(
+    pageRows.map(async (row) => {
+      const job = await rowToJob(params.env, row);
+      job.wait = await resolveJobHeadWait({ env: params.env, jobId: job.jobId });
+      return job;
+    }),
+  );
   const next = rows.length > limit ? pageRows.at(-1) : null;
   return {
     jobs,
@@ -403,10 +590,18 @@ export async function listJobRuns(params: {
     (db) =>
       db
         .prepare(
-          `SELECT runs.*, jobs.final_output_json, jobs.final_output_blob_id
-           FROM runs JOIN jobs ON jobs.job_id = runs.job_id
-           WHERE runs.job_id = ?
-           ORDER BY runs.depth, runs.created_at, runs.run_id`,
+          `SELECT
+            runs.*,
+            jobs.final_output_json,
+            jobs.final_output_blob_id,
+            rc.desired AS control_desired,
+            rc.step_mode AS control_step_mode,
+            rc.updated_at AS control_updated_at
+          FROM runs
+          JOIN jobs ON jobs.job_id = runs.job_id
+          LEFT JOIN run_controls rc ON rc.run_id = runs.root_run_id
+          WHERE runs.job_id = ?
+          ORDER BY runs.depth, runs.created_at, runs.run_id`,
         )
         .all(params.jobId) as any[],
   );
@@ -424,6 +619,33 @@ export async function listPendingApprovals(params: {
   const cursor = decodeQueryCursor(params.cursor);
   const where = ["status = 'waiting'"];
   const values: unknown[] = [];
+  if (params.jobId || params.runId) {
+    const headWait = await resolveJobHeadWait({
+      env: params.env,
+      jobId: params.jobId,
+      runId: params.runId,
+    });
+    if (headWait?.kind !== "approval") {
+      return { approvals: [], nextCursor: null };
+    }
+    const headClauses: string[] = [];
+    if (headWait.approvalId) {
+      headClauses.push("approval_id = ?");
+      values.push(headWait.approvalId);
+    }
+    if (headWait.checkpointId) {
+      headClauses.push("checkpoint_id = ?");
+      values.push(headWait.checkpointId);
+    }
+    if (headWait.stateKey) {
+      headClauses.push("state_key = ?");
+      values.push(headWait.stateKey);
+    }
+    if (!headClauses.length) {
+      return { approvals: [], nextCursor: null };
+    }
+    where.push(`(${headClauses.join(" OR ")})`);
+  }
   if (params.jobId) {
     where.push("job_id = ?");
     values.push(params.jobId);
@@ -515,6 +737,28 @@ export async function appendCheckpoint(params: {
       params.exitStatus ?? null,
       createdAt,
     );
+    if (
+      params.status === "waiting" &&
+      params.stepType &&
+      WAIT_GATE_STEP_TYPES.includes(params.stepType as WaitGateStepType)
+    ) {
+      db.prepare(
+        `UPDATE checkpoints
+        SET status = 'resumed', finished_at = ?
+        WHERE run_id = ?
+          AND status = 'waiting'
+          AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+          AND checkpoint_id != ?`,
+      ).run(createdAt, runId, ...WAIT_GATE_STEP_TYPES, checkpointId);
+      db.prepare(
+        `UPDATE approvals
+        SET status = 'cancelled', decision = 'superseded', resolved_at = ?
+        WHERE run_id = ?
+          AND status = 'waiting'
+          AND checkpoint_id IS NOT NULL
+          AND checkpoint_id != ?`,
+      ).run(createdAt, runId, checkpointId);
+    }
   });
 
   if (params.io) await writeCheckpointIO(params.env, checkpointId, params.io);
@@ -902,8 +1146,19 @@ async function rowToJob(env: Record<string, string | undefined>, row: any): Prom
     externalSessionProvider: row.external_session_provider ?? null,
     agent: row.agent ?? null,
     model: row.model ?? null,
+    control: controlSnapshotFromRow(row),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function controlSnapshotFromRow(row: any): RunControlSnapshot {
+  return {
+    stepMode: Boolean(row.control_step_mode),
+    desired: (row.control_desired as RunControlState) ?? "none",
+    ...(row.control_updated_at !== null && row.control_updated_at !== undefined
+      ? { updatedAt: row.control_updated_at }
+      : {}),
   };
 }
 
@@ -956,6 +1211,7 @@ async function rowToRun(env: Record<string, string | undefined>, row: any): Prom
     finalOutput,
     finalOutputBlobId: row.final_output_blob_id,
     latestCheckpointId: row.latest_checkpoint_id,
+    control: controlSnapshotFromRow(row),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

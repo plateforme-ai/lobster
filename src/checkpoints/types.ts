@@ -1,5 +1,18 @@
 export type RunStatus = "running" | "waiting" | "succeeded" | "failed" | "cancelled";
 
+export type JobWaitKind = "none" | "pause" | "approval" | "input";
+
+export type JobWaitSnapshot = {
+  kind: JobWaitKind;
+  checkpointId?: string | null;
+  stepId?: string | null;
+  stepType?: string | null;
+  stateKey?: string | null;
+  approvalId?: string | null;
+  nextStepId?: string | null;
+  reason?: "pause_requested" | "step_mode" | null;
+};
+
 export type JobRecord = {
   jobId: string;
   rootRunId?: string | null;
@@ -15,11 +28,19 @@ export type JobRecord = {
   externalSessionProvider?: string | null;
   agent?: string | null;
   model?: string | null;
+  control: RunControlSnapshot;
+  wait?: JobWaitSnapshot | null;
   createdAt: string;
   updatedAt: string;
 };
 
 export type RunControlState = "none" | "pause" | "cancel";
+
+export type RunControlSnapshot = {
+  stepMode: boolean;
+  desired: RunControlState;
+  updatedAt?: string | null;
+};
 
 export type RunControlRecord = {
   runId: string;
@@ -46,6 +67,7 @@ export type RunRecord = {
   finalOutput?: unknown;
   finalOutputBlobId?: string | null;
   latestCheckpointId?: string | null;
+  control: RunControlSnapshot;
   createdAt: string;
   updatedAt: string;
 };

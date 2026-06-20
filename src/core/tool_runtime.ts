@@ -12,7 +12,11 @@ import {
   findStateKeyByApprovalId,
   cleanupApprovalIndexByStateKey,
 } from "../state/store.js";
-import { WorkflowResumeArgumentError, runWorkflowFile } from "../workflows/file.js";
+import {
+  WorkflowResumeArgumentError,
+  readWorkflowDisplayName,
+  runWorkflowFile,
+} from "../workflows/file.js";
 import {
   finalizePipelineToolRun,
   loadPipelineResumeState,
@@ -22,7 +26,7 @@ import {
   checkpointsEnabled,
   createCheckpointRun,
   createRun,
-  findLatestResumeStateKey,
+  findHeadResumeStateKey,
   getCheckpoint as getStoredCheckpoint,
   getJob as getStoredJob,
   getRun as getStoredRun,
@@ -33,6 +37,7 @@ import {
   listRunCheckpoints as listStoredRunCheckpoints,
   getCheckpointIO as getStoredCheckpointIO,
   resolveApprovalRecord,
+  resolveJobHeadWait,
   setJobExternalSession as setStoredJobExternalSession,
   setRunControl,
   updateRun,
@@ -140,10 +145,12 @@ export async function runToolRequest({
     }
 
     try {
+      const workflowName = await readWorkflowDisplayName(resolvedFilePath);
       checkpointRun = await maybeCreateRun({
         runtime,
         sourceType: "workflow_file",
         workflowFile: resolvedFilePath,
+        workflowName,
         args,
         agent,
         model,
@@ -307,12 +314,23 @@ export async function resumeToolRequest({
     } else if (token) {
       resolvedToken = token;
     } else if (jobId || runId) {
-      const stateKey = await findLatestResumeStateKey({ env: runtime.env, jobId, runId });
+      const isContinueIntent = approved === undefined && response === undefined && cancel !== true;
+      const stateKey = await findHeadResumeStateKey({
+        env: runtime.env,
+        jobId,
+        runId,
+        allowedStepTypes: isContinueIntent ? ["pause"] : undefined,
+      });
       if (!stateKey) {
-        return errorEnvelope(
-          "no_resumable_state",
-          `No resumable (waiting/paused) state found for ${runId ? `run "${runId}"` : `job "${jobId}"`}`,
-        );
+        const wait = isContinueIntent
+          ? await resolveJobHeadWait({ env: runtime.env, jobId, runId })
+          : null;
+        const subject = runId ? `run "${runId}"` : `job "${jobId}"`;
+        const message =
+          isContinueIntent && wait && wait.kind !== "pause"
+            ? `Job is waiting on ${wait.kind}, not paused`
+            : `No resumable (waiting/paused) state found for ${subject}`;
+        return errorEnvelope("no_resumable_state", message);
       }
       resolvedToken = encodeToken({
         protocolVersion: 1,
@@ -829,6 +847,7 @@ export async function rewindToolRequest({
     env: runtime.env,
     sourceType: "workflow_file",
     workflowFile: targetRun.workflowFile,
+    workflowName: await readWorkflowDisplayName(targetRun.workflowFile),
     args: mergePatch(targetRun.args, argsPatch),
     agent: job.agent ?? null,
     model: job.model ?? null,
@@ -1020,6 +1039,7 @@ async function maybeCreateRun(params: {
   runtime: ReturnType<typeof createToolContext>;
   sourceType: "workflow_file" | "pipeline";
   workflowFile?: string;
+  workflowName?: string | null;
   pipelineText?: string;
   args?: unknown;
   agent?: string | null;
@@ -1042,6 +1062,7 @@ async function maybeCreateRun(params: {
     env: params.runtime.env,
     sourceType: params.sourceType,
     workflowFile: params.workflowFile,
+    workflowName: params.workflowName,
     pipelineText: params.pipelineText,
     args: params.args,
     agent: params.agent,

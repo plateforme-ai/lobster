@@ -94,6 +94,8 @@ test("explicit pause is honored at the next step boundary", async () => {
 
   // Turn off step mode, then request a one-shot pause.
   await setStepMode({ jobId: first.jobId!, stepMode: false, ctx });
+  const job = await getJob({ jobId: first.jobId!, ctx });
+  assert.equal(job?.control.stepMode, false);
   await pauseRun({ jobId: first.jobId!, ctx });
 
   const second = await resumeToolRequest({ token: first.paused!.resumeToken, ctx });

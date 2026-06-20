@@ -193,6 +193,8 @@ Runtime identifiers use these meanings:
 - `parentRunId`: the caller workflow invocation for nested workflows.
 - `stepPath`: stable nested path, for example `root.review.childStep`.
 
+Commands inside a workflow `pipeline:` step emit checkpoints under that workflow step's path. For example, a workflow step `summarize` running `llm.invoke` records the outer step at `root.summarize` and inner pipeline checkpoints such as `root.summarize.llm.invoke` and `root.summarize.pipeline_output`.
+
 Nested workflows share the same `jobId` and get separate child `runId` rows. Child workflow approval/input waits bubble up to the caller envelope and resume through a persisted call stack, so approving a child workflow can continue the child and then the parent workflow.
 
 Current rewind support is strongest for linear root and child workflow checkpoints. Rewind inside `parallel`, `for_each`, or command-level pipeline suspension may return `replay_not_supported` until those replay boundaries are fully captured.
@@ -209,10 +211,11 @@ LOBSTER_CACHE_INLINE_MAX_BYTES=65536
 
 Public dashboard/plugin APIs are exported from `@plateforme-ai/lobster/core`:
 
-- `getJob({ jobId })` and `getRun({ runId })` fetch durable job/run status.
-- `listJobs({ status, limit, cursor })` returns cursor-paginated dashboard job rows.
-- `listJobRuns({ jobId })` returns root and nested workflow invocations for a job.
-- `listPendingApprovals({ jobId, runId, limit, cursor })` powers global or job-scoped approval inboxes.
+- `getJob({ jobId })` fetches durable job status, including `control` (`{ stepMode, desired, updatedAt? }`) and `wait` (the current head blocker: `pause`, `approval`, `input`, or `null`).
+- `getRun({ runId })` fetches durable run status, including `control` resolved from the job root run.
+- `listJobs({ status, limit, cursor })` returns cursor-paginated dashboard job rows, including `control` and `wait`.
+- `listJobRuns({ jobId })` returns root and nested workflow invocations for a job, including `control` on each run.
+- `listPendingApprovals({ jobId, runId, limit, cursor })` powers global or job-scoped approval inboxes. Scoped calls return only the current head approval for that job/run.
 - `listJobCheckpoints({ jobId })`, `getCheckpointIO({ checkpointId })`, `rerunToolRequest({ jobId })`, and `rewindToolRequest({ jobId, checkpointId })` complete the inspect/rerun/rewind dashboard flow.
 
 ### Run control (pause / cancel / step-by-step)
@@ -223,8 +226,9 @@ Long workflow-file runs can be controlled cooperatively. The runtime checks a pe
 - `pauseRun({ jobId })` / `pauseRun({ runId })` requests a one-shot pause at the next step boundary.
 - `cancelRun({ jobId })` requests cancellation; the run returns `status: "cancelled"` at the next boundary (including a resumed paused run).
 - `setStepMode({ jobId, stepMode })` toggles sticky step-by-step mode.
+- `getJob` / `getRun` / `listJobs` / `listJobRuns` expose the current run control snapshot as `control` (`{ stepMode, desired, updatedAt? }`), resolved from the job root run. `getJob` / `listJobs` also expose `wait`, the current head blocker for dashboard controls.
 - Continue a paused run by calling `resumeToolRequest({ token })` with the `paused.resumeToken` (no `approved`/`response` needed). In step mode each resume advances exactly one step.
-- Continue without a token by passing `resumeToolRequest({ jobId })` (or `{ runId }`). Core resolves the latest `waiting`/paused resume point for that job/run (approval and input gates, plus `pause`/step-mode pauses) and advances it. If nothing is waiting it returns `no_resumable_state`. This lets a job chat resume by saying "continue" without tracking tokens. `approved`/`response`, `argsPatch`, and `approvedPayloadOverride` work the same as the token path.
+- Continue without a token by passing `resumeToolRequest({ jobId })` (or `{ runId }`). With no `approved` or `response`, this is a pause-only continue: core resolves the current head `pause` checkpoint and advances it. If the job is waiting on approval or input, it returns `no_resumable_state`; approval/input gates must use `approvalId` or `token` with `approved`/`response`. `argsPatch` and `approvedPayloadOverride` work the same as the token path.
 
 > `paused` is a non-terminal status (resumable). Terminal statuses are `ok`, `cancelled`, and errors. The CLI exposes `lobster pause --job <id>`, `lobster cancel --job <id>`, and `lobster step-mode --job <id> --on|--off`.
 

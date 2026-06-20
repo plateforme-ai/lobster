@@ -21,6 +21,7 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
     childPath,
     JSON.stringify(
       {
+        name: "named-child",
         steps: [
           {
             id: "review",
@@ -52,7 +53,11 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
     LOBSTER_CHECKPOINTS_ENABLED: "true",
   };
 
-  const first = await runToolRequest({ filePath: parentPath, ctx: { cwd: tmpDir, env } });
+  const first = await runToolRequest({
+    filePath: parentPath,
+    stepMode: true,
+    ctx: { cwd: tmpDir, env },
+  });
   assert.equal(first.status, "needs_approval");
   assert.ok(first.jobId);
   assert.ok(first.runId);
@@ -60,10 +65,17 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
   const job = await getJob({ jobId: first.jobId!, ctx: { env } });
   assert.equal(job?.jobId, first.jobId);
   assert.equal(job?.status, "waiting");
+  assert.equal(job?.control.stepMode, true);
+  assert.equal(job?.control.desired, "none");
+  assert.equal(job?.wait?.kind, "approval");
+  assert.equal(job?.wait?.stepId, "callChild");
 
   const rootRun = await getRun({ runId: first.runId!, ctx: { env } });
   assert.equal(rootRun?.runId, first.runId);
   assert.equal(rootRun?.depth, 0);
+  assert.equal(rootRun?.workflowName, "parent");
+  assert.equal(rootRun?.control.stepMode, true);
+  assert.equal(rootRun?.control.desired, "none");
 
   const runs = await listJobRuns({ jobId: first.jobId!, ctx: { env } });
   assert.equal(runs.length, 2);
@@ -73,9 +85,21 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
   );
   assert.equal(runs[1].parentRunId, first.runId);
   assert.equal(runs[1].parentStepId, "callChild");
+  assert.equal(runs[1].workflowName, "named-child");
+  assert.deepEqual(
+    runs.map((run) => run.control),
+    [
+      { stepMode: true, desired: "none", updatedAt: job?.control.updatedAt },
+      { stepMode: true, desired: "none", updatedAt: job?.control.updatedAt },
+    ],
+  );
 
   const waitingJobs = await listJobs({ status: "waiting", limit: 10, ctx: { env } });
-  assert.ok(waitingJobs.jobs.some((item) => item.jobId === first.jobId));
+  const waitingJob = waitingJobs.jobs.find((item) => item.jobId === first.jobId);
+  assert.ok(waitingJob);
+  assert.equal(waitingJob.control.stepMode, true);
+  assert.equal(waitingJob.control.desired, "none");
+  assert.equal(waitingJob.wait?.kind, "approval");
   assert.equal(waitingJobs.nextCursor, null);
 
   const approvals = await listPendingApprovals({ jobId: first.jobId!, ctx: { env } });
@@ -83,4 +107,21 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
   assert.equal(approvals.approvals[0].jobId, first.jobId);
   assert.equal(approvals.approvals[0].runId, runs[1].runId);
   assert.equal(approvals.approvals[0].prompt, "Approve review?");
+});
+
+test("pipeline run records do not set workflowName", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pipeline-run-name-"));
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const result = await runToolRequest({ pipeline: "json", ctx: { cwd: tmpDir, env } });
+  assert.equal(result.status, "ok");
+  assert.ok(result.runId);
+
+  const run = await getRun({ runId: result.runId!, ctx: { env } });
+  assert.equal(run?.sourceType, "pipeline");
+  assert.equal(run?.workflowName, null);
 });

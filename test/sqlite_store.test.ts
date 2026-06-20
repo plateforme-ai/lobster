@@ -12,6 +12,7 @@ import {
   getCheckpoint,
   getCheckpointIO,
   getJob,
+  getRun,
   getRunControl,
   listJobRuns,
   listJobCheckpoints,
@@ -112,7 +113,7 @@ test("sqlite runtime store persists runs, checkpoints, approvals, and cache entr
   assert.ok([run.jobId, otherRun.jobId].includes(firstJobsPage.jobs[0].jobId));
   assert.ok([run.jobId, otherRun.jobId].includes(secondJobsPage.jobs[0].jobId));
 
-  const pendingApprovals = await listPendingApprovals({ env, jobId: run.jobId });
+  const pendingApprovals = await listPendingApprovals({ env });
   assert.equal(pendingApprovals.approvals.length, 1);
   assert.equal(pendingApprovals.approvals[0].approvalId, "deadbeef");
   assert.equal(pendingApprovals.approvals[0].prompt, "Proceed?");
@@ -164,6 +165,9 @@ test("migration id 2 adds session columns and the run_controls table", async () 
   const job = await getJob(env, run.jobId);
   assert.equal(job?.externalSessionId, "sess-xyz");
   assert.equal(job?.externalSessionProvider, "openclaw");
+  assert.deepEqual(job?.control, { stepMode: false, desired: "none" });
+  const storedRun = await getRun(env, run.runId);
+  assert.deepEqual(storedRun?.control, { stepMode: false, desired: "none" });
   const { jobs } = await listJobs({ env });
   assert.equal(jobs.find((entry) => entry.jobId === run.jobId)?.externalSessionId, "sess-xyz");
 
@@ -172,11 +176,19 @@ test("migration id 2 adds session columns and the run_controls table", async () 
   let control = await getRunControl({ env, runId: run.runId });
   assert.equal(control?.stepMode, true);
   assert.equal(control?.desired, "none");
+  assert.equal((await getJob(env, run.jobId))?.control.stepMode, true);
+  assert.equal((await getJob(env, run.jobId))?.control.desired, "none");
+  assert.equal((await getRun(env, run.runId))?.control.stepMode, true);
+  assert.equal((await getRun(env, run.runId))?.control.desired, "none");
 
   await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "pause" });
   control = await getRunControl({ env, runId: run.runId });
   assert.equal(control?.desired, "pause");
   assert.equal(control?.stepMode, true, "stepMode should persist across desired updates");
+  assert.equal((await getJob(env, run.jobId))?.control.desired, "pause");
+  assert.equal((await getJob(env, run.jobId))?.control.stepMode, true);
+  assert.equal((await getRun(env, run.runId))?.control.desired, "pause");
+  assert.equal((await getRun(env, run.runId))?.control.stepMode, true);
 
   await clearRunControlDesired({ env, runId: run.runId });
   control = await getRunControl({ env, runId: run.runId });

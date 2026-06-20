@@ -122,3 +122,100 @@ test("nested workflow checkpoints share jobId and use child runId with stable st
   assert.notEqual(rewind.jobId, result.jobId);
   assert.deepEqual(rewind.output, [{ child: true }]);
 });
+
+test("workflow pipeline checkpoints are scoped under the owning step path", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pipeline-checkpoints-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          {
+            id: "source",
+            run: 'node -e "process.stdout.write(JSON.stringify({ticket:1}))"',
+          },
+          {
+            id: "transform",
+            pipeline: "json",
+            stdin: "$source.json",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const result = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
+  assert.equal(result.status, "ok");
+  assert.ok(result.runId);
+
+  const checkpoints = await listRunCheckpoints({ runId: result.runId, ctx: { env } });
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.stepId === "transform" &&
+        checkpoint.stepPath === "root.transform" &&
+        checkpoint.stepType === "pipeline",
+    ),
+  );
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.stepId === "json" &&
+        checkpoint.stepPath === "root.transform.json" &&
+        checkpoint.stepType === "pipeline_stage",
+    ),
+  );
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.stepId === "pipeline_output" &&
+        checkpoint.stepPath === "root.transform.pipeline_output" &&
+        checkpoint.stepType === "pipeline_result",
+    ),
+  );
+  assert.equal(
+    checkpoints.some((checkpoint) => checkpoint.stepPath === "root.json"),
+    false,
+  );
+});
+
+test("standalone pipeline checkpoints keep top-level step paths", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-standalone-pipeline-"));
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const result = await runToolRequest({ pipeline: "json", ctx: { cwd: tmpDir, env } });
+  assert.equal(result.status, "ok");
+  assert.ok(result.runId);
+
+  const checkpoints = await listRunCheckpoints({ runId: result.runId, ctx: { env } });
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.stepId === "json" &&
+        checkpoint.stepPath === "root.json" &&
+        checkpoint.stepType === "pipeline_stage",
+    ),
+  );
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.stepId === "pipeline_output" &&
+        checkpoint.stepPath === "root.pipeline_output" &&
+        checkpoint.stepType === "pipeline_result",
+    ),
+  );
+});

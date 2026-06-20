@@ -24,9 +24,11 @@ import {
   createApprovalRecord,
   createCheckpointRun,
   createChildRun,
+  findWaitingCheckpointByStateKey,
   getJob,
   getRunControl,
   resolveApprovalRecord,
+  updateCheckpointStatus,
   updateRun,
 } from "../store/runtime_store.js";
 import { readLineFromStream } from "../read_line.js";
@@ -51,6 +53,17 @@ export type WorkflowFile = {
   steps: WorkflowStep[];
   cost_limit?: CostLimit;
 };
+
+export function resolveWorkflowDisplayName(workflow: WorkflowFile, filePath: string): string {
+  const explicit = workflow.name?.trim();
+  if (explicit) return explicit;
+  return path.parse(filePath).name;
+}
+
+export async function readWorkflowDisplayName(filePath: string): Promise<string> {
+  const workflow = await loadWorkflowFile(filePath);
+  return resolveWorkflowDisplayName(workflow, filePath);
+}
 
 export type ParallelBranch = {
   id: string;
@@ -786,7 +799,7 @@ export async function runWorkflowFile({
     }
     if (cancel === true || approved === false) {
       if (consumedResumeStateKey) {
-        await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+        await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
       }
       if (resumeState.runId) {
         await updateRun({ env: ctx.env, runId: resumeState.runId, status: "cancelled" });
@@ -797,7 +810,7 @@ export async function runWorkflowFile({
 
   if (resumeState?.inputStepId && cancel === true) {
     if (consumedResumeStateKey) {
-      await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+      await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
     }
     if (resumeState.runId) {
       await updateRun({ env: ctx.env, runId: resumeState.runId, status: "cancelled" });
@@ -870,7 +883,7 @@ export async function runWorkflowFile({
       status: resumeState ? "resumed" : "started",
       metadata: {
         filePath: resolvedFilePath,
-        workflowName: workflow.name ?? null,
+        workflowName: resolveWorkflowDisplayName(workflow, resolvedFilePath),
         startIndex,
         args: resolvedArgs,
       },
@@ -901,7 +914,7 @@ export async function runWorkflowFile({
         cancel,
       });
       if (childResult.status === "needs_approval" || childResult.status === "needs_input") {
-        return await wrapChildSuspension({
+        const suspended = await wrapChildSuspension({
           ctx,
           parentRun: checkpointRun,
           childRun,
@@ -913,17 +926,21 @@ export async function runWorkflowFile({
           childStepId: child.stepId,
           childFilePath: child.filePath,
         });
+        if (consumedResumeStateKey) {
+          await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+        }
+        return suspended;
       }
       if (childResult.status === "cancelled") {
         if (consumedResumeStateKey) {
-          await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+          await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
         }
         return { status: "cancelled", output: [] };
       }
       results[child.stepId] = workflowOutputToStepResult(child.stepId, childResult.output);
       startIndex = (stepIndexById.get(child.stepId) ?? startIndex) + 1;
       if (consumedResumeStateKey) {
-        await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+        await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
       }
     }
 
@@ -1007,7 +1024,7 @@ export async function runWorkflowFile({
           pipelineInput: resumeState.pipelineInput!,
           onConsumed: consumedResumeStateKey
             ? async () => {
-                await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+                await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
               }
             : undefined,
         };
@@ -1057,7 +1074,7 @@ export async function runWorkflowFile({
         if (control?.desired === "cancel") {
           await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
           if (consumedResumeStateKey) {
-            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
           await updateRun({ env: ctx.env, runId: checkpointRun.runId, status: "cancelled" });
           await appendCheckpoint({
@@ -1087,7 +1104,7 @@ export async function runWorkflowFile({
             createdAt: new Date().toISOString(),
           });
           if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
           if (control.desired === "pause") {
             await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
@@ -1173,7 +1190,7 @@ export async function runWorkflowFile({
           });
 
           if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
 
           const resumeToken = encodeToken({
@@ -1311,6 +1328,7 @@ export async function runWorkflowFile({
               const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
               subResult = await runPipelineStep({
                 stepId: subStep.id,
+                stepScopeId: `${step.id}.${subStep.id}`,
                 pipelineText,
                 inputValue,
                 ctx,
@@ -1450,6 +1468,7 @@ export async function runWorkflowFile({
                 const inputValue = resolveInputValue(branch.stdin, resolvedArgs, results);
                 const branchResult = await runPipelineStep({
                   stepId: branch.id,
+                  stepScopeId: `${step.id}.${branch.id}`,
                   pipelineText,
                   inputValue,
                   ctx: { ...ctx, signal: branchSignal },
@@ -1546,6 +1565,7 @@ export async function runWorkflowFile({
             childActive.add(canonicalWorkflowPath);
             const subArgs = resolveWorkflowStepArgs(step.workflow_args, resolvedArgs, results);
             const childStepPath = workflowStepPath(checkpointRun, step.id);
+            const childWorkflow = await loadWorkflowFile(resolvedWorkflowPath);
             const childRun = checkpointRun
               ? await createChildRun({
                   env: ctx.env,
@@ -1553,6 +1573,7 @@ export async function runWorkflowFile({
                   parentStepId: step.id,
                   parentStepPath: childStepPath,
                   workflowFile: resolvedWorkflowPath,
+                  workflowName: resolveWorkflowDisplayName(childWorkflow, resolvedWorkflowPath),
                   args: subArgs,
                 })
               : undefined;
@@ -1683,7 +1704,7 @@ export async function runWorkflowFile({
           });
 
           if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
 
           const resumeToken = encodeToken({
@@ -1825,7 +1846,7 @@ export async function runWorkflowFile({
           }
 
           if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
 
           const resumeToken = encodeToken({
@@ -1835,7 +1856,7 @@ export async function runWorkflowFile({
             stateKey,
           } satisfies WorkflowResumePayload);
 
-          await appendCheckpoint({
+          const approvalCheckpointId = await appendCheckpoint({
             env: ctx.env,
             run: checkpointRun,
             stepId: step.id,
@@ -1856,6 +1877,7 @@ export async function runWorkflowFile({
               env: ctx.env,
               approvalId,
               run: checkpointRun,
+              checkpointId: approvalCheckpointId,
               stateKey,
               prompt: approval.prompt,
               metadata: approval,
@@ -1895,7 +1917,7 @@ export async function runWorkflowFile({
 
     const output = lastStepId ? toOutputItems(results[lastStepId]) : [];
     if (consumedResumeStateKey) {
-      await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
+      await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
     }
     await appendCheckpoint({
       env: ctx.env,
@@ -1925,6 +1947,21 @@ export async function runWorkflowFile({
   } finally {
     ctx._activeWorkflows?.delete(canonicalFilePath);
   }
+}
+
+async function consumeWorkflowResumeState(
+  env: Record<string, string | undefined>,
+  stateKey: string,
+) {
+  const checkpoint = await findWaitingCheckpointByStateKey({ env, stateKey }).catch(() => null);
+  if (checkpoint) {
+    await updateCheckpointStatus({
+      env,
+      checkpointId: checkpoint.checkpointId,
+      status: "resumed",
+    });
+  }
+  await deleteStateJson({ env, key: stateKey });
 }
 
 async function wrapChildSuspension({
@@ -1996,11 +2033,27 @@ async function wrapChildSuspension({
 
   if (childResult.status === "needs_approval" && childResult.requiresApproval) {
     const approvalId = await createApprovalIndex({ env: ctx.env, stateKey: parentStateKey });
+    const approvalCheckpointId = await appendCheckpoint({
+      env: ctx.env,
+      run: parentRun,
+      stepId: childStepId,
+      stepIndex: parentResumeAtIndex,
+      stepType: "approval",
+      status: "waiting",
+      metadata: {
+        stateKey: parentStateKey,
+        approvalId,
+        nested: true,
+        childStepId,
+      },
+      io: { jsonOutput: childResult.requiresApproval.items },
+    });
     if (approvalId) {
       await createApprovalRecord({
         env: ctx.env,
         approvalId,
         run: childRun ?? parentRun,
+        checkpointId: approvalCheckpointId,
         stateKey: parentStateKey,
         prompt: childResult.requiresApproval.prompt,
         metadata: {
@@ -3404,6 +3457,7 @@ function getStepExecution(step: WorkflowStep) {
 
 async function runPipelineStep({
   stepId,
+  stepScopeId,
   pipelineText,
   inputValue,
   ctx,
@@ -3413,6 +3467,7 @@ async function runPipelineStep({
   requestInputEnabled = true,
 }: {
   stepId: string;
+  stepScopeId?: string;
   pipelineText: string;
   inputValue: unknown;
   ctx: RunContext;
@@ -3472,7 +3527,10 @@ async function runPipelineStep({
           onConsumed: resume.onConsumed,
         }
       : undefined,
-    checkpointRun: ctx.checkpointRun,
+    checkpointRun: {
+      ...ctx.checkpointRun,
+      stepPathPrefix: workflowStepPath(ctx.checkpointRun, stepScopeId ?? stepId),
+    },
   });
   stdout.end();
 
