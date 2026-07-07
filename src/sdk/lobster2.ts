@@ -3,7 +3,7 @@ import { runPipelineInternal } from "./runtime.js";
 import { encodeToken, decodeToken } from "./token.js";
 import { compileCached } from "../validation.js";
 import { validateCommandInputState, type CommandInputState } from "../input_request.js";
-import { deleteStateJson, readStateJson, writeStateJson } from "../state/store.js";
+import { deleteStateJson, readStateJson, writeStateJson } from "../store/state.js";
 
 type SdkResumePayload = {
   protocolVersion: 1;
