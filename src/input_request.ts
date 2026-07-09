@@ -1,4 +1,4 @@
-import { stableStringify } from "./state/store.js";
+import { stableStringify } from "./store/state.js";
 import { compileCached } from "./validation.js";
 
 export type RequestInputParams = {

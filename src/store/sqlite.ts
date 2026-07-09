@@ -1,7 +1,7 @@
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { defaultStateDir, ensureDirectory } from "../state/store.js";
+import { defaultStateDir, ensureDirectory } from "./state.js";
 
 const MIGRATIONS = [
   {
@@ -188,6 +188,60 @@ const MIGRATIONS = [
       ALTER TABLE jobs ADD COLUMN model TEXT;
     `,
   },
+  {
+    id: 4,
+    sql: `
+      ALTER TABLE jobs ADD COLUMN title TEXT;
+      ALTER TABLE jobs ADD COLUMN description TEXT;
+      ALTER TABLE jobs ADD COLUMN metadata_json TEXT;
+    `,
+  },
+  {
+    id: 5,
+    sql: `
+      ALTER TABLE jobs ADD COLUMN external_agent_id TEXT;
+      ALTER TABLE jobs RENAME COLUMN external_session_provider TO external_provider;
+      UPDATE jobs
+      SET
+        external_agent_id = substr(substr(external_session_id, 7), 1, instr(substr(external_session_id, 7), ':') - 1),
+        external_session_id = substr(substr(external_session_id, 7), instr(substr(external_session_id, 7), ':') + 1)
+      WHERE external_session_id LIKE 'agent:%';
+    `,
+  },
+  {
+    id: 6,
+    sql: `
+      ALTER TABLE jobs RENAME COLUMN external_session_id TO external_session_key;
+    `,
+  },
+  {
+    id: 7,
+    sql: `
+      DROP INDEX IF EXISTS idx_jobs_lineage;
+      ALTER TABLE jobs RENAME COLUMN rerun_of_job_id TO parent_job_id;
+      ALTER TABLE jobs DROP COLUMN rewind_of_job_id;
+      ALTER TABLE jobs DROP COLUMN rewind_of_checkpoint_id;
+      ALTER TABLE jobs ADD COLUMN root_job_id TEXT;
+      ALTER TABLE jobs ADD COLUMN latest_run_id TEXT;
+      ALTER TABLE runs ADD COLUMN rewind_of_checkpoint_id TEXT;
+      UPDATE jobs SET latest_run_id = root_run_id;
+      UPDATE jobs SET root_job_id = job_id;
+      CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_root ON jobs(root_job_id);
+    `,
+  },
+  {
+    id: 8,
+    sql: `
+      ALTER TABLE runs ADD COLUMN workflow_description TEXT;
+    `,
+  },
+  {
+    id: 9,
+    sql: `
+      ALTER TABLE jobs ADD COLUMN external_session_id TEXT;
+    `,
+  },
 ];
 
 export async function openRuntimeDb(env: Record<string, string | undefined>) {
@@ -215,9 +269,6 @@ export async function withRuntimeDb<T>(
 export function resolveRuntimeDbPath(env: Record<string, string | undefined>) {
   const explicit = String(env?.LOBSTER_SQLITE_PATH ?? "").trim();
   if (explicit) return explicit;
-  if (env?.LOBSTER_STATE_DIR) return path.join(defaultStateDir(env), "lobster.db");
-  const cacheDir = String(env?.LOBSTER_CACHE_DIR ?? "").trim();
-  if (cacheDir) return `${cacheDir}.lobster.db`;
   return path.join(defaultStateDir(env), "lobster.db");
 }
 
@@ -229,7 +280,15 @@ function configureDb(db: DatabaseSync, env: Record<string, string | undefined>) 
 }
 
 function migrateDb(db: DatabaseSync) {
-  db.exec(MIGRATIONS[0].sql);
+  // Bootstrap only the ledger table so migrations (including the id-1 base DDL)
+  // apply exactly once. Re-running the id-1 block on every open is unsafe once a
+  // later migration drops columns the id-1 DDL still references.
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      id INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    );`,
+  );
   for (const migration of MIGRATIONS) {
     const existing = db
       .prepare("SELECT id FROM schema_migrations WHERE id = ?")

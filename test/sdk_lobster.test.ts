@@ -4,7 +4,7 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { Lobster } from "../src/sdk/Lobster.js";
+import { Lobster } from "../src/sdk/lobster.js";
 import { stateSet } from "../src/sdk/primitives/state.js";
 import { decodeToken, encodeToken } from "../src/token.js";
 

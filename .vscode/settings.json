@@ -1,0 +1,26 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit:
+  // https://code.visualstudio.com/docs/getstarted/settings#_settingsjson
+
+  // Editor
+  "files.exclude": {
+    "**/node_modules": true
+  },
+  "search.exclude": {
+    "**/.cursor": true,
+    "**/.venv": true,
+    "**/.vscode": true,
+    "**/.lock": true,
+    "**/pnpm-lock.yaml": true
+  },
+  "material-icon-theme.folders.associations": {
+    "primitives": "base",
+    "renderers": "json",
+    "recipes": "gulp",
+    "sdk": "tools",
+    "stdlib": "lib",
+    "workflows": "pipe"
+  },
+}

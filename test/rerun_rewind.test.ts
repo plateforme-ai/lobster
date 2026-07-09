@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  getJob,
   listRunCheckpoints,
   rerunToolRequest,
   resumeToolRequest,
@@ -68,7 +69,8 @@ test("rerun creates a linked run and rewind creates a child run from checkpoint 
   assert.equal(rewind.status, "ok");
   assert.ok(rewind.jobId);
   assert.ok(rewind.runId);
-  assert.notEqual(rewind.jobId, first.jobId);
+  assert.equal(rewind.jobId, first.jobId);
+  assert.notEqual(rewind.runId, first.runId);
   assert.deepEqual(rewind.output, [{ n: 2 }]);
 });
 
@@ -242,4 +244,69 @@ test("resume can edit the approved payload (edit-then-approve)", async () => {
   });
   assert.equal(resumed.status, "ok");
   assert.deepEqual(resumed.output, [{ v: 42 }]);
+});
+
+test("rerun and rewind copy job title, description, and metadata", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-rerun-metadata-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          {
+            id: "one",
+            run: 'node -e "process.stdout.write(JSON.stringify({n:1}))"',
+          },
+          {
+            id: "two",
+            run: 'node -e "process.stdout.write(JSON.stringify({n:2}))"',
+            stdin: "$one.json",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_CHECKPOINTS_ENABLED: "true",
+  };
+
+  const first = await runToolRequest({
+    filePath,
+    title: "Original run",
+    description: "First attempt",
+    metadata: { attempt: 1 },
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(first.status, "ok");
+
+  const rerun = await rerunToolRequest({ jobId: first.jobId!, ctx: { cwd: tmpDir, env } });
+  assert.equal(rerun.status, "ok");
+  const rerunJob = await getJob({ jobId: rerun.jobId!, ctx: { env } });
+  assert.equal(rerunJob?.title, "Original run");
+  assert.equal(rerunJob?.description, "First attempt");
+  assert.deepEqual(rerunJob?.metadata, { attempt: 1 });
+
+  const checkpoints = await listRunCheckpoints({ runId: first.runId!, ctx: { env } });
+  const one = checkpoints.find(
+    (checkpoint) => checkpoint.stepId === "one" && checkpoint.status === "succeeded",
+  );
+  assert.ok(one);
+
+  const rewind = await rewindToolRequest({
+    jobId: first.jobId!,
+    checkpointId: one!.checkpointId,
+    ctx: { cwd: tmpDir, env },
+  });
+  assert.equal(rewind.status, "ok");
+  const rewindJob = await getJob({ jobId: rewind.jobId!, ctx: { env } });
+  assert.equal(rewindJob?.title, "Original run");
+  assert.equal(rewindJob?.description, "First attempt");
+  assert.deepEqual(rewindJob?.metadata, { attempt: 1 });
 });

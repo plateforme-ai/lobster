@@ -107,7 +107,6 @@ Checkpoint/cache validation:
 
 ```powershell
 $env:LOBSTER_CHECKPOINTS_ENABLED="true"
-$env:LOBSTER_STORE="sqlite"
 $env:LOBSTER_STATE_DIR="$PWD\.lobster-state"
 lobster run --mode tool 'exec --json node -e "process.stdout.write(JSON.stringify({ok:true}))"'
 ```

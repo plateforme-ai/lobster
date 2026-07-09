@@ -32,7 +32,7 @@ function runProcess(command, argv, { env, cwd }) {
   });
 }
 
-import { diffAndStore } from "../state/store.js";
+import { diffAndStore } from "../store/state.js";
 
 function pickSubset(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return null;

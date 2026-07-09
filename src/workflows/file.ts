@@ -15,8 +15,8 @@ import {
   deleteStateJson,
   readStateJson,
   writeStateJson,
-} from "../state/store.js";
-import type { WorkflowExecutionContext } from "../checkpoints/types.js";
+} from "../store/state.js";
+import type { WorkflowExecutionContext } from "../workflows/checkpoints.js";
 import {
   appendCheckpoint,
   checkpointsEnabled,
@@ -27,8 +27,10 @@ import {
   findWaitingCheckpointByStateKey,
   getJob,
   getRunControl,
+  recordTerminalCancel,
   resolveApprovalRecord,
   updateCheckpointStatus,
+  updateJobMetadata,
   updateRun,
 } from "../store/runtime_store.js";
 import { readLineFromStream } from "../read_line.js";
@@ -63,6 +65,16 @@ export function resolveWorkflowDisplayName(workflow: WorkflowFile, filePath: str
 export async function readWorkflowDisplayName(filePath: string): Promise<string> {
   const workflow = await loadWorkflowFile(filePath);
   return resolveWorkflowDisplayName(workflow, filePath);
+}
+
+export function resolveWorkflowDescription(workflow: WorkflowFile): string | null {
+  const desc = workflow.description?.trim();
+  return desc ? desc : null;
+}
+
+export async function readWorkflowDescription(filePath: string): Promise<string | null> {
+  const workflow = await loadWorkflowFile(filePath);
+  return resolveWorkflowDescription(workflow);
 }
 
 export type ParallelBranch = {
@@ -111,6 +123,20 @@ export type WorkflowStep = {
     max_delay_ms?: number;
     jitter?: boolean;
   };
+  metadata?: WorkflowStepMetadataInput | NormalizedWorkflowStepMetadata;
+};
+
+export type WorkflowStepMetadataInput =
+  | "auto"
+  | Array<Record<string, unknown>>
+  | { title?: "auto" | string; description?: "auto" | string; [key: string]: unknown };
+
+export type NormalizedWorkflowStepMetadata = {
+  autoTitle: boolean;
+  autoDescription: boolean;
+  title?: string;
+  description?: string;
+  custom: Record<string, unknown>;
 };
 
 export type WorkflowApproval =
@@ -719,6 +745,9 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
         throw new Error(`Workflow step ${step.id} retry.jitter must be a boolean`);
       }
     }
+    if (step.metadata !== undefined) {
+      step.metadata = normalizeStepMetadata(step.metadata, step.id) ?? undefined;
+    }
     if (seen.has(step.id)) {
       throw new Error(`Duplicate workflow step id: ${step.id}`);
     }
@@ -732,6 +761,56 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
   }
 
   return parsed as WorkflowFile;
+}
+
+function normalizeStepMetadata(
+  raw: unknown,
+  stepId: string,
+): NormalizedWorkflowStepMetadata | null {
+  if (raw === undefined || raw === null) return null;
+  if (raw === "auto") {
+    return { autoTitle: true, autoDescription: true, custom: {} };
+  }
+  let source: Record<string, unknown>;
+  if (Array.isArray(raw)) {
+    source = {};
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`Workflow step ${stepId} metadata list entries must be single-key maps`);
+      }
+      const keys = Object.keys(entry as Record<string, unknown>);
+      if (keys.length !== 1) {
+        throw new Error(`Workflow step ${stepId} metadata list entries must be single-key maps`);
+      }
+      source[keys[0]] = (entry as Record<string, unknown>)[keys[0]];
+    }
+  } else if (typeof raw === "object") {
+    source = raw as Record<string, unknown>;
+  } else {
+    throw new Error(
+      `Workflow step ${stepId} metadata must be "auto", a map, or a list of single-key maps`,
+    );
+  }
+  const normalized: NormalizedWorkflowStepMetadata = {
+    autoTitle: false,
+    autoDescription: false,
+    custom: {},
+  };
+  for (const [key, value] of Object.entries(source)) {
+    if (key === "title" || key === "description") {
+      if (value === "auto") {
+        if (key === "title") normalized.autoTitle = true;
+        else normalized.autoDescription = true;
+      } else if (typeof value === "string") {
+        normalized[key] = value;
+      } else {
+        throw new Error(`Workflow step ${stepId} metadata.${key} must be a string or "auto"`);
+      }
+    } else {
+      normalized.custom[key] = value;
+    }
+  }
+  return normalized;
 }
 
 export function resolveWorkflowArgs(
@@ -761,7 +840,6 @@ export async function runWorkflowFile({
   resume,
   approved,
   response,
-  cancel,
   argsOverride,
   approvedPayloadOverride,
 }: {
@@ -771,7 +849,6 @@ export async function runWorkflowFile({
   resume?: WorkflowResumePayload;
   approved?: boolean;
   response?: unknown;
-  cancel?: boolean;
   argsOverride?: Record<string, unknown>;
   approvedPayloadOverride?: unknown;
 }): Promise<WorkflowRunResult> {
@@ -792,30 +869,27 @@ export async function runWorkflowFile({
         "Workflow resume requires --approve yes|no for approval requests",
       );
     }
-    if (cancel !== true && typeof approved !== "boolean") {
+    if (typeof approved !== "boolean") {
       throw new WorkflowResumeArgumentError(
         "Workflow resume requires --approve yes|no for approval requests",
       );
     }
-    if (cancel === true || approved === false) {
+    if (approved === false) {
       if (consumedResumeStateKey) {
         await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
       }
       if (resumeState.runId) {
-        await updateRun({ env: ctx.env, runId: resumeState.runId, status: "cancelled" });
+        await recordTerminalCancel({
+          env: ctx.env,
+          runId: resumeState.runId,
+          jobId: resumeState.jobId,
+          rootRunId: resumeState.rootRunId,
+          stepId: resumeState.approvalStepId,
+          metadata: { reason: "approval_rejected" },
+        });
       }
       return { status: "cancelled", output: [] };
     }
-  }
-
-  if (resumeState?.inputStepId && cancel === true) {
-    if (consumedResumeStateKey) {
-      await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
-    }
-    if (resumeState.runId) {
-      await updateRun({ env: ctx.env, runId: resumeState.runId, status: "cancelled" });
-    }
-    return { status: "cancelled", output: [] };
   }
 
   const resolvedFilePath = filePath ?? resumeState?.filePath;
@@ -862,8 +936,8 @@ export async function runWorkflowFile({
     if (checkpointRun?.jobId && checkpointsEnabled(ctx.env)) {
       const job = await getJob(ctx.env, checkpointRun.jobId).catch(() => null);
       if (job) {
-        if (job.externalSessionId && ctx.env.LOBSTER_JOB_SESSION_KEY === undefined) {
-          ctx.env.LOBSTER_JOB_SESSION_KEY = job.externalSessionId;
+        if (job.externalSessionKey && ctx.env.LOBSTER_JOB_SESSION_KEY === undefined) {
+          ctx.env.LOBSTER_JOB_SESSION_KEY = job.externalSessionKey;
         }
         if (job.agent && ctx.env.LOBSTER_JOB_AGENT === undefined) {
           ctx.env.LOBSTER_JOB_AGENT = job.agent;
@@ -877,7 +951,7 @@ export async function runWorkflowFile({
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: "workflow_start",
+      stepId: "workflow-start",
       stepIndex: -1,
       stepType: "workflow",
       status: resumeState ? "resumed" : "started",
@@ -911,9 +985,12 @@ export async function runWorkflowFile({
         },
         approved,
         response,
-        cancel,
       });
-      if (childResult.status === "needs_approval" || childResult.status === "needs_input") {
+      if (
+        childResult.status === "needs_approval" ||
+        childResult.status === "needs_input" ||
+        childResult.status === "paused"
+      ) {
         const suspended = await wrapChildSuspension({
           ctx,
           parentRun: checkpointRun,
@@ -1065,33 +1142,30 @@ export async function runWorkflowFile({
       const step = steps[idx];
 
       // Cooperative run control: between-steps pause/cancel/step-by-step.
-      // The step at the resume entry index always runs (so "continue" advances
-      // exactly one step and we never re-pause on the same step forever); pause
-      // and step-mode take effect before any subsequent step. Cancel is honored
-      // at every boundary, including the entry step.
+      // On a fresh run, pause and step-mode take effect before the first step.
+      // On resume, the step at the resume entry index always runs (so "continue"
+      // advances exactly one step and we never re-pause on the same step forever);
+      // pause and step-mode then take effect before any subsequent step. Cancel is
+      // honored at every boundary, including the entry step.
       if (checkpointRun?.runId && checkpointsEnabled(ctx.env)) {
-        const control = await getRunControl({ env: ctx.env, runId: checkpointRun.runId });
+        const control = await getRunControl({ env: ctx.env, runId: checkpointRun.rootRunId });
         if (control?.desired === "cancel") {
-          await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
           if (consumedResumeStateKey) {
             await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
-          await updateRun({ env: ctx.env, runId: checkpointRun.runId, status: "cancelled" });
-          await appendCheckpoint({
+          await recordTerminalCancel({
             env: ctx.env,
             run: checkpointRun,
+            runId: checkpointRun.runId,
+            jobId: checkpointRun.jobId,
             stepId: step.id,
             stepIndex: idx,
-            stepType: "control",
-            status: "cancelled",
-            metadata: {
-              reason: "cancel_requested",
-              resultsSnapshot: cloneResults(results),
-            },
+            metadata: { resultsSnapshot: cloneResults(results) },
           });
           return { status: "cancelled", output: [] };
         }
-        if (idx > startIndex && (control?.desired === "pause" || control?.stepMode)) {
+        const isResumeEntryStep = resumeState != null && idx === startIndex;
+        if (!isResumeEntryStep && (control?.desired === "pause" || control?.stepMode)) {
           const reason: WorkflowPausedInfo["reason"] =
             control.desired === "pause" ? "pause_requested" : "step_mode";
           const stateKey = await saveWorkflowResumeState(ctx.env, {
@@ -1107,7 +1181,7 @@ export async function runWorkflowFile({
             await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
           }
           if (control.desired === "pause") {
-            await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.runId });
+            await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.rootRunId });
           }
           const resumeToken = encodeToken({
             protocolVersion: 1,
@@ -1582,7 +1656,11 @@ export async function runWorkflowFile({
               args: subArgs,
               ctx: { ...ctx, env, cwd, _activeWorkflows: childActive, checkpointRun: childRun },
             });
-            if (subResult.status === "needs_approval" || subResult.status === "needs_input") {
+            if (
+              subResult.status === "needs_approval" ||
+              subResult.status === "needs_input" ||
+              subResult.status === "paused"
+            ) {
               throw new WorkflowNestedSuspension(
                 await wrapChildSuspension({
                   ctx,
@@ -1812,6 +1890,39 @@ export async function runWorkflowFile({
         },
       });
 
+      if (
+        step.metadata &&
+        checkpointRun?.jobId &&
+        checkpointsEnabled(ctx.env) &&
+        (execution.kind === "shell" ||
+          execution.kind === "pipeline" ||
+          execution.kind === "workflow")
+      ) {
+        const metadataOutcome = await applyStepMetadata({
+          ctx,
+          step,
+          stepIndex: idx,
+          checkpointRun,
+          resolvedArgs,
+          results,
+          input: resolveShellStdin(step.stdin, resolvedArgs, results),
+          output: result,
+        });
+        if (!metadataOutcome.ok) {
+          // Metadata generation is a step sub-operation: on failure follow the
+          // step's on_error policy so it can be stopped/replayed/rewound like any
+          // other step failure. The scoped `${step.id}.metadata` checkpoint is the
+          // anchor. The step's own succeeded checkpoint stays intact.
+          const metadataPolicy = step.on_error ?? "stop";
+          if (metadataPolicy === "stop") {
+            throw new Error(metadataOutcome.error ?? `metadata generation failed for step '${step.id}'`);
+          }
+          if (metadataPolicy === "skip_rest") {
+            break;
+          }
+        }
+      }
+
       trackStepCost(costTracker, step.id, result);
       if (workflow.cost_limit) {
         costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
@@ -1922,7 +2033,7 @@ export async function runWorkflowFile({
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: "workflow_output",
+      stepId: "workflow-output",
       stepIndex: steps.length,
       stepType: "workflow_result",
       status: "succeeded",
@@ -1988,7 +2099,9 @@ async function wrapChildSuspension({
   childFilePath: string;
 }): Promise<WorkflowRunResult> {
   const childResumeToken =
-    childResult.requiresApproval?.resumeToken ?? childResult.requiresInput?.resumeToken;
+    childResult.requiresApproval?.resumeToken ??
+    childResult.requiresInput?.resumeToken ??
+    childResult.paused?.resumeToken;
   const childStateKey = childResumeToken ? decodeStateKeyFromResumeToken(childResumeToken) : null;
   if (!childStateKey) {
     throw new Error(`Workflow step ${childStepId} sub-workflow did not return a resume state`);
@@ -2085,7 +2198,213 @@ async function wrapChildSuspension({
     };
   }
 
+  if (childResult.status === "paused" && childResult.paused) {
+    await appendCheckpoint({
+      env: ctx.env,
+      run: parentRun,
+      stepId: childStepId,
+      stepIndex: parentResumeAtIndex,
+      stepType: "pause",
+      status: "waiting",
+      metadata: {
+        reason: childResult.paused.reason,
+        stateKey: parentStateKey,
+        nested: true,
+        childStepId,
+      },
+    });
+    return {
+      status: "paused",
+      output: [],
+      paused: {
+        ...childResult.paused,
+        nextStepId: childStepId,
+        resumeToken,
+      },
+    };
+  }
+
   throw new Error(`Workflow step ${childStepId} sub-workflow did not suspend`);
+}
+
+type StepMetadataOutcome = { ok: boolean; error?: string };
+
+async function applyStepMetadata({
+  ctx,
+  step,
+  stepIndex,
+  checkpointRun,
+  resolvedArgs,
+  results,
+  input,
+  output,
+}: {
+  ctx: RunContext;
+  step: WorkflowStep;
+  stepIndex: number;
+  checkpointRun: WorkflowExecutionContext;
+  resolvedArgs: Record<string, unknown>;
+  results: Record<string, WorkflowStepResult>;
+  input: unknown;
+  output: WorkflowStepResult;
+}): Promise<StepMetadataOutcome> {
+  const meta = step.metadata as NormalizedWorkflowStepMetadata;
+  try {
+    const updates: {
+      title?: string;
+      description?: string;
+      metadata?: Record<string, unknown>;
+    } = {};
+    if (meta.title !== undefined) {
+      updates.title = resolveTemplate(meta.title, resolvedArgs, results);
+    }
+    if (meta.description !== undefined) {
+      updates.description = resolveTemplate(meta.description, resolvedArgs, results);
+    }
+    if (meta.autoTitle || meta.autoDescription) {
+      const auto = await generateJobMetadataAuto({
+        ctx,
+        step,
+        input,
+        output,
+        needTitle: meta.autoTitle,
+        needDescription: meta.autoDescription,
+      });
+      if (meta.autoTitle && auto.title) updates.title = auto.title;
+      if (meta.autoDescription && auto.description) updates.description = auto.description;
+    }
+    if (Object.keys(meta.custom).length > 0) {
+      updates.metadata = meta.custom;
+    }
+
+    // Requested auto-generation that yielded no usable field is a failure, not a no-op.
+    const autoEmpty =
+      (meta.autoTitle && updates.title === undefined) ||
+      (meta.autoDescription && updates.description === undefined);
+
+    if (
+      updates.title !== undefined ||
+      updates.description !== undefined ||
+      updates.metadata !== undefined
+    ) {
+      await updateJobMetadata({ env: ctx.env, jobId: checkpointRun.jobId, ...updates });
+    }
+
+    if (autoEmpty) {
+      const message = `metadata auto-generation produced no ${
+        meta.autoTitle && updates.title === undefined ? "title" : "description"
+      } for step '${step.id}'`;
+      ctx.stderr.write(`[metadata] ${message}\n`);
+      await appendCheckpoint({
+        env: ctx.env,
+        run: checkpointRun,
+        stepId: `${step.id}.metadata`,
+        stepIndex,
+        stepType: "metadata",
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        error: { message },
+        metadata: { reason: "metadata_generation_empty" },
+      }).catch(() => {});
+      return { ok: false, error: message };
+    }
+
+    if (
+      updates.title !== undefined ||
+      updates.description !== undefined ||
+      updates.metadata !== undefined
+    ) {
+      await appendCheckpoint({
+        env: ctx.env,
+        run: checkpointRun,
+        stepId: `${step.id}.metadata`,
+        stepIndex,
+        stepType: "metadata",
+        status: "succeeded",
+        finishedAt: new Date().toISOString(),
+        metadata: {
+          ...(updates.title !== undefined ? { title: updates.title } : {}),
+          ...(updates.description !== undefined ? { description: updates.description } : {}),
+          ...(updates.metadata !== undefined ? { custom: updates.metadata } : {}),
+          auto: { title: meta.autoTitle, description: meta.autoDescription },
+        },
+      }).catch(() => {});
+    }
+    return { ok: true };
+  } catch (err: any) {
+    const message = err?.message ?? String(err);
+    ctx.stderr.write(`[metadata] step '${step.id}' metadata update failed: ${message}\n`);
+    await appendCheckpoint({
+      env: ctx.env,
+      run: checkpointRun,
+      stepId: `${step.id}.metadata`,
+      stepIndex,
+      stepType: "metadata",
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      error: { message },
+      metadata: { reason: "metadata_generation_failed" },
+    }).catch(() => {});
+    return { ok: false, error: message };
+  }
+}
+
+async function generateJobMetadataAuto({
+  ctx,
+  step,
+  input,
+  output,
+  needTitle,
+  needDescription,
+}: {
+  ctx: RunContext;
+  step: WorkflowStep;
+  input: unknown;
+  output: WorkflowStepResult;
+  needTitle: boolean;
+  needDescription: boolean;
+}): Promise<{ title?: string; description?: string }> {
+  const { invokeLlmText } = await import("../commands/stdlib/llm_client.js");
+  const inputText = compactForPrompt(input);
+  const outputText = compactForPrompt(output.json ?? output.stdout ?? null);
+  const timeoutMs = parseMetadataTimeoutMs(ctx.env);
+  const signal = ctx.signal;
+  const result: { title?: string; description?: string } = {};
+  if (needTitle) {
+    const prompt =
+      `Write a concise title (at most 8 words, no surrounding quotes) that summarizes the ` +
+      `result of workflow step "${step.id}". Input: ${inputText} Output: ${outputText} ` +
+      `Respond with only the title text.`;
+    const title = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
+    if (title) result.title = title.split("\n")[0]!.trim();
+  }
+  if (needDescription) {
+    const prompt =
+      `Write a 1-2 sentence description that summarizes the result of workflow step ` +
+      `"${step.id}". Input: ${inputText} Output: ${outputText} ` +
+      `Respond with only the description text.`;
+    const description = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
+    if (description) result.description = description.trim();
+  }
+  return result;
+}
+
+function compactForPrompt(value: unknown): string {
+  let text: string;
+  if (value === null || value === undefined) {
+    text = "(none)";
+  } else if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  text = text.replace(/\s+/g, " ").trim();
+  if (text.length > 500) text = `${text.slice(0, 500)}...`;
+  return text.length ? text : "(none)";
 }
 
 function workflowOutputToStepResult(stepId: string, output: unknown[]): WorkflowStepResult {
@@ -2918,6 +3237,17 @@ function parseApprovalTimeoutMs(env: Record<string, string | undefined>) {
   const raw = env?.LOBSTER_APPROVAL_INPUT_TIMEOUT_MS;
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
+// Bound the auto-metadata LLM call so a hanging adapter cannot run unbounded.
+// This runs after the step's own timeout_ms guard has exited, so it needs its
+// own budget. Configurable via LOBSTER_METADATA_TIMEOUT_MS; defaults to 60s.
+export const DEFAULT_METADATA_TIMEOUT_MS = 60_000;
+export function parseMetadataTimeoutMs(env: Record<string, string | undefined>) {
+  const raw = env?.LOBSTER_METADATA_TIMEOUT_MS;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_METADATA_TIMEOUT_MS;
   return Math.floor(value);
 }
 

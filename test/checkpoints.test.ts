@@ -50,7 +50,7 @@ test("workflow tool runs create sqlite checkpoints and redact secret-looking out
 
   const checkpoints = await listRunCheckpoints({ runId: result.runId!, ctx: { env } });
   assert.ok(checkpoints.some((checkpoint) => checkpoint.stepId === "secret"));
-  assert.ok(checkpoints.some((checkpoint) => checkpoint.stepId === "workflow_output"));
+  assert.ok(checkpoints.some((checkpoint) => checkpoint.stepId === "workflow-output"));
 
   const secretCheckpoint = checkpoints.find((checkpoint) => checkpoint.stepId === "secret");
   assert.ok(secretCheckpoint);
@@ -119,7 +119,7 @@ test("nested workflow checkpoints share jobId and use child runId with stable st
     ctx: { cwd: tmpDir, env },
   });
   assert.equal(rewind.status, "ok");
-  assert.notEqual(rewind.jobId, result.jobId);
+  assert.equal(rewind.jobId, result.jobId);
   assert.deepEqual(rewind.output, [{ child: true }]);
 });
 
@@ -178,8 +178,8 @@ test("workflow pipeline checkpoints are scoped under the owning step path", asyn
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
-        checkpoint.stepId === "pipeline_output" &&
-        checkpoint.stepPath === "root.transform.pipeline_output" &&
+        checkpoint.stepId === "pipeline-output" &&
+        checkpoint.stepPath === "root.transform.pipeline-output" &&
         checkpoint.stepType === "pipeline_result",
     ),
   );
@@ -213,8 +213,8 @@ test("standalone pipeline checkpoints keep top-level step paths", async () => {
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
-        checkpoint.stepId === "pipeline_output" &&
-        checkpoint.stepPath === "root.pipeline_output" &&
+        checkpoint.stepId === "pipeline-output" &&
+        checkpoint.stepPath === "root.pipeline-output" &&
         checkpoint.stepType === "pipeline_result",
     ),
   );

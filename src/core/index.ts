@@ -23,3 +23,19 @@ export {
   setStepMode,
   setJobExternalSession,
 } from "./tool_runtime.js";
+export type { ToolEnvelope } from "./tool_runtime.js";
+export type {
+  JobRecord,
+  RunRecord,
+  CheckpointRecord,
+  CheckpointIORecord,
+  ApprovalRecord,
+  RunControlSnapshot,
+  RunControlState,
+  RunControlRecord,
+  JobWaitSnapshot,
+  JobWaitKind,
+  RunStatus,
+  CheckpointStatus,
+  ApprovalStatus,
+} from "../workflows/checkpoints.js";

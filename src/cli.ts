@@ -2,7 +2,7 @@ import { parsePipeline } from "./parser.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { runPipeline } from "./runtime.js";
 import { decodeResumeToken, parseResumeArgs, resolveApprovalId } from "./resume.js";
-import { cleanupApprovalIndexByStateKey, deleteApprovalId } from "./state/store.js";
+import { cleanupApprovalIndexByStateKey, deleteApprovalId } from "./store/state.js";
 import {
   WorkflowResumeArgumentError,
   loadWorkflowFile,
@@ -11,12 +11,13 @@ import {
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
-import { deleteStateJson } from "./state/store.js";
+import { deleteStateJson } from "./store/state.js";
 import {
   finalizePipelineToolRun,
   loadPipelineResumeState,
   validatePipelineInputResponse,
 } from "./pipeline_resume_state.js";
+import { recordTerminalCancel, resolveApprovalRecord } from "./store/runtime_store.js";
 
 export async function runCli(argv) {
   const registry = createDefaultRegistry();
@@ -585,14 +586,12 @@ async function handleResume({ argv, registry }) {
   const mode = "tool";
   let approved: boolean | undefined;
   let response: unknown = undefined;
-  let cancel = false;
   let payload: any;
   let resolvedApprovalId: string | null = null;
   try {
     const parsed = parseResumeArgs(argv);
     approved = parsed.approved;
     response = parsed.response;
-    cancel = parsed.cancel === true;
     resolvedApprovalId = parsed.approvalId;
 
     // Resolve short approval ID to token if provided
@@ -621,24 +620,6 @@ async function handleResume({ argv, registry }) {
     }
   };
 
-  if (cancel === true) {
-    await cleanupIndex();
-    if (payload.kind === "workflow-file" && payload.stateKey) {
-      await deleteStateJson({ env: process.env, key: payload.stateKey });
-    }
-    if (payload.kind === "pipeline-resume" && payload.stateKey) {
-      await deleteStateJson({ env: process.env, key: payload.stateKey });
-    }
-    writeToolEnvelope({
-      ok: true,
-      status: "cancelled",
-      output: [],
-      requiresApproval: null,
-      requiresInput: null,
-    });
-    return;
-  }
-
   if (payload.kind === "workflow-file") {
     try {
       const output = await runWorkflowFile({
@@ -654,7 +635,6 @@ async function handleResume({ argv, registry }) {
         resume: payload,
         approved,
         response,
-        cancel,
       });
 
       if (output.status === "needs_approval") {
@@ -785,6 +765,23 @@ async function handleResume({ argv, registry }) {
     if (approved !== true) {
       await cleanupIndex();
       await deleteStateJson({ env: process.env, key: previousStateKey });
+      await resolveApprovalRecord({
+        env: process.env,
+        approvalId: resolvedApprovalId,
+        stateKey: previousStateKey,
+        status: "rejected",
+        decision: "reject",
+        approvedBy: String(process.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
+      });
+      if (resumeState.runId) {
+        await recordTerminalCancel({
+          env: process.env,
+          runId: resumeState.runId,
+          jobId: resumeState.jobId,
+          rootRunId: resumeState.rootRunId,
+          metadata: { reason: "approval_rejected" },
+        });
+      }
       writeToolEnvelope({
         ok: true,
         status: "cancelled",
@@ -932,7 +929,6 @@ function helpText() {
     `  lobster graph --file path/to/workflow.lobster --format ascii\n` +
     `  lobster resume --token <token> --approve yes|no\n` +
     `  lobster resume --token <token> --response-json '{...}'\n` +
-    `  lobster resume --token <token> --cancel\n` +
     `  lobster pause --job <jobId>\n` +
     `  lobster cancel --job <jobId>\n` +
     `  lobster step-mode --job <jobId> --on|--off\n` +

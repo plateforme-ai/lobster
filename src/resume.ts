@@ -1,6 +1,6 @@
 import { decodeToken, encodeToken } from "./token.js";
 import { decodeWorkflowResumePayload } from "./workflows/file.js";
-import { findStateKeyByApprovalId } from "./state/store.js";
+import { findStateKeyByApprovalId } from "./store/state.js";
 
 /**
  * Determine the resume payload kind from a state key prefix.
@@ -21,7 +21,7 @@ export type PipelineResumePayload = {
 };
 
 export function parseResumeArgs(argv) {
-  const args = { decision: null, token: null, approvalId: null, responseJson: null, cancel: false };
+  const args = { decision: null, token: null, approvalId: null, responseJson: null };
 
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
@@ -52,26 +52,6 @@ export function parseResumeArgs(argv) {
       args.responseJson = tok.slice("--response-json=".length);
       continue;
     }
-    if (tok === "--cancel") {
-      const next = argv[i + 1];
-      if (typeof next === "string" && !next.startsWith("--")) {
-        const parsed = parseBooleanArg(next);
-        if (parsed === null) {
-          throw new Error("resume --cancel must be true or false");
-        }
-        args.cancel = parsed;
-        i++;
-        continue;
-      }
-      args.cancel = true;
-      continue;
-    }
-    if (tok.startsWith("--cancel=")) {
-      const parsed = parseBooleanArg(tok.slice("--cancel=".length));
-      if (parsed === null) throw new Error("resume --cancel must be true or false");
-      args.cancel = parsed;
-      continue;
-    }
     if (tok === "--approve" || tok === "--decision") {
       args.decision = argv[i + 1];
       i++;
@@ -88,21 +68,12 @@ export function parseResumeArgs(argv) {
   }
 
   if (!args.token && !args.approvalId) throw new Error("resume requires --token or --id");
-  const intentCount =
-    Number(Boolean(args.decision)) + Number(args.responseJson !== null) + Number(args.cancel);
+  const intentCount = Number(Boolean(args.decision)) + Number(args.responseJson !== null);
   if (intentCount > 1) {
-    throw new Error("resume accepts only one of --approve, --response-json, or --cancel");
+    throw new Error("resume accepts only one of --approve or --response-json");
   }
   if (intentCount === 0) {
-    throw new Error("resume requires --approve yes|no, --response-json, or --cancel");
-  }
-
-  if (args.cancel) {
-    return {
-      token: args.token ? String(args.token) : null,
-      approvalId: args.approvalId ? String(args.approvalId) : null,
-      cancel: true,
-    };
+    throw new Error("resume requires --approve yes|no or --response-json");
   }
 
   if (args.responseJson !== null) {
@@ -125,15 +96,6 @@ export function parseResumeArgs(argv) {
     approvalId: args.approvalId ? String(args.approvalId) : null,
     approved: decision === "yes" || decision === "y",
   };
-}
-
-function parseBooleanArg(value: string): boolean | null {
-  const raw = String(value ?? "")
-    .trim()
-    .toLowerCase();
-  if (["1", "true", "yes", "y"].includes(raw)) return true;
-  if (["0", "false", "no", "n"].includes(raw)) return false;
-  return null;
 }
 
 /**

@@ -17,7 +17,7 @@
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureDirectory, isJsonSyntaxError, writeFileAtomic } from "../../state/store.js";
+import { ensureDirectory, isJsonSyntaxError, writeFileAtomic } from "../../store/state.js";
 
 /**
  * Get the state directory

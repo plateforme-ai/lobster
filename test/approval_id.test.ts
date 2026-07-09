@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { findStateKeyByApprovalId, writeApprovalIndex } from "../src/state/store.js";
+import { findStateKeyByApprovalId, writeApprovalIndex } from "../src/store/state.js";
 
 function runCli(args: string[], env: Record<string, string | undefined>) {
   const bin = path.join(process.cwd(), "bin", "lobster.js");

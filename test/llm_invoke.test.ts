@@ -23,7 +23,7 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd, "llm.invoke should be registered");
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -69,7 +69,7 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
         prompt: "Summarize",
       },
       ctx: baseCtx(
-        { OPENCLAW_URL: `http://localhost:${port}`, LOBSTER_CACHE_DIR: cacheDir },
+        { OPENCLAW_URL: `http://localhost:${port}`, LOBSTER_STATE_DIR: stateDir },
         registry,
       ),
     } as any);
@@ -87,7 +87,7 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
     assert.equal("artifacts" in bodyLog[0].args, false);
     assert.equal(bodyLog[0].args.artifactHashes.length, 1);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -96,7 +96,7 @@ test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -148,7 +148,7 @@ test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async
           LOBSTER_LLM_PROVIDER: undefined,
           LOBSTER_PI_LLM_ADAPTER_URL: undefined,
           LOBSTER_LLM_ADAPTER_URL: undefined,
-          LOBSTER_CACHE_DIR: cacheDir,
+          LOBSTER_STATE_DIR: stateDir,
         },
         registry,
       ),
@@ -165,7 +165,7 @@ test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async
     assert.equal("artifacts" in bodyLog[0].args, false);
     assert.equal(bodyLog[0].args.artifactHashes.length, 1);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -174,7 +174,7 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -226,7 +226,7 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
         {
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: "anthropic/claude-sonnet-4-5",
-          LOBSTER_CACHE_DIR: cacheDir,
+          LOBSTER_STATE_DIR: stateDir,
         },
         registry,
       ),
@@ -243,7 +243,7 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
     assert.equal(requestLog[0].model, "anthropic/claude-sonnet-4-5");
     assert.equal(requestLog[0].artifacts.length, 1);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -252,7 +252,7 @@ test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
     let buf = "";
@@ -284,7 +284,7 @@ test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: undefined,
           LOBSTER_JOB_MODEL: "job/model",
-          LOBSTER_CACHE_DIR: cacheDir,
+          LOBSTER_STATE_DIR: stateDir,
         },
         registry,
       ),
@@ -294,7 +294,7 @@ test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
     assert.equal(items[0].model, "job/model");
     assert.equal(requestLog[0].model, "job/model");
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -303,7 +303,7 @@ test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => 
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
     let buf = "";
@@ -335,7 +335,7 @@ test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => 
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: "llm/model",
           LOBSTER_JOB_MODEL: "job/model",
-          LOBSTER_CACHE_DIR: cacheDir,
+          LOBSTER_STATE_DIR: stateDir,
         },
         registry,
       ),
@@ -345,7 +345,7 @@ test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => 
     assert.equal(items[0].model, "llm/model");
     assert.equal(requestLog[0].model, "llm/model");
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });

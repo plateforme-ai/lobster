@@ -14,7 +14,7 @@ import {
   readStateJson,
   writeFileAtomic,
   writeFileAtomicExclusive,
-} from "../src/state/store.js";
+} from "../src/store/state.js";
 
 function streamOf(items) {
   return (async function* () {

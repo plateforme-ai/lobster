@@ -1,7 +1,7 @@
 # Protect ownership and automation rules.
-/.github/CODEOWNERS @openclaw/openclaw-secops
-/.github/workflows/ @openclaw/openclaw-secops
-/package.json @openclaw/openclaw-secops
-/.github/actionlint.yaml @openclaw/openclaw-secops
-/.agents/skills/ @openclaw/openclaw-secops
-/.crabbox.yaml @openclaw/openclaw-secops
+/.github/CODEOWNERS @plateforme-ai/secops
+/.github/workflows/ @plateforme-ai/secops
+/package.json @plateforme-ai/secops
+/.github/actionlint.yaml @plateforme-ai/secops
+/.agents/skills/ @plateforme-ai/secops
+/.crabbox.yaml @plateforme-ai/secops

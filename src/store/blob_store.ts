@@ -1,7 +1,7 @@
 import path from "node:path";
 import { promises as fsp } from "node:fs";
 
-import { defaultStateDir, ensureDirectory, writeFileAtomic } from "../state/store.js";
+import { defaultStateDir, ensureDirectory, writeFileAtomic } from "./state.js";
 import { serializeBounded, type SerializedPayload } from "./serialization.js";
 
 export type StoredPayload = {

@@ -17,7 +17,7 @@
  * const result = await workflow.run();
  */
 
-export { Lobster } from "./Lobster.js";
+export { Lobster } from "./lobster.js";
 export { approve } from "./primitives/approve.js";
 export { exec } from "./primitives/exec.js";
 export { stateGet, stateSet, state } from "./primitives/state.js";

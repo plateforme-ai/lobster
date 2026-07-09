@@ -1,5 +1,5 @@
 import { createJsonRenderer } from "./renderers/json.js";
-import type { WorkflowExecutionContext } from "./checkpoints/types.js";
+import type { WorkflowExecutionContext } from "./workflows/checkpoints.js";
 import { appendCheckpoint } from "./store/runtime_store.js";
 import {
   InputRequestSuspension,
@@ -239,7 +239,7 @@ export async function runPipeline({
   await appendCheckpoint({
     env,
     run: checkpointRun,
-    stepId: "pipeline_output",
+    stepId: "pipeline-output",
     stepIndex: pipeline.length,
     stepType: "pipeline_result",
     status: halted ? "waiting" : "succeeded",

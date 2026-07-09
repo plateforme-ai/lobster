@@ -16,14 +16,14 @@ import type {
   WorkflowExecutionContext,
   RunRecord,
   RunStatus,
-} from "../checkpoints/types.js";
+} from "../workflows/checkpoints.js";
 import { storePayload, readBlobJson } from "./blob_store.js";
 import { parseJsonSafe, stringifySafe } from "./serialization.js";
 import { withRuntimeDb } from "./sqlite.js";
 
 type WaitGateStepType = (typeof WAIT_GATE_STEP_TYPES)[number];
 
-const DEFAULT_CHECKPOINT_INLINE_BYTES = 64_000;
+const DEFAULT_CHECKPOINT_INLINE_BYTES = 65_536;
 const DEFAULT_CHECKPOINT_PREVIEW_BYTES = 16_384;
 const DEFAULT_CACHE_INLINE_BYTES = 65_536;
 const DEFAULT_CACHE_TTL_DAYS = 30;
@@ -59,12 +59,15 @@ export async function createRun(params: {
   workflowFile?: string | null;
   workflowName?: string | null;
   pipelineText?: string | null;
+  workflowDescription?: string | null;
   args?: unknown;
   agent?: string | null;
   model?: string | null;
-  rerunOfJobId?: string | null;
-  rewindOfJobId?: string | null;
-  rewindOfCheckpointId?: string | null;
+  title?: string | null;
+  description?: string | null;
+  metadata?: Record<string, unknown> | null;
+  parentJobId?: string | null;
+  rootJobId?: string | null;
 }) {
   const now = new Date().toISOString();
   const jobId = randomUUID();
@@ -72,28 +75,34 @@ export async function createRun(params: {
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
       `INSERT INTO jobs (
-        job_id, root_run_id, status, source_type, rerun_of_job_id, rewind_of_job_id,
-        rewind_of_checkpoint_id, agent, model, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        job_id, root_run_id, status, source_type, parent_job_id, root_job_id,
+        latest_run_id, agent, model, title, description, metadata_json,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       jobId,
       runId,
       "running",
       params.sourceType,
-      params.rerunOfJobId ?? null,
-      params.rewindOfJobId ?? null,
-      params.rewindOfCheckpointId ?? null,
+      params.parentJobId ?? null,
+      params.rootJobId ?? jobId,
+      runId,
       params.agent ?? null,
       params.model ?? null,
+      normalizeStoredJobText(params.title),
+      normalizeStoredJobText(params.description),
+      params.metadata === undefined || params.metadata === null
+        ? null
+        : stringifySafe(params.metadata),
       now,
       now,
     );
     db.prepare(
       `INSERT INTO runs (
         run_id, job_id, root_run_id, parent_run_id, parent_step_id, parent_step_path,
-        status, source_type, workflow_file, workflow_name, pipeline_text, args_json,
-        latest_checkpoint_id, depth, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        status, source_type, workflow_file, workflow_name, pipeline_text, workflow_description,
+        args_json, latest_checkpoint_id, depth, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       runId,
       jobId,
@@ -106,6 +115,7 @@ export async function createRun(params: {
       params.workflowFile ?? null,
       params.workflowName ?? null,
       params.pipelineText ?? null,
+      params.workflowDescription ?? null,
       params.args === undefined ? null : stringifySafe(params.args),
       null,
       0,
@@ -116,6 +126,156 @@ export async function createRun(params: {
   return createCheckpointRun(runId, { jobId, rootRunId: runId, stepPathPrefix: "root" });
 }
 
+/**
+ * Insert a new top-level run under an existing job (rewind). The run shares the
+ * job's original `root_run_id` (so job-wide control anchored on the root run is
+ * inherited) but has a fresh `run_id`, `parent_run_id = null`, and records the
+ * checkpoint it rewound from. Moves `jobs.latest_run_id` to the new run so the
+ * job mirrors this attempt going forward. No new job row is created.
+ */
+export async function createRewindRun(params: {
+  env: Record<string, string | undefined>;
+  job: JobRecord;
+  targetRun: RunRecord;
+  checkpointId: string;
+  args?: unknown;
+}): Promise<WorkflowExecutionContext> {
+  const now = new Date().toISOString();
+  const runId = randomUUID();
+  const jobId = params.job.jobId;
+  const rootRunId = params.job.rootRunId ?? runId;
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `INSERT INTO runs (
+        run_id, job_id, root_run_id, parent_run_id, parent_step_id, parent_step_path,
+        rewind_of_checkpoint_id, status, source_type, workflow_file, workflow_name,
+        pipeline_text, workflow_description, args_json, latest_checkpoint_id, depth, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      runId,
+      jobId,
+      rootRunId,
+      null,
+      null,
+      null,
+      params.checkpointId,
+      "running",
+      params.targetRun.sourceType,
+      params.targetRun.workflowFile ?? null,
+      params.targetRun.workflowName ?? null,
+      params.targetRun.pipelineText ?? null,
+      params.targetRun.workflowDescription ?? null,
+      params.args === undefined ? null : stringifySafe(params.args),
+      null,
+      0,
+      now,
+      now,
+    );
+    db.prepare(
+      `UPDATE jobs SET latest_run_id = ?, status = 'running', updated_at = ? WHERE job_id = ?`,
+    ).run(runId, now, jobId);
+  });
+  return createCheckpointRun(runId, { jobId, rootRunId, stepPathPrefix: "root" });
+}
+
+/**
+ * Cancel every run of a job that is still `running`/`waiting` (except
+ * `exceptRunId`) and flip their still-`waiting` gate checkpoints/approvals to a
+ * terminal state so no zombie waiting gates survive a rewind replay.
+ */
+export async function cancelSupersededRuns(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+  exceptRunId?: string | null;
+}) {
+  const now = new Date().toISOString();
+  const except = params.exceptRunId ?? null;
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `UPDATE runs SET status = 'cancelled', updated_at = ?
+        WHERE job_id = ? AND status IN ('running', 'waiting')
+        AND (? IS NULL OR run_id != ?)`,
+    ).run(now, params.jobId, except, except);
+    db.prepare(
+      `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
+        WHERE job_id = ? AND status = 'waiting'
+        AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+        AND (? IS NULL OR run_id != ?)`,
+    ).run(now, params.jobId, ...WAIT_GATE_STEP_TYPES, except, except);
+    db.prepare(
+      `UPDATE approvals SET status = 'cancelled', decision = 'superseded', resolved_at = ?
+        WHERE job_id = ? AND status = 'waiting'
+        AND (? IS NULL OR run_id != ?)`,
+    ).run(now, params.jobId, except, except);
+  });
+}
+
+/**
+ * Clear a stale `cancel`/`pause` intent on the job's root run control row before
+ * a rewind replay. Control is job-wide and physically stored on the root run, so
+ * a replay would otherwise inherit the prior attempt's desired transition.
+ */
+export async function resetJobControlDesired(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    const job = db.prepare("SELECT root_run_id FROM jobs WHERE job_id = ?").get(params.jobId) as
+      | { root_run_id?: string | null }
+      | undefined;
+    if (!job?.root_run_id) return;
+    db.prepare("UPDATE run_controls SET desired = 'none', updated_at = ? WHERE run_id = ?").run(
+      now,
+      job.root_run_id,
+    );
+  });
+}
+
+/**
+ * Update job labeling fields. Only provided fields are written; `metadata` is
+ * shallow-merged over the job's current metadata.
+ */
+export async function updateJobMetadata(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+  title?: string | null;
+  description?: string | null;
+  metadata?: Record<string, unknown> | null;
+}) {
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    const row = db.prepare("SELECT metadata_json FROM jobs WHERE job_id = ?").get(params.jobId) as
+      | { metadata_json?: string | null }
+      | undefined;
+    if (!row) return;
+    const sets: string[] = [];
+    const values: string[] = [];
+    if (params.title !== undefined) {
+      sets.push("title = ?");
+      values.push(normalizeStoredJobText(params.title));
+    }
+    if (params.description !== undefined) {
+      sets.push("description = ?");
+      values.push(normalizeStoredJobText(params.description));
+    }
+    if (params.metadata !== undefined) {
+      const current =
+        row.metadata_json === null || row.metadata_json === undefined
+          ? null
+          : (parseJsonSafe(row.metadata_json) as Record<string, unknown> | null);
+      const merged = params.metadata === null ? null : { ...current, ...params.metadata };
+      sets.push("metadata_json = ?");
+      values.push(merged === null ? null : stringifySafe(merged));
+    }
+    if (!sets.length) return;
+    sets.push("updated_at = ?");
+    values.push(now);
+    values.push(params.jobId);
+    db.prepare(`UPDATE jobs SET ${sets.join(", ")} WHERE job_id = ?`).run(...values);
+  });
+}
+
 export async function createChildRun(params: {
   env: Record<string, string | undefined>;
   parent: WorkflowExecutionContext;
@@ -123,6 +283,7 @@ export async function createChildRun(params: {
   parentStepPath: string;
   workflowFile: string;
   workflowName?: string | null;
+  workflowDescription?: string | null;
   args?: unknown;
 }) {
   const now = new Date().toISOString();
@@ -132,9 +293,9 @@ export async function createChildRun(params: {
     db.prepare(
       `INSERT INTO runs (
         run_id, job_id, root_run_id, parent_run_id, parent_step_id, parent_step_path,
-        status, source_type, workflow_file, workflow_name, args_json,
+        status, source_type, workflow_file, workflow_name, workflow_description, args_json,
         latest_checkpoint_id, depth, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       runId,
       params.parent.jobId,
@@ -146,6 +307,7 @@ export async function createChildRun(params: {
       "workflow_file",
       params.workflowFile,
       params.workflowName ?? null,
+      params.workflowDescription ?? null,
       params.args === undefined ? null : stringifySafe(params.args),
       null,
       params.parent.depth + 1,
@@ -194,7 +356,12 @@ export async function updateRun(params: {
       now,
       params.runId,
     );
-    if (current?.rootRunId === params.runId || current?.runId === current?.rootRunId) {
+    const jobRow = current
+      ? (db.prepare("SELECT latest_run_id FROM jobs WHERE job_id = ?").get(current.jobId) as
+          | { latest_run_id?: string | null }
+          | undefined)
+      : undefined;
+    if (current && jobRow?.latest_run_id === params.runId) {
       db.prepare(
         `UPDATE jobs
         SET status = ?, latest_checkpoint_id = ?, final_output_json = ?,
@@ -250,10 +417,15 @@ export async function getJob(
       db
         .prepare(
           `SELECT jobs.*,
+            root_run.workflow_file AS root_workflow_file,
+            root_run.workflow_name AS root_workflow_name,
+            root_run.pipeline_text AS root_pipeline_text,
+            root_run.workflow_description AS root_workflow_description,
             rc.desired AS control_desired,
             rc.step_mode AS control_step_mode,
             rc.updated_at AS control_updated_at
           FROM jobs
+          LEFT JOIN runs AS root_run ON root_run.run_id = jobs.root_run_id
           LEFT JOIN run_controls rc ON rc.run_id = jobs.root_run_id
           WHERE jobs.job_id = ?`,
         )
@@ -268,14 +440,23 @@ export async function getJob(
 export async function setJobExternalSession(params: {
   env: Record<string, string | undefined>;
   jobId: string;
-  sessionId: string | null;
+  sessionKey: string | null;
   provider?: string | null;
+  agentId?: string | null;
+  sessionId?: string | null;
 }) {
   const now = new Date().toISOString();
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
-      `UPDATE jobs SET external_session_id = ?, external_session_provider = ?, updated_at = ? WHERE job_id = ?`,
-    ).run(params.sessionId ?? null, params.provider ?? null, now, params.jobId);
+      `UPDATE jobs SET external_session_key = ?, external_provider = ?, external_agent_id = ?, external_session_id = ?, updated_at = ? WHERE job_id = ?`,
+    ).run(
+      params.sessionKey ?? null,
+      params.provider ?? null,
+      params.agentId ?? null,
+      params.sessionId ?? null,
+      now,
+      params.jobId,
+    );
   });
 }
 
@@ -333,6 +514,62 @@ export async function clearRunControlDesired(params: {
       params.runId,
     );
   });
+}
+
+/**
+ * Single source of truth for writing a terminal cancel transition: clears any
+ * pending cancel intent, transitions stale waiting gate checkpoints to
+ * "cancelled", marks the run/job cancelled, and appends a terminal
+ * `control`/`cancelled` checkpoint. Approval-record resolution and resume-state
+ * cleanup stay with the caller (cancel vs reject carry different intents and
+ * approver identity). Callers without a live workflow context may pass runId/
+ * jobId/rootRunId directly instead of a synthesized WorkflowExecutionContext.
+ */
+export async function recordTerminalCancel(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+  jobId?: string;
+  rootRunId?: string;
+  parentRunId?: string | null;
+  run?: WorkflowExecutionContext | null;
+  stepId?: string | null;
+  stepIndex?: number | null;
+  stepPath?: string | null;
+  metadata?: Record<string, unknown> | null;
+}): Promise<string | null> {
+  const run = await getRun(params.env, params.runId).catch(() => null);
+  const jobId = params.jobId ?? run?.jobId ?? params.runId;
+  const rootRunId = params.rootRunId ?? run?.rootRunId ?? params.runId;
+  const parentRunId = params.parentRunId ?? run?.parentRunId ?? null;
+  await clearRunControlDesired({ env: params.env, runId: params.runId });
+  if (!checkpointsEnabled(params.env)) {
+    await updateRun({ env: params.env, runId: params.runId, status: "cancelled" });
+    return null;
+  }
+  const now = new Date().toISOString();
+  await withRuntimeDb(params.env, (db) => {
+    db.prepare(
+      `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
+        WHERE run_id = ? AND status = 'waiting'
+        AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})`,
+    ).run(now, params.runId, ...WAIT_GATE_STEP_TYPES);
+  });
+  const checkpointId = await appendCheckpoint({
+    env: params.env,
+    run: params.run ?? undefined,
+    runId: params.runId,
+    jobId,
+    rootRunId,
+    parentRunId,
+    stepId: params.stepId ?? null,
+    stepIndex: params.stepIndex ?? null,
+    stepPath: params.stepPath ?? null,
+    stepType: "control",
+    status: "cancelled",
+    metadata: { reason: "cancel_requested", ...(params.metadata ?? {}) },
+  });
+  await updateRun({ env: params.env, runId: params.runId, status: "cancelled" });
+  return checkpointId;
 }
 
 /**
@@ -546,7 +783,7 @@ export async function listJobs(params: {
   const limit = normalizeQueryLimit(params.limit);
   const cursor = decodeQueryCursor(params.cursor);
   const where: string[] = [];
-  const values: unknown[] = [];
+  const values: string[] = [];
   if (params.status) {
     where.push("jobs.status = ?");
     values.push(params.status);
@@ -557,10 +794,15 @@ export async function listJobs(params: {
   }
   const rows = await withRuntimeDb(params.env, (db) => {
     const sql = `SELECT jobs.*,
+      root_run.workflow_file AS root_workflow_file,
+      root_run.workflow_name AS root_workflow_name,
+      root_run.pipeline_text AS root_pipeline_text,
+      root_run.workflow_description AS root_workflow_description,
       rc.desired AS control_desired,
       rc.step_mode AS control_step_mode,
       rc.updated_at AS control_updated_at
       FROM jobs
+      LEFT JOIN runs AS root_run ON root_run.run_id = jobs.root_run_id
       LEFT JOIN run_controls rc ON rc.run_id = jobs.root_run_id${
         where.length ? ` WHERE ${where.join(" AND ")}` : ""
       } ORDER BY jobs.created_at DESC, jobs.job_id DESC LIMIT ?`;
@@ -618,7 +860,7 @@ export async function listPendingApprovals(params: {
   const limit = normalizeQueryLimit(params.limit);
   const cursor = decodeQueryCursor(params.cursor);
   const where = ["status = 'waiting'"];
-  const values: unknown[] = [];
+  const values: string[] = [];
   if (params.jobId || params.runId) {
     const headWait = await resolveJobHeadWait({
       env: params.env,
@@ -1136,16 +1378,28 @@ async function rowToJob(env: Record<string, string | undefined>, row: any): Prom
     rootRunId: row.root_run_id,
     status: row.status,
     sourceType: row.source_type,
-    rerunOfJobId: row.rerun_of_job_id,
-    rewindOfJobId: row.rewind_of_job_id,
-    rewindOfCheckpointId: row.rewind_of_checkpoint_id,
+    parentJobId: row.parent_job_id ?? null,
+    rootJobId: row.root_job_id ?? null,
+    latestRunId: row.latest_run_id ?? null,
     finalOutput,
     finalOutputBlobId: row.final_output_blob_id,
     latestCheckpointId: row.latest_checkpoint_id,
+    externalProvider: row.external_provider ?? null,
+    externalAgentId: row.external_agent_id ?? null,
     externalSessionId: row.external_session_id ?? null,
-    externalSessionProvider: row.external_session_provider ?? null,
+    externalSessionKey: row.external_session_key ?? null,
     agent: row.agent ?? null,
     model: row.model ?? null,
+    title: row.title ?? null,
+    description: row.description ?? null,
+    metadata:
+      row.metadata_json === null || row.metadata_json === undefined
+        ? null
+        : (parseJsonSafe(row.metadata_json) as Record<string, unknown> | null),
+    workflowFile: row.root_workflow_file ?? null,
+    workflowName: row.root_workflow_name ?? null,
+    workflowDescription: row.root_workflow_description ?? null,
+    pipelineText: row.root_pipeline_text ?? null,
     control: controlSnapshotFromRow(row),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1201,11 +1455,13 @@ async function rowToRun(env: Record<string, string | undefined>, row: any): Prom
     parentRunId: row.parent_run_id,
     parentStepId: row.parent_step_id,
     parentStepPath: row.parent_step_path,
+    rewindOfCheckpointId: row.rewind_of_checkpoint_id ?? null,
     status: row.status,
     sourceType: row.source_type,
     workflowFile: row.workflow_file,
     workflowName: row.workflow_name,
     pipelineText: row.pipeline_text,
+    workflowDescription: row.workflow_description ?? null,
     args: parseJsonSafe(row.args_json),
     depth: Number(row.depth ?? 0),
     finalOutput,
@@ -1290,6 +1546,12 @@ function defaultCacheExpiresAt(env: Record<string, string | undefined>, now: str
   const days = Number(env.LOBSTER_CACHE_TTL_DAYS ?? DEFAULT_CACHE_TTL_DAYS);
   if (!Number.isFinite(days) || days <= 0) return null;
   return new Date(Date.parse(now) + Math.floor(days * 24 * 60 * 60 * 1000)).toISOString();
+}
+
+function normalizeStoredJobText(value: string | null | undefined): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number) {

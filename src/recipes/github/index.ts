@@ -8,7 +8,7 @@
  */
 
 export { prMonitor, prMonitorNotify } from "./pr-monitor.js";
-export { ghPrView } from "./stages/pr-view.js";
+export { ghPrView } from "./pr-view.js";
 
 // Register recipes
 import { registerRecipe } from "../registry.js";

@@ -79,7 +79,7 @@ test("job-scoped continue advances only the head pause", async () => {
 
   const second = await resumeToolRequest({ jobId: first.jobId!, ctx });
   assert.equal(second.status, "paused");
-  assert.equal(second.paused?.stepIndex, 2);
+  assert.equal(second.paused?.stepIndex, 1);
 
   const afterSecond = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   const pauseCheckpoints = afterSecond.filter((checkpoint) => checkpoint.stepType === "pause");
@@ -89,15 +89,19 @@ test("job-scoped continue advances only the head pause", async () => {
   );
 
   const third = await resumeToolRequest({ jobId: first.jobId!, ctx });
-  assert.equal(third.status, "ok");
-  assert.deepEqual(third.output, [{ n: 3 }]);
+  assert.equal(third.status, "paused");
+  assert.equal(third.paused?.stepIndex, 2);
+
+  const fourth = await resumeToolRequest({ jobId: first.jobId!, ctx });
+  assert.equal(fourth.status, "ok");
+  assert.deepEqual(fourth.output, [{ n: 3 }]);
 
   const finalCheckpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   assert.deepEqual(
     finalCheckpoints
       .filter((checkpoint) => checkpoint.stepType === "pause")
       .map((checkpoint) => checkpoint.status),
-    ["resumed", "resumed"],
+    ["resumed", "resumed", "resumed"],
   );
 });
 
@@ -124,7 +128,7 @@ test("stale approval does not intercept job-scoped continue when head is pause",
 
   const second = await resumeToolRequest({ jobId: first.jobId!, ctx });
   assert.equal(second.status, "paused");
-  assert.equal(second.paused?.stepIndex, 2);
+  assert.equal(second.paused?.stepIndex, 1);
 });
 
 test("head approval blocks continue and resumes by approval id", async () => {

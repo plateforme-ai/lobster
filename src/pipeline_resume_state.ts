@@ -7,10 +7,10 @@ import {
   deleteStateJson,
   readStateJson,
   writeStateJson,
-} from "./state/store.js";
+} from "./store/state.js";
 import { compileCached } from "./validation.js";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
-import type { WorkflowExecutionContext } from "./checkpoints/types.js";
+import type { WorkflowExecutionContext } from "./workflows/checkpoints.js";
 import { createApprovalRecord } from "./store/runtime_store.js";
 
 export type PipelineResumeState = {

@@ -8,7 +8,7 @@ import path from "node:path";
 import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { runPipeline } from "../src/runtime.js";
 import { decodeResumeToken } from "../src/resume.js";
-import { readStateJson, writeStateJson } from "../src/state/store.js";
+import { readStateJson, writeStateJson } from "../src/store/state.js";
 
 const responseSchema = {
   type: "object",

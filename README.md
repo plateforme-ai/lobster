@@ -179,7 +179,6 @@ This package can persist OpenClaw-oriented run history in SQLite using Node's bu
 
 ```txt
 LOBSTER_CHECKPOINTS_ENABLED=true
-LOBSTER_STORE=sqlite
 LOBSTER_SQLITE_PATH=<LOBSTER_STATE_DIR>/lobster.db
 ```
 
@@ -193,7 +192,7 @@ Runtime identifiers use these meanings:
 - `parentRunId`: the caller workflow invocation for nested workflows.
 - `stepPath`: stable nested path, for example `root.review.childStep`.
 
-Commands inside a workflow `pipeline:` step emit checkpoints under that workflow step's path. For example, a workflow step `summarize` running `llm.invoke` records the outer step at `root.summarize` and inner pipeline checkpoints such as `root.summarize.llm.invoke` and `root.summarize.pipeline_output`.
+Commands inside a workflow `pipeline:` step emit checkpoints under that workflow step's path. For example, a workflow step `summarize` running `llm.invoke` records the outer step at `root.summarize` and inner pipeline checkpoints such as `root.summarize.llm.invoke` and `root.summarize.pipeline-output`.
 
 Nested workflows share the same `jobId` and get separate child `runId` rows. Child workflow approval/input waits bubble up to the caller envelope and resume through a persisted call stack, so approving a child workflow can continue the child and then the parent workflow.
 
@@ -204,33 +203,33 @@ Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are st
 Useful cache settings:
 
 ```txt
-LOBSTER_CACHE_STORE=sqlite
 LOBSTER_CACHE_TTL_DAYS=30
 LOBSTER_CACHE_INLINE_MAX_BYTES=65536
 ```
 
 Public dashboard/plugin APIs are exported from `@plateforme-ai/lobster/core`:
 
-- `getJob({ jobId })` fetches durable job status, including `control` (`{ stepMode, desired, updatedAt? }`) and `wait` (the current head blocker: `pause`, `approval`, `input`, or `null`).
+- `getJob({ jobId })` fetches durable job status, including `control` (`{ stepMode, desired, updatedAt? }`), `wait` (the current head blocker: `pause`, `approval`, `input`, or `null`), and optional job metadata (`title`, `description`, `metadata`).
 - `getRun({ runId })` fetches durable run status, including `control` resolved from the job root run.
-- `listJobs({ status, limit, cursor })` returns cursor-paginated dashboard job rows, including `control` and `wait`.
+- `listJobs({ status, limit, cursor })` returns cursor-paginated dashboard job rows, including `control`, `wait`, and optional job metadata (`title`, `description`, `metadata`).
 - `listJobRuns({ jobId })` returns root and nested workflow invocations for a job, including `control` on each run.
 - `listPendingApprovals({ jobId, runId, limit, cursor })` powers global or job-scoped approval inboxes. Scoped calls return only the current head approval for that job/run.
 - `listJobCheckpoints({ jobId })`, `getCheckpointIO({ checkpointId })`, `rerunToolRequest({ jobId })`, and `rewindToolRequest({ jobId, checkpointId })` complete the inspect/rerun/rewind dashboard flow.
 
 ### Run control (pause / cancel / step-by-step)
 
-Long workflow-file runs can be controlled cooperatively. The runtime checks a persisted control record at each step boundary, so control requests are honored between steps (the currently running step is not interrupted, except best-effort via the existing `AbortSignal`). Control state lives in the `run_controls` table and is keyed by `runId`; resolving a `jobId` targets its root run.
+Long workflow-file runs can be controlled cooperatively. The runtime checks a persisted control record at each step boundary, so mid-step control requests are honored between steps (the currently running step is not interrupted, except best-effort via the existing `AbortSignal`). Control state lives in the `run_controls` table and is keyed by `runId`; resolving a `jobId` targets its root run.
 
-- `runToolRequest({ filePath, stepMode: true })` starts a run that pauses after each step. The first step runs, then the run returns `status: "paused"` with a `paused` payload `{ stepId, stepIndex, nextStepId, resumeToken, reason }`.
+- `runToolRequest({ filePath, stepMode: true })` starts a run that pauses before each step. The run immediately returns `status: "paused"` before the first step executes, with a `paused` payload `{ stepId, stepIndex, nextStepId, resumeToken, reason }` (`stepIndex: 0` for the first step). Each `resume` then runs exactly the pending step and pauses before the next. Nested workflows inherit this: a freshly entered child pauses before its own first step.
 - `pauseRun({ jobId })` / `pauseRun({ runId })` requests a one-shot pause at the next step boundary.
-- `cancelRun({ jobId })` requests cancellation; the run returns `status: "cancelled"` at the next boundary (including a resumed paused run).
+- `cancelRun({ jobId })` cancels the run. **At a wait gate** (the job is `waiting` on a `pause`, `approval`, or `input`) cancel takes effect **immediately**: the job transitions to `cancelled`, the head waiting gate checkpoint is transitioned to `cancelled`, a terminal `control`/`cancelled` checkpoint is appended, any pending approval is cancelled, and the resume state is cleaned up — no `continue`/`resume` is required. The envelope returns `status: "cancelled"`. **Mid-step** (a step is in flight) cancel is cooperative: it sets `control.desired = "cancel"`, the envelope returns `status: "ok"`, and the run cancels at the next step boundary. `getJob().control.desired` exposes the pending `"cancel"` intent (render as "cancelling…" in a UI) until the boundary is reached.
 - `setStepMode({ jobId, stepMode })` toggles sticky step-by-step mode.
 - `getJob` / `getRun` / `listJobs` / `listJobRuns` expose the current run control snapshot as `control` (`{ stepMode, desired, updatedAt? }`), resolved from the job root run. `getJob` / `listJobs` also expose `wait`, the current head blocker for dashboard controls.
 - Continue a paused run by calling `resumeToolRequest({ token })` with the `paused.resumeToken` (no `approved`/`response` needed). In step mode each resume advances exactly one step.
 - Continue without a token by passing `resumeToolRequest({ jobId })` (or `{ runId }`). With no `approved` or `response`, this is a pause-only continue: core resolves the current head `pause` checkpoint and advances it. If the job is waiting on approval or input, it returns `no_resumable_state`; approval/input gates must use `approvalId` or `token` with `approved`/`response`. `argsPatch` and `approvedPayloadOverride` work the same as the token path.
+- Rejecting an approval (`resumeToolRequest({ token, approved: false })` or `--approve no`) cancels the run and appends the same terminal `control`/`cancelled` checkpoint as `cancelRun`; the approval record is marked `rejected` (vs `cancelled` for `cancelRun`).
 
-> `paused` is a non-terminal status (resumable). Terminal statuses are `ok`, `cancelled`, and errors. The CLI exposes `lobster pause --job <id>`, `lobster cancel --job <id>`, and `lobster step-mode --job <id> --on|--off`.
+> `paused` is a non-terminal status (resumable). Terminal statuses are `ok`, `cancelled`, and errors. The CLI exposes `lobster pause --job <id>`, `lobster cancel --job <id>`, and `lobster step-mode --job <id> --on|--off`. Cancel is performed via `lobster cancel --job <id>` (which calls `cancelRun`); `lobster resume` no longer accepts `--cancel`.
 
 ### Editable inputs (rewind / rerun / resume)
 
@@ -240,16 +239,25 @@ Long workflow-file runs can be controlled cooperatively. The runtime checks a pe
 
 ### Job chat sessions
 
-A job can carry a reference to an external chat session (created by the OpenClaw plugin). Lobster core stores the mapping on the job and surfaces it in run envelopes so a frontend can deep-link to the job chat.
+A job can carry a reference to an external chat session (created by the OpenClaw plugin). Lobster core stores the host's session identity on the job and surfaces it in run envelopes so a frontend can deep-link to the job chat, and so the plugin can resolve and re-create the transcript from the job alone via `(agentId, sessionId, sessionKey)`.
 
-- `setJobExternalSession({ jobId, sessionId, provider })` persists the mapping (`provider` defaults to `"openclaw"`). Pass `sessionId: null` to clear it.
-- `getJob`/`listJobs` return `externalSessionId` and `externalSessionProvider`.
-- `run`/`resume`/`rewind` envelopes include `externalSessionId` / `externalSessionProvider` when the job has a bound session.
+- `setJobExternalSession({ jobId, sessionKey, provider, agentId, sessionId })` persists the mapping (`provider` defaults to `"openclaw"`). Pass `sessionKey: null` to clear it. `sessionKey` is the bare host session key (e.g. `lobster:<jobId>`); `agentId` is the OpenClaw agent id; `sessionId` is the host transcript's session id (the durable locator that lets the plugin write the chat transcript without depending on the host session store surviving).
+- `getJob`/`listJobs` return `externalProvider`, `externalAgentId`, `externalSessionId`, and `externalSessionKey`.
+- `run`/`resume`/`rewind` envelopes include `externalProvider` / `externalAgentId` / `externalSessionId` / `externalSessionKey` when the job has a bound session.
 - `runToolRequest({ filePath, agent, model })` persists the job's `agent` and `model` identity on the job record (`getJob`/`listJobs` surface `agent`/`model`). `rerun`/`rewind` carry the source job's `agent`/`model` over to the new job (the per-job session is not carried; the caller decides whether to create one).
+- `runToolRequest({ filePath, title, description, metadata })` persists optional job metadata for dashboard labeling. `metadata` must be a plain JSON object (not an array). `title` and `description` are trimmed strings. `rerun`/`rewind` carry the source job's metadata over to the new job, like `agent`/`model`.
 
 #### In-workflow session/agent/model defaulting
 
 When a job has a bound session/agent/model, in-workflow `openclaw.invoke` and `llm.invoke` (OpenClaw adapter) steps default to them so the call runs inside the job's chat session. Resolution precedence is **explicit step value > job's stored value > current default (no session)**. Core injects the job's values into the base step env (`LOBSTER_JOB_SESSION_KEY`, `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`) once per run, so per-step `--session-key`/`--agent`/`--model` (and an already-set ambient env value) still win. `llm.invoke` keeps `LOBSTER_LLM_MODEL` as the preferred LLM-specific default and falls back to `LOBSTER_JOB_MODEL` when no LLM-specific model is set. These are sent best-effort on the `/tools/invoke` body; gateways that do not yet honor them simply ignore the extra fields.
+
+#### In-process LLM adapters (`ctx.llmAdapters`)
+
+LLM resolution (`resolveProvider`/`resolveAdapter`) checks `ctx.llmAdapters` before any HTTP transport: if the host provides a single direct adapter, or a step names it explicitly by provider key, the call runs through that adapter in-process instead of posting to `/tools/invoke`. The OpenClaw plugin uses this to route `llm.invoke` steps and `metadata: auto` generation through the host's in-process LLM (avoiding a nested gateway round-trip and honoring the run's `AbortSignal`). `pi`/`http` remain explicit HTTP opt-outs.
+
+#### Per-step job metadata (`metadata: auto`)
+
+A step's `metadata` can set the job `title`/`description`/custom keys, either literally or with `"auto"` (LLM-generated from the step input/output via the resolved LLM adapter). Metadata is applied after the step's own `succeeded` checkpoint and always emits a terminal scoped `metadata` checkpoint (`stepType: "metadata"`, id `${stepId}.metadata`): `succeeded` (carrying the resolved values, visible alongside `llm.invoke`/`pipeline-output` checkpoints) or `failed`. A failure is either a thrown error (`reason: "metadata_generation_failed"`) or requested `auto` output that came back empty (`reason: "metadata_generation_empty"` - no longer a silent no-op). Metadata generation follows the step's `on_error` policy, so a failure behaves like any step failure: with the default `on_error: stop` it halts the run at the scoped `${stepId}.metadata` checkpoint (replay/rewind-able); `on_error: continue` records the failed checkpoint and proceeds; `on_error: skip_rest` stops remaining steps while keeping prior output.
 
 ### Launching durable jobs from a command: `openclaw.lobster`
 
@@ -259,12 +267,13 @@ Use it when an OpenClaw-managed cron is a `command` job: a plain `lobster run �
 
 ```
 openclaw.lobster run --args-json '{"filePath":"workflows/x.lobster","createSession":true,"stepMode":true}' --agent main --model anthropic/claude-sonnet-4-6
+openclaw.lobster run --args-json '{"filePath":"workflows/x.lobster","title":"Weekly triage","description":"Review open PRs","metadata":{"source":"cron"}}'
 openclaw.lobster run --args-json '{"filePath":"workflows/x.lobster","createSession":true}' --session-key user:chat:abc
 openclaw.lobster listJobs --args-json '{"status":"waiting"}'
 openclaw.lobster continue --args-json '{"jobId":"<id>"}'
 ```
 
-The action is the required first positional argument; `--action` is not accepted by `openclaw.lobster`. Workflow/action params (`filePath`, `argsJson`, `jobId`, `stepMode`, `createSession`, `token`, `approvalId`, ...) travel inside `--args-json`. Job context params (`agent`, `model`, `sessionKey`, and `session-key`) are forbidden in `--args-json`; pass them as `--agent`, `--model`, and `--session-key` on `run` only. `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`, and `LOBSTER_JOB_SESSION_KEY` provide run-only env defaults. `createSession: true` creates a dedicated job chat; `--session-key` binds an existing chat and wins over `createSession`. Transport config matches `openclaw.invoke` (`--url`/`OPENCLAW_URL`, `--token`/`OPENCLAW_TOKEN`). Plain `lobster run` behavior is unchanged.
+The action is the required first positional argument; `--action` is not accepted by `openclaw.lobster`. Workflow/action params (`filePath`, `argsJson`, `jobId`, `stepMode`, `createSession`, `title`, `description`, `metadata`, `token`, `approvalId`, ...) travel inside `--args-json`. Job context params (`agent`, `model`, `sessionKey`, and `session-key`) are forbidden in `--args-json`; pass them as `--agent`, `--model`, and `--session-key` on `run` only. The OpenClaw lobster plugin must peel `title`, `description`, and `metadata` out of the run payload before forwarding remaining keys as workflow `args`. `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`, and `LOBSTER_JOB_SESSION_KEY` provide run-only env defaults. `createSession: true` creates a dedicated job chat; `--session-key` binds an existing chat and wins over `createSession`. Transport config matches `openclaw.invoke` (`--url`/`OPENCLAW_URL`, `--token`/`OPENCLAW_TOKEN`). Plain `lobster run` behavior is unchanged.
 
 ## Workflow files
 

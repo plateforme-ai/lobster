@@ -121,7 +121,7 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
     },
   ];
 
-  const cacheDir = await mkdtemp(join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "lobster-state-"));
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -189,7 +189,7 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
       env: {
         ...process.env,
         CLAWD_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_CACHE_DIR: cacheDir,
+        LOBSTER_STATE_DIR: stateDir,
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",
@@ -222,7 +222,7 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
       env: {
         ...process.env,
         CLAWD_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_CACHE_DIR: cacheDir,
+        LOBSTER_STATE_DIR: stateDir,
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",
@@ -235,14 +235,14 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
     assert.equal(bodyLog[0].args?.model ?? bodyLog[0].model, "claude-test");
     assert.ok(bodyLog[0].prompt || bodyLog[0].args?.prompt);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
 
 test("email.triage --llm honors OPENCLAW_URL (not just CLAWD_URL)", async () => {
   const registry = createDefaultRegistry();
-  const cacheDir = await mkdtemp(join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(join(tmpdir(), "lobster-state-"));
 
   const emails = [
     {
@@ -309,7 +309,7 @@ test("email.triage --llm honors OPENCLAW_URL (not just CLAWD_URL)", async () => 
       env: {
         ...process.env,
         OPENCLAW_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_CACHE_DIR: cacheDir,
+        LOBSTER_STATE_DIR: stateDir,
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",
@@ -320,7 +320,7 @@ test("email.triage --llm honors OPENCLAW_URL (not just CLAWD_URL)", async () => 
     assert.equal(result.items[0].mode, "llm");
     assert.equal(result.items[0].drafts.length, 1);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });

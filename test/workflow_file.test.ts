@@ -8,7 +8,7 @@ import os from "node:os";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
 import { decodeResumeToken } from "../src/resume.js";
-import { readStateJson } from "../src/state/store.js";
+import { readStateJson } from "../src/store/state.js";
 
 function streamOf(items: unknown[]) {
   return (async function* () {
@@ -1377,14 +1377,12 @@ test("workflow files can mix shell steps, approval-only steps, and pipeline llm 
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-mixed-"));
   const stateDir = path.join(tmpDir, "state");
-  const cacheDir = path.join(tmpDir, "cache");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const env = {
     ...process.env,
     LOBSTER_STATE_DIR: stateDir,
-    LOBSTER_CACHE_DIR: cacheDir,
     LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
   };
 
@@ -1498,14 +1496,12 @@ test("workflow pipeline llm_task.invoke consumes stdin artifacts from previous s
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-llm-task-stdin-"));
   const stateDir = path.join(tmpDir, "state");
-  const cacheDir = path.join(tmpDir, "cache");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const env = {
     ...process.env,
     LOBSTER_STATE_DIR: stateDir,
-    LOBSTER_CACHE_DIR: cacheDir,
     OPENCLAW_URL: `http://127.0.0.1:${port}`,
   };
 

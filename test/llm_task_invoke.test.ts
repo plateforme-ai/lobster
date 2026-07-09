@@ -23,7 +23,7 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd, "llm_task.invoke should be registered");
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -74,7 +74,7 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
         prompt: "Summarize",
       },
       ctx: baseCtx(
-        { LOBSTER_CACHE_DIR: cacheDir, CLAWD_URL: `http://localhost:${port}` },
+        { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` },
         registry,
       ),
     } as any);
@@ -99,7 +99,7 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
     assert.equal("artifacts" in bodyLog[0].args, false);
     assert.equal(bodyLog[0].args.artifactHashes.length, 1);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -108,7 +108,7 @@ test("llm_task.invoke retries when schema validation fails", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   let calls = 0;
   const server = http.createServer((req, res) => {
@@ -148,7 +148,7 @@ test("llm_task.invoke retries when schema validation fails", async () => {
         "max-validation-retries": 2,
       },
       ctx: baseCtx(
-        { LOBSTER_CACHE_DIR: cacheDir, CLAWD_URL: `http://localhost:${port}` },
+        { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` },
         registry,
       ),
     } as any);
@@ -159,7 +159,7 @@ test("llm_task.invoke retries when schema validation fails", async () => {
     assert.equal(items[0].output.data.decision, "send");
     assert.equal(calls, 2);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -194,8 +194,7 @@ test("llm_task.invoke persists to run state so resume skips remote call", async 
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
-  const ctxEnv = { LOBSTER_STATE_DIR: stateDir, LOBSTER_CACHE_DIR: cacheDir };
+  const ctxEnv = { LOBSTER_STATE_DIR: stateDir };
 
   try {
     const first = await cmd.run({
@@ -228,13 +227,12 @@ test("llm_task.invoke persists to run state so resume skips remote call", async 
     assert.equal(secondItems[0].source, "run_state");
   } finally {
     await rm(stateDir, { recursive: true, force: true });
-    await rm(cacheDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
 
 test("llm_task.invoke reuses file cache when URL unavailable", async () => {
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -263,7 +261,7 @@ test("llm_task.invoke reuses file cache when URL unavailable", async () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  const ctxEnv = { LOBSTER_CACHE_DIR: cacheDir, CLAWD_URL: `http://localhost:${port}` };
+  const ctxEnv = { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` };
 
   try {
     const first = await cmd.run({
@@ -294,13 +292,13 @@ test("llm_task.invoke reuses file cache when URL unavailable", async () => {
     assert.equal(secondItems[0].source, "cache");
     assert.equal(secondItems[0].cached, true);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
 
 test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites them", async () => {
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-expire-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-expire-"));
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -328,7 +326,7 @@ test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
   const ctxEnv = {
-    LOBSTER_CACHE_DIR: cacheDir,
+    LOBSTER_STATE_DIR: stateDir,
     LOBSTER_CACHE_TTL_DAYS: "0.000001",
     CLAWD_URL: `http://localhost:${port}`,
   };
@@ -368,7 +366,7 @@ test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites
     assert.equal(thirdItems[0].runId, "cache_repair_3");
     assert.equal(calls, 3);
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });
@@ -378,7 +376,7 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
 
-  const cacheDir = await mkdtemp(path.join(tmpdir(), "lobster-cache-"));
+  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -426,7 +424,7 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
         refresh: true,
       },
       ctx: baseCtx(
-        { CLAWD_URL: `http://localhost:${port}`, LOBSTER_CACHE_DIR: cacheDir },
+        { CLAWD_URL: `http://localhost:${port}`, LOBSTER_STATE_DIR: stateDir },
         registry,
       ),
     } as any);
@@ -446,7 +444,7 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
     assert.equal("artifacts" in bodyLog[0].args, false);
     assert.ok(Array.isArray(bodyLog[0].args.artifactHashes));
   } finally {
-    await rm(cacheDir, { recursive: true, force: true });
+    await rm(stateDir, { recursive: true, force: true });
     await closeServer(server);
   }
 });

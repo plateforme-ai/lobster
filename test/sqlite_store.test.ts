@@ -20,6 +20,7 @@ import {
   listPendingApprovals,
   listRunCheckpoints,
   readCacheEntry,
+  recordTerminalCancel,
   setJobExternalSession,
   setRunControl,
   writeCacheEntry,
@@ -143,8 +144,10 @@ test("migration id 2 adds session columns and the run_controls table", async () 
     (db) => db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>,
   );
   const jobColumnNames = jobColumns.map((row) => row.name);
+  assert.ok(jobColumnNames.includes("external_session_key"));
+  assert.ok(jobColumnNames.includes("external_provider"));
+  assert.ok(jobColumnNames.includes("external_agent_id"));
   assert.ok(jobColumnNames.includes("external_session_id"));
-  assert.ok(jobColumnNames.includes("external_session_provider"));
 
   const controlTable = await withRuntimeDb(
     env,
@@ -159,17 +162,21 @@ test("migration id 2 adds session columns and the run_controls table", async () 
   await setJobExternalSession({
     env,
     jobId: run.jobId,
-    sessionId: "sess-xyz",
+    sessionKey: "sess-xyz",
     provider: "openclaw",
+    agentId: "main",
+    sessionId: "session-uuid-xyz",
   });
   const job = await getJob(env, run.jobId);
-  assert.equal(job?.externalSessionId, "sess-xyz");
-  assert.equal(job?.externalSessionProvider, "openclaw");
+  assert.equal(job?.externalProvider, "openclaw");
+  assert.equal(job?.externalAgentId, "main");
+  assert.equal(job?.externalSessionId, "session-uuid-xyz");
+  assert.equal(job?.externalSessionKey, "sess-xyz");
   assert.deepEqual(job?.control, { stepMode: false, desired: "none" });
   const storedRun = await getRun(env, run.runId);
   assert.deepEqual(storedRun?.control, { stepMode: false, desired: "none" });
   const { jobs } = await listJobs({ env });
-  assert.equal(jobs.find((entry) => entry.jobId === run.jobId)?.externalSessionId, "sess-xyz");
+  assert.equal(jobs.find((entry) => entry.jobId === run.jobId)?.externalSessionKey, "sess-xyz");
 
   // run control upsert + clear semantics.
   await setRunControl({ env, runId: run.runId, jobId: run.jobId, stepMode: true });
@@ -194,6 +201,90 @@ test("migration id 2 adds session columns and the run_controls table", async () 
   control = await getRunControl({ env, runId: run.runId });
   assert.equal(control?.desired, "none");
   assert.equal(control?.stepMode, true);
+});
+
+test("recordTerminalCancel transitions a waiting gate checkpoint and appends a terminal control checkpoint", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-terminal-cancel-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir, LOBSTER_CHECKPOINTS_ENABLED: "true" };
+  const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
+
+  // Park the run at an approval gate with a pending approval.
+  const gateCheckpointId = await appendCheckpoint({
+    env,
+    run,
+    stepId: "gate",
+    stepIndex: 1,
+    stepType: "approval",
+    status: "waiting",
+    metadata: { stateKey: "workflow_resume_terminal" },
+  });
+  await createApprovalRecord({
+    env,
+    approvalId: "approval-terminal",
+    run,
+    checkpointId: gateCheckpointId,
+    stateKey: "workflow_resume_terminal",
+    prompt: "Proceed?",
+  });
+  await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "cancel" });
+  await withRuntimeDb(env, (db) => {
+    db.prepare(`UPDATE runs SET status = 'waiting' WHERE run_id = ?`).run(run.runId);
+    db.prepare(`UPDATE jobs SET status = 'waiting' WHERE job_id = ?`).run(run.jobId);
+  });
+
+  const terminalId = await recordTerminalCancel({
+    env,
+    runId: run.runId,
+    jobId: run.jobId,
+    stepId: "gate",
+    stepIndex: 1,
+    metadata: { gate: "approval" },
+  });
+  assert.ok(terminalId);
+
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.status, "cancelled");
+  assert.equal(job?.control.desired, "none");
+
+  const checkpoints = await listRunCheckpoints({ env, runId: run.runId });
+  const gate = checkpoints.find((cp) => cp.checkpointId === gateCheckpointId);
+  assert.equal(gate?.status, "cancelled", "waiting gate checkpoint should be transitioned to cancelled");
+  const terminal = checkpoints.find((cp) => cp.checkpointId === terminalId);
+  assert.equal(terminal?.stepType, "control");
+  assert.equal(terminal?.status, "cancelled");
+});
+
+test("setRunControl desired=cancel is observable through getJob/getRun", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cancel-desired-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
+
+  await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "cancel" });
+  assert.equal((await getJob(env, run.jobId))?.control.desired, "cancel");
+  assert.equal((await getRun(env, run.runId))?.control.desired, "cancel");
+});
+
+test("migration id 5 backfill splits legacy agent-prefixed session ids", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration5-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
+
+  await withRuntimeDb(env, (db) => {
+    db.prepare(
+      `UPDATE jobs SET external_session_key = ?, external_agent_id = NULL WHERE job_id = ?`,
+    ).run("agent:main:lobster:job_1", run.jobId);
+    db.prepare(`
+      UPDATE jobs
+      SET
+        external_agent_id = substr(substr(external_session_key, 7), 1, instr(substr(external_session_key, 7), ':') - 1),
+        external_session_key = substr(substr(external_session_key, 7), instr(substr(external_session_key, 7), ':') + 1)
+      WHERE external_session_key LIKE 'agent:%'
+    `).run();
+  });
+
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.externalAgentId, "main");
+  assert.equal(job?.externalSessionKey, "lobster:job_1");
 });
 
 test("migration id 3 adds agent/model columns and they round-trip through createRun", async () => {
@@ -230,6 +321,84 @@ test("migration id 3 adds agent/model columns and they round-trip through create
   const bareJob = await getJob(env, bare.jobId);
   assert.equal(bareJob?.agent, null);
   assert.equal(bareJob?.model, null);
+});
+
+test("migration id 4 adds title/description/metadata columns and they round-trip through createRun", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration4-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+
+  const run = await createRun({
+    env,
+    sourceType: "workflow_file",
+    workflowFile: "wf.lobster",
+    title: " Weekly triage ",
+    description: "Review open PRs",
+    metadata: { source: "cron", tags: ["triage"] },
+  });
+
+  const jobColumns = await withRuntimeDb(
+    env,
+    (db) => db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>,
+  );
+  const jobColumnNames = jobColumns.map((row) => row.name);
+  assert.ok(jobColumnNames.includes("title"));
+  assert.ok(jobColumnNames.includes("description"));
+  assert.ok(jobColumnNames.includes("metadata_json"));
+
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.title, "Weekly triage");
+  assert.equal(job?.description, "Review open PRs");
+  assert.deepEqual(job?.metadata, { source: "cron", tags: ["triage"] });
+
+  const { jobs } = await listJobs({ env });
+  const listed = jobs.find((entry) => entry.jobId === run.jobId);
+  assert.equal(listed?.title, "Weekly triage");
+  assert.equal(listed?.description, "Review open PRs");
+  assert.deepEqual(listed?.metadata, { source: "cron", tags: ["triage"] });
+
+  const bare = await createRun({ env, sourceType: "pipeline", pipelineText: "json" });
+  const bareJob = await getJob(env, bare.jobId);
+  assert.equal(bareJob?.title, null);
+  assert.equal(bareJob?.description, null);
+  assert.equal(bareJob?.metadata, null);
+});
+
+test("migration id 8 surfaces root-run workflow identity on the job payload", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration8-"));
+  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+
+  const run = await createRun({
+    env,
+    sourceType: "workflow_file",
+    workflowFile: "flows/triage.lobster",
+    workflowName: "Weekly triage",
+    workflowDescription: "Review and label open issues",
+  });
+
+  const runColumns = await withRuntimeDb(
+    env,
+    (db) => db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>,
+  );
+  assert.ok(runColumns.map((row) => row.name).includes("workflow_description"));
+
+  const job = await getJob(env, run.jobId);
+  assert.equal(job?.workflowFile, "flows/triage.lobster");
+  assert.equal(job?.workflowName, "Weekly triage");
+  assert.equal(job?.workflowDescription, "Review and label open issues");
+  assert.equal(job?.pipelineText, null);
+
+  const { jobs } = await listJobs({ env });
+  const listed = jobs.find((entry) => entry.jobId === run.jobId);
+  assert.equal(listed?.workflowFile, "flows/triage.lobster");
+  assert.equal(listed?.workflowName, "Weekly triage");
+  assert.equal(listed?.workflowDescription, "Review and label open issues");
+
+  const pipeline = await createRun({ env, sourceType: "pipeline", pipelineText: "json | echo" });
+  const pipelineJob = await getJob(env, pipeline.jobId);
+  assert.equal(pipelineJob?.pipelineText, "json | echo");
+  assert.equal(pipelineJob?.workflowFile, null);
+  assert.equal(pipelineJob?.workflowName, null);
+  assert.equal(pipelineJob?.workflowDescription, null);
 });
 
 test("large payloads spill to content-addressed blobs and round-trip through the store", async () => {

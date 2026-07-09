@@ -31,6 +31,7 @@ function lobsterHelp() {
     `optional dedicated chat session) that shows up in the dashboard.\n\n` +
     `Usage:\n` +
     `  ${commandName} run --args-json '{"filePath":"workflows/x.lobster","createSession":true,"stepMode":true}' --agent main --model anthropic/claude-sonnet-4-6\n` +
+    `  ${commandName} run --args-json '{"filePath":"workflows/x.lobster","title":"Weekly triage","description":"Review open PRs","metadata":{"source":"cron"}}'\n` +
     `  ${commandName} run --args-json '{"filePath":"workflows/x.lobster","createSession":true}' --session-key user:chat:abc\n` +
     `  ${commandName} listJobs --args-json '{"status":"waiting"}'\n` +
     `  ${commandName} continue --args-json '{"jobId":"<id>"}'\n` +
@@ -45,8 +46,10 @@ function lobsterHelp() {
     `Notes:\n` +
     `  - The action is the required first positional arg; --action is not accepted.\n` +
     `  - Workflow/action params (filePath, argsJson, jobId, stepMode,\n` +
-    `    createSession, token, approvalId, ...) go inside --args-json.\n` +
+    `    createSession, title, description, metadata, token, approvalId, ...) go inside --args-json.\n` +
     `  - agent, model, sessionKey, and session-key are not accepted in --args-json.\n` +
+    `  - title, description, and metadata label the durable job; the OpenClaw plugin\n` +
+    `    should peel them out before forwarding remaining keys as workflow args.\n` +
     `  - createSession creates a dedicated job chat; --session-key binds an existing chat.\n` +
     `  - This is a thin transport bridge. Lobster should not own OAuth/secrets.\n`
   );

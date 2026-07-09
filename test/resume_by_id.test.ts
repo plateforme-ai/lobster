@@ -67,12 +67,16 @@ test("resume by jobId advances the latest paused run", async () => {
 
   const second = await resumeToolRequest({ jobId: first.jobId!, ctx });
   assert.equal(second.status, "paused");
-  assert.equal(second.paused?.stepIndex, 2);
+  assert.equal(second.paused?.stepIndex, 1);
   assert.equal(second.jobId, first.jobId);
 
   const third = await resumeToolRequest({ jobId: first.jobId!, ctx });
-  assert.equal(third.status, "ok");
-  assert.deepEqual(third.output, [{ n: 3 }]);
+  assert.equal(third.status, "paused");
+  assert.equal(third.paused?.stepIndex, 2);
+
+  const fourth = await resumeToolRequest({ jobId: first.jobId!, ctx });
+  assert.equal(fourth.status, "ok");
+  assert.deepEqual(fourth.output, [{ n: 3 }]);
 });
 
 test("resume by runId advances the latest paused run", async () => {
@@ -86,7 +90,7 @@ test("resume by runId advances the latest paused run", async () => {
 
   const second = await resumeToolRequest({ runId: first.runId!, ctx });
   assert.equal(second.status, "paused");
-  assert.equal(second.paused?.stepIndex, 2);
+  assert.equal(second.paused?.stepIndex, 1);
 });
 
 test("resume by jobId returns no_resumable_state when nothing is waiting", async () => {

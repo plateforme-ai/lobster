@@ -1,0 +1,9 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit:
+  // https://code.visualstudio.com/docs/debugtest/tasks
+
+  "version": "2.0.0",
+  "tasks": []
+}

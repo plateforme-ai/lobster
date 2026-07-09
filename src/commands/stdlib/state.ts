@@ -1,6 +1,6 @@
 import { promises as fsp } from "node:fs";
 
-import { defaultStateDir, ensureDirectory, keyToPath, writeFileAtomic } from "../../state/store.js";
+import { defaultStateDir, ensureDirectory, keyToPath, writeFileAtomic } from "../../store/state.js";
 
 export const stateGetCommand = {
   name: "state.get",

@@ -11,9 +11,10 @@ import {
   deleteApprovalId,
   findStateKeyByApprovalId,
   cleanupApprovalIndexByStateKey,
-} from "../state/store.js";
+} from "../store/state.js";
 import {
   WorkflowResumeArgumentError,
+  readWorkflowDescription,
   readWorkflowDisplayName,
   runWorkflowFile,
 } from "../workflows/file.js";
@@ -23,10 +24,13 @@ import {
   validatePipelineInputResponse,
 } from "../pipeline_resume_state.js";
 import {
+  cancelSupersededRuns,
   checkpointsEnabled,
   createCheckpointRun,
+  createRewindRun,
   createRun,
   findHeadResumeStateKey,
+  resetJobControlDesired,
   getCheckpoint as getStoredCheckpoint,
   getJob as getStoredJob,
   getRun as getStoredRun,
@@ -38,11 +42,12 @@ import {
   getCheckpointIO as getStoredCheckpointIO,
   resolveApprovalRecord,
   resolveJobHeadWait,
+  recordTerminalCancel,
   setJobExternalSession as setStoredJobExternalSession,
   setRunControl,
   updateRun,
 } from "../store/runtime_store.js";
-import type { WorkflowExecutionContext } from "../checkpoints/types.js";
+import type { WorkflowExecutionContext } from "../workflows/checkpoints.js";
 
 type ToolRunContext = {
   cwd?: string;
@@ -64,7 +69,7 @@ type PausedInfo = {
   reason: "pause_requested" | "step_mode";
 };
 
-type ToolEnvelope = {
+export type ToolEnvelope = {
   protocolVersion: 1;
   ok: boolean;
   status?: "ok" | "needs_approval" | "needs_input" | "cancelled" | "paused";
@@ -75,8 +80,10 @@ type ToolEnvelope = {
   parentRunId?: string | null;
   checkpointId?: string | null;
   latestCheckpointId?: string | null;
+  externalProvider?: string | null;
+  externalAgentId?: string | null;
   externalSessionId?: string | null;
-  externalSessionProvider?: string | null;
+  externalSessionKey?: string | null;
   paused?: PausedInfo | null;
   requiresApproval?: {
     type?: "approval_request";
@@ -107,6 +114,9 @@ export async function runToolRequest({
   stepMode,
   agent,
   model,
+  title,
+  description,
+  metadata,
   ctx = {},
   lineage = {},
 }: {
@@ -116,12 +126,14 @@ export async function runToolRequest({
   stepMode?: boolean;
   agent?: string | null;
   model?: string | null;
+  title?: string | null;
+  description?: string | null;
+  metadata?: Record<string, unknown> | null;
   ctx?: ToolRunContext;
   lineage?: {
     parentRunId?: string | null;
-    rerunOfJobId?: string | null;
-    rewindOfJobId?: string | null;
-    rewindOfCheckpointId?: string | null;
+    parentJobId?: string | null;
+    rootJobId?: string | null;
   };
 }): Promise<ToolEnvelope> {
   const runtime = createToolContext(ctx);
@@ -136,6 +148,17 @@ export async function runToolRequest({
     return errorEnvelope("parse_error", "run accepts either pipeline or filePath, not both");
   }
 
+  let normalizedTitle: string | null;
+  let normalizedDescription: string | null;
+  let normalizedMetadata: Record<string, unknown> | null;
+  try {
+    normalizedTitle = normalizeJobTextField(title, "title");
+    normalizedDescription = normalizeJobTextField(description, "description");
+    normalizedMetadata = normalizeJobMetadata(metadata);
+  } catch (err: any) {
+    return errorEnvelope("parse_error", err?.message ?? String(err));
+  }
+
   if (hasFile) {
     let resolvedFilePath: string;
     try {
@@ -146,14 +169,19 @@ export async function runToolRequest({
 
     try {
       const workflowName = await readWorkflowDisplayName(resolvedFilePath);
+      const workflowDescription = await readWorkflowDescription(resolvedFilePath);
       checkpointRun = await maybeCreateRun({
         runtime,
         sourceType: "workflow_file",
         workflowFile: resolvedFilePath,
         workflowName,
+        workflowDescription,
         args,
         agent,
         model,
+        title: normalizedTitle,
+        description: normalizedDescription,
+        metadata: normalizedMetadata,
         lineage,
       });
       if (stepMode && checkpointRun?.runId) {
@@ -224,9 +252,13 @@ export async function runToolRequest({
       runtime,
       sourceType: "pipeline",
       pipelineText: String(pipeline),
+      workflowDescription: null,
       args,
       agent,
       model,
+      title: normalizedTitle,
+      description: normalizedDescription,
+      metadata: normalizedMetadata,
       lineage,
     });
     const output = await runPipeline({
@@ -276,7 +308,6 @@ export async function resumeToolRequest({
   runId,
   approved,
   response,
-  cancel,
   argsPatch,
   approvedPayloadOverride,
   ctx = {},
@@ -287,7 +318,6 @@ export async function resumeToolRequest({
   runId?: string;
   approved?: boolean;
   response?: unknown;
-  cancel?: boolean;
   argsPatch?: Record<string, unknown>;
   approvedPayloadOverride?: unknown;
   ctx?: ToolRunContext;
@@ -314,7 +344,7 @@ export async function resumeToolRequest({
     } else if (token) {
       resolvedToken = token;
     } else if (jobId || runId) {
-      const isContinueIntent = approved === undefined && response === undefined && cancel !== true;
+      const isContinueIntent = approved === undefined && response === undefined;
       const stateKey = await findHeadResumeStateKey({
         env: runtime.env,
         jobId,
@@ -355,24 +385,6 @@ export async function resumeToolRequest({
     }
   };
 
-  if (cancel === true) {
-    await cleanupIndex();
-    await resolveApprovalRecord({
-      env: runtime.env,
-      approvalId: resolvedApprovalId,
-      stateKey: payload?.stateKey,
-      status: "cancelled",
-      decision: "cancelled",
-    });
-    if (payload.kind === "workflow-file" && payload.stateKey) {
-      await deleteStateJson({ env: runtime.env, key: payload.stateKey });
-    }
-    if (payload.kind === "pipeline-resume" && payload.stateKey) {
-      await deleteStateJson({ env: runtime.env, key: payload.stateKey });
-    }
-    return okEnvelope("cancelled", [], null, null);
-  }
-
   if (payload.kind === "workflow-file") {
     try {
       const loadedRun = payload.stateKey
@@ -384,7 +396,6 @@ export async function resumeToolRequest({
         resume: payload,
         approved,
         response,
-        cancel,
         argsOverride: argsPatch,
         approvedPayloadOverride,
       });
@@ -494,8 +505,17 @@ export async function resumeToolRequest({
         stateKey: payload.stateKey,
         status: "rejected",
         decision: "reject",
+        approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
       });
-      await maybeUpdateRun(runtime, pipelineCheckpointRun, "cancelled");
+      if (pipelineCheckpointRun?.runId) {
+        await recordTerminalCancel({
+          env: runtime.env,
+          run: pipelineCheckpointRun,
+          runId: pipelineCheckpointRun.runId,
+          jobId: pipelineCheckpointRun.jobId,
+          metadata: { reason: "approval_rejected" },
+        });
+      }
       return okEnvelope("cancelled", [], null, null, pipelineCheckpointRun);
     }
   }
@@ -601,8 +621,10 @@ function okEnvelope(
   checkpointRun?: WorkflowExecutionContext,
   extra?: {
     paused?: PausedInfo | null;
+    externalProvider?: string | null;
+    externalAgentId?: string | null;
     externalSessionId?: string | null;
-    externalSessionProvider?: string | null;
+    externalSessionKey?: string | null;
   },
 ) {
   return {
@@ -619,11 +641,15 @@ function okEnvelope(
           latestCheckpointId: checkpointRun.latestCheckpointId ?? null,
         }
       : null),
+    ...(extra?.externalProvider !== undefined
+      ? { externalProvider: extra.externalProvider }
+      : null),
+    ...(extra?.externalAgentId !== undefined ? { externalAgentId: extra.externalAgentId } : null),
     ...(extra?.externalSessionId !== undefined
       ? { externalSessionId: extra.externalSessionId }
       : null),
-    ...(extra?.externalSessionProvider !== undefined
-      ? { externalSessionProvider: extra.externalSessionProvider }
+    ...(extra?.externalSessionKey !== undefined
+      ? { externalSessionKey: extra.externalSessionKey }
       : null),
     ...(extra?.paused !== undefined ? { paused: extra.paused } : null),
     requiresApproval,
@@ -634,13 +660,20 @@ function okEnvelope(
 async function sessionExtraForRun(
   runtime: ReturnType<typeof createToolContext>,
   checkpointRun: WorkflowExecutionContext | undefined,
-): Promise<{ externalSessionId?: string | null; externalSessionProvider?: string | null }> {
+): Promise<{
+  externalProvider?: string | null;
+  externalAgentId?: string | null;
+  externalSessionId?: string | null;
+  externalSessionKey?: string | null;
+}> {
   if (!checkpointRun?.jobId) return {};
   const job = await getStoredJob(runtime.env, checkpointRun.jobId).catch(() => null);
   if (!job) return {};
   return {
+    externalProvider: job.externalProvider ?? null,
+    externalAgentId: job.externalAgentId ?? null,
     externalSessionId: job.externalSessionId ?? null,
-    externalSessionProvider: job.externalSessionProvider ?? null,
+    externalSessionKey: job.externalSessionKey ?? null,
   };
 }
 
@@ -767,8 +800,11 @@ export async function rerunToolRequest({
       args,
       agent: job.agent ?? null,
       model: job.model ?? null,
+      title: job.title ?? null,
+      description: job.description ?? null,
+      metadata: job.metadata ?? null,
       ctx,
-      lineage: { rerunOfJobId: job.jobId },
+      lineage: { parentJobId: job.jobId, rootJobId: job.rootJobId ?? job.jobId },
     });
   }
   if (run.sourceType === "pipeline" && run.pipelineText) {
@@ -777,8 +813,11 @@ export async function rerunToolRequest({
       args,
       agent: job.agent ?? null,
       model: job.model ?? null,
+      title: job.title ?? null,
+      description: job.description ?? null,
+      metadata: job.metadata ?? null,
       ctx,
-      lineage: { rerunOfJobId: job.jobId },
+      lineage: { parentJobId: job.jobId, rootJobId: job.rootJobId ?? job.jobId },
     });
   }
   return errorEnvelope(
@@ -843,16 +882,19 @@ export async function rewindToolRequest({
     }
   }
 
-  const checkpointRun = await createRun({
+  const replayArgs = mergePatch(targetRun.args, argsPatch);
+  // All validation above completes before any write, so a rejected rewind leaves
+  // no run/checkpoint behind. Cancel the prior attempt's abandoned in-flight
+  // run(s) + open gates, clear any stale control intent (job-wide, on the root
+  // run), then insert a new top-level run under the SAME job.
+  await cancelSupersededRuns({ env: runtime.env, jobId });
+  await resetJobControlDesired({ env: runtime.env, jobId });
+  const checkpointRun = await createRewindRun({
     env: runtime.env,
-    sourceType: "workflow_file",
-    workflowFile: targetRun.workflowFile,
-    workflowName: await readWorkflowDisplayName(targetRun.workflowFile),
-    args: mergePatch(targetRun.args, argsPatch),
-    agent: job.agent ?? null,
-    model: job.model ?? null,
-    rewindOfJobId: job.jobId,
-    rewindOfCheckpointId: checkpoint.checkpointId,
+    job,
+    targetRun,
+    checkpointId: checkpoint.checkpointId,
+    args: replayArgs,
   });
   try {
     const output = await runWorkflowFile({
@@ -868,7 +910,7 @@ export async function rewindToolRequest({
             ? checkpoint.stepIndex + 1
             : checkpoint.stepIndex,
         steps,
-        args: mergePatch(targetRun.args, argsPatch),
+        args: replayArgs,
       },
     });
     const sessionExtra = await sessionExtraForRun(runtime, checkpointRun);
@@ -968,6 +1010,49 @@ export async function cancelRun(params: {
   const runtime = createToolContext(params.ctx);
   const target = await resolveControlTarget(runtime, params);
   if ("error" in target) return target.error;
+
+  // At a wait gate (pause/approval/input) the run is suspended, not mid-step:
+  // cancel takes effect immediately, with a terminal checkpoint consumers can
+  // observe. Mid-step runs stay cooperative (desired = "cancel", honored at the
+  // next step boundary by the workflow loop).
+  const job = await getStoredJob(runtime.env, target.jobId).catch(() => null);
+  const wait = job?.status === "waiting" ? job.wait : null;
+  if (wait && (wait.kind === "pause" || wait.kind === "approval" || wait.kind === "input")) {
+    if (wait.kind === "approval") {
+      await resolveApprovalRecord({
+        env: runtime.env,
+        approvalId: wait.approvalId,
+        stateKey: wait.stateKey,
+        status: "cancelled",
+        decision: "cancelled",
+      });
+    }
+    if (wait.approvalId) {
+      await deleteApprovalId({ env: runtime.env, approvalId: wait.approvalId });
+    } else if (wait.stateKey) {
+      await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey: wait.stateKey });
+    }
+    if (wait.stateKey) {
+      await deleteStateJson({ env: runtime.env, key: wait.stateKey });
+    }
+    await recordTerminalCancel({
+      env: runtime.env,
+      runId: target.runId,
+      jobId: target.jobId,
+      stepId: wait.stepId ?? null,
+      stepIndex: wait.stepIndex ?? null,
+      metadata: { gate: wait.kind },
+    });
+    return {
+      protocolVersion: 1,
+      ok: true,
+      status: "cancelled",
+      output: [],
+      jobId: target.jobId,
+      runId: target.runId,
+    };
+  }
+
   await setRunControl({
     env: runtime.env,
     runId: target.runId,
@@ -1011,18 +1096,23 @@ export async function setStepMode(params: {
 
 export async function setJobExternalSession(params: {
   jobId: string;
-  sessionId: string | null;
+  sessionKey: string | null;
   provider?: string | null;
+  agentId?: string | null;
+  sessionId?: string | null;
   ctx?: ToolRunContext;
 }): Promise<ToolEnvelope> {
   const runtime = createToolContext(params.ctx);
   const job = await getStoredJob(runtime.env, params.jobId);
   if (!job) return errorEnvelope("not_found", `Job "${params.jobId}" not found`);
+  const provider = params.provider ?? "openclaw";
   await setStoredJobExternalSession({
     env: runtime.env,
     jobId: params.jobId,
-    sessionId: params.sessionId,
-    provider: params.provider ?? "openclaw",
+    sessionKey: params.sessionKey,
+    provider,
+    agentId: params.agentId ?? null,
+    sessionId: params.sessionId ?? null,
   });
   return {
     protocolVersion: 1,
@@ -1030,8 +1120,10 @@ export async function setJobExternalSession(params: {
     status: "ok",
     output: [],
     jobId: params.jobId,
-    externalSessionId: params.sessionId,
-    externalSessionProvider: params.provider ?? "openclaw",
+    externalProvider: provider,
+    externalAgentId: params.agentId ?? null,
+    externalSessionId: params.sessionId ?? null,
+    externalSessionKey: params.sessionKey,
   };
 }
 
@@ -1040,22 +1132,22 @@ async function maybeCreateRun(params: {
   sourceType: "workflow_file" | "pipeline";
   workflowFile?: string;
   workflowName?: string | null;
+  workflowDescription?: string | null;
   pipelineText?: string;
   args?: unknown;
   agent?: string | null;
   model?: string | null;
+  title?: string | null;
+  description?: string | null;
+  metadata?: Record<string, unknown> | null;
   lineage?: {
     parentRunId?: string | null;
-    rerunOfJobId?: string | null;
-    rewindOfJobId?: string | null;
-    rewindOfCheckpointId?: string | null;
+    parentJobId?: string | null;
+    rootJobId?: string | null;
   };
 }) {
   const hasLineage = Boolean(
-    params.lineage?.parentRunId ||
-    params.lineage?.rerunOfJobId ||
-    params.lineage?.rewindOfJobId ||
-    params.lineage?.rewindOfCheckpointId,
+    params.lineage?.parentRunId || params.lineage?.parentJobId || params.lineage?.rootJobId,
   );
   if (!checkpointsEnabled(params.runtime.env) && !hasLineage) return undefined;
   return createRun({
@@ -1063,14 +1155,64 @@ async function maybeCreateRun(params: {
     sourceType: params.sourceType,
     workflowFile: params.workflowFile,
     workflowName: params.workflowName,
+    workflowDescription: params.workflowDescription,
     pipelineText: params.pipelineText,
     args: params.args,
     agent: params.agent,
     model: params.model,
-    rerunOfJobId: params.lineage?.rerunOfJobId,
-    rewindOfJobId: params.lineage?.rewindOfJobId,
-    rewindOfCheckpointId: params.lineage?.rewindOfCheckpointId,
+    title: params.title,
+    description: params.description,
+    metadata: params.metadata,
+    parentJobId: params.lineage?.parentJobId,
+    rootJobId: params.lineage?.rootJobId,
   });
+}
+
+function normalizeJobTextField(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a string`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function normalizeJobMetadata(value: unknown): Record<string, unknown> | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("metadata must be a plain object");
+  }
+  assertJsonSerializable(value, "metadata", new WeakSet());
+  return value as Record<string, unknown>;
+}
+
+function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<object>) {
+  if (value === null) return;
+  const valueType = typeof value;
+  if (valueType === "string" || valueType === "boolean") return;
+  if (valueType === "number") {
+    if (!Number.isFinite(value as number)) {
+      throw new Error(`${label} must be JSON-serializable`);
+    }
+    return;
+  }
+  if (valueType !== "object") {
+    throw new Error(`${label} must be JSON-serializable`);
+  }
+  const object = value as object;
+  if (seen.has(object)) {
+    throw new Error(`${label} must be JSON-serializable`);
+  }
+  seen.add(object);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      assertJsonSerializable(item, label, seen);
+    }
+    return;
+  }
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    assertJsonSerializable((value as Record<string, unknown>)[key], label, seen);
+  }
 }
 
 async function maybeUpdateRun(
@@ -1093,7 +1235,7 @@ async function loadWorkflowRunContext(
   env: Record<string, string | undefined>,
   stateKey: string,
 ): Promise<WorkflowExecutionContext | undefined> {
-  const { readStateJson } = await import("../state/store.js");
+  const { readStateJson } = await import("../store/state.js");
   const stored = await readStateJson({ env, key: stateKey }).catch(() => null);
   const runId = typeof stored?.runId === "string" ? stored.runId : null;
   return runId

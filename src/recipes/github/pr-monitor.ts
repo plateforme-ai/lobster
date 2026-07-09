@@ -13,7 +13,7 @@
 
 import { Lobster } from "../../sdk/index.js";
 import { diffLast } from "../../sdk/primitives/diff.js";
-import { ghPrView } from "./stages/pr-view.js";
+import { ghPrView } from "./pr-view.js";
 
 /**
  * Pick a subset of PR fields for comparison
