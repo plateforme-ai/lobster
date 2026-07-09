@@ -20,7 +20,7 @@ async function runWorkflow(workflow: unknown) {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr: process.stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       registry: createDefaultRegistry(),
     },
@@ -255,7 +255,6 @@ test("for_each dry-run renders loop structure", async () => {
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -271,7 +270,7 @@ test("for_each dry-run renders loop structure", async () => {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       dryRun: true,
       registry: createDefaultRegistry(),

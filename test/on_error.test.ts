@@ -13,7 +13,6 @@ function printLine(text: string) {
 
 async function runWorkflow(workflow: unknown) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-onerror-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -23,7 +22,7 @@ async function runWorkflow(workflow: unknown) {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr: process.stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       registry: createDefaultRegistry(),
     },
@@ -188,7 +187,7 @@ test("external abort propagates even with on_error: continue", async () => {
           stdin: process.stdin,
           stdout: process.stdout,
           stderr: process.stderr,
-          env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+          env: { ...process.env, LOBSTER_DIR: path.dirname(stateDir) },
           mode: "tool",
           signal: controller.signal,
         },

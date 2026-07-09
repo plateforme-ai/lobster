@@ -191,7 +191,6 @@ test("retry validation accepts valid config", async () => {
 
 async function runWorkflow(workflow: any) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-retry-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -205,7 +204,7 @@ async function runWorkflow(workflow: any) {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
     },
   });
@@ -298,7 +297,6 @@ test("step without retry fails immediately (no retry)", async () => {
 
 test("dry-run renders retry config", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-retry-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   const workflow = {
     name: "dry-run-retry",
@@ -322,7 +320,7 @@ test("dry-run renders retry config", async () => {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       dryRun: true,
     },

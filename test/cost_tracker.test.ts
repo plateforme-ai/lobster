@@ -154,7 +154,7 @@ async function runWorkflow(workflow: unknown, envOverride?: Record<string, strin
       stdin: process.stdin,
       stdout: process.stdout,
       stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir, ...envOverride },
+      env: { ...process.env, LOBSTER_DIR: tmpDir, ...envOverride },
       mode: "tool",
     },
   });

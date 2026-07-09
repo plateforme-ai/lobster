@@ -8,13 +8,12 @@ import { runPipeline } from "../src/runtime.js";
 import { diffLast, diffAndStoreValue } from "../src/sdk/primitives/diff.js";
 import { stateSet, readState, writeState } from "../src/sdk/primitives/state.js";
 import {
-  createApprovalIndex,
   diffAndStore,
   writeStateJson,
   readStateJson,
   writeFileAtomic,
   writeFileAtomicExclusive,
-} from "../src/store/state.js";
+} from "../src/store/helpers.js";
 
 function streamOf(items) {
   return (async function* () {
@@ -23,10 +22,10 @@ function streamOf(items) {
 }
 
 test("state.set writes and state.get reads", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-state-"));
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "lobster-"));
   const registry = createDefaultRegistry();
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   // write
   const setCmd = registry.get("state.set");
@@ -66,9 +65,9 @@ test("state.set writes and state.get reads", async () => {
 });
 
 test("state.get returns null for missing key", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-state-"));
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "lobster-"));
   const registry = createDefaultRegistry();
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const output = await runPipeline({
     pipeline: [{ name: "state.get", args: { _: ["missing"] }, raw: "state.get missing" }],
@@ -94,7 +93,7 @@ test("state.get returns null for missing key", async () => {
 
 test("writeStateJson is atomic: concurrent reads never observe truncated state (#108)", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-store-"));
-  const env = { LOBSTER_STATE_DIR: tmp };
+  const env = { LOBSTER_DIR: tmp };
   const key = "pipeline-resume";
   const payload = "x".repeat(256 * 1024); // large enough that writeFile is not instantaneous
 
@@ -196,9 +195,11 @@ test("writeFileAtomic propagates parent directory sync failures", async () => {
 });
 
 test("readStateJson surfaces malformed authoritative state", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-state-corrupt-"));
-  const env = { LOBSTER_STATE_DIR: tmp };
-  await fsp.writeFile(path.join(tmp, "resume.json"), '{"partial"', "utf8");
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "lobster-"));
+  const env = { LOBSTER_DIR: tmpDir };
+  const stateDir = path.join(tmpDir, "state");
+  await fsp.mkdir(stateDir, { recursive: true });
+  await fsp.writeFile(path.join(stateDir, "resume.json"), '{"partial"', "utf8");
 
   await assert.rejects(() => readStateJson({ env, key: "resume" }), SyntaxError);
 });
@@ -287,50 +288,12 @@ test("writeFileAtomicExclusive removes published target when parent directory sy
   assert.deepEqual(leftovers, []);
 });
 
-test("createApprovalIndex omits short ID when atomic exclusive publish is unsupported", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-approval-index-unsupported-"));
-  const env = { LOBSTER_STATE_DIR: tmp };
-  const unsupported = Object.assign(new Error("operation not supported"), { code: "ENOTSUP" });
-
-  const approvalId = await createApprovalIndex({
-    env,
-    stateKey: "workflow_resume_1",
-    options: {
-      async linkFile() {
-        throw unsupported;
-      },
-    },
-  });
-
-  assert.equal(approvalId, null);
-  const files = await fsp.readdir(tmp);
-  assert.deepEqual(files, []);
-});
-
-test("createApprovalIndex omits short ID when approval index durability fails", async () => {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-approval-index-sync-fails-"));
-  const env = { LOBSTER_STATE_DIR: tmp };
-  const fault = Object.assign(new Error("dir sync failed"), { code: "EIO" });
-
-  const approvalId = await createApprovalIndex({
-    env,
-    stateKey: "workflow_resume_1",
-    options: {
-      async syncParentDir() {
-        throw fault;
-      },
-    },
-  });
-
-  assert.equal(approvalId, null);
-  const files = await fsp.readdir(tmp);
-  assert.deepEqual(files, []);
-});
-
 test("diffAndStore treats corrupt previous state as a miss and rewrites atomically (#112)", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-corrupt-"));
-  const env = { LOBSTER_STATE_DIR: tmp };
-  await fsp.writeFile(path.join(tmp, "snapshot.json"), '{"partial"', "utf8");
+  const env = { LOBSTER_DIR: tmp };
+  const stateDir = path.join(tmp, "state");
+  await fsp.mkdir(stateDir, { recursive: true });
+  await fsp.writeFile(path.join(stateDir, "snapshot.json"), '{"partial"', "utf8");
 
   const result = await diffAndStore({ env, key: "snapshot", value: { ok: true } });
 
@@ -341,14 +304,16 @@ test("diffAndStore treats corrupt previous state as a miss and rewrites atomical
 
 test("SDK diff primitives treat corrupt previous state as a miss (#112)", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-sdk-diff-corrupt-"));
-  const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-  await fsp.writeFile(path.join(tmp, "sdk-snapshot.json"), '{"partial"', "utf8");
+  const ctx = { env: { LOBSTER_DIR: tmp } };
+  const stateDir = path.join(tmp, "state");
+  await fsp.mkdir(stateDir, { recursive: true });
+  await fsp.writeFile(path.join(stateDir, "sdk-snapshot.json"), '{"partial"', "utf8");
 
   const direct = await diffAndStoreValue("sdk-snapshot", { next: true }, ctx);
   assert.equal(direct.before, null);
   assert.equal(direct.changed, true);
 
-  await fsp.writeFile(path.join(tmp, "stage-snapshot.json"), '{"partial"', "utf8");
+  await fsp.writeFile(path.join(stateDir, "stage-snapshot.json"), '{"partial"', "utf8");
   const stage = diffLast("stage-snapshot");
   const result = await stage.run({ input: streamOf([{ next: true }]), ctx });
   const output = [];
@@ -367,7 +332,7 @@ test("SDK diff primitives treat corrupt previous state as a miss (#112)", async 
 
 test("SDK stateSet/readState is atomic under concurrent reads (#109)", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-sdk-"));
-  const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
+  const ctx = { env: { LOBSTER_DIR: tmp } };
   const key = "sdk-state";
   const payload = "y".repeat(256 * 1024);
 
@@ -409,9 +374,10 @@ test("SDK stateSet/readState is atomic under concurrent reads (#109)", async () 
 
 test("SDK writeState preserves restricted state-file mode", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-sdk-mode-"));
-  const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-  const filePath = path.join(tmp, "sdk-state.json");
-  await fsp.mkdir(tmp, { recursive: true });
+  const ctx = { env: { LOBSTER_DIR: tmp } };
+  const stateDir = path.join(tmp, "state");
+  const filePath = path.join(stateDir, "sdk-state.json");
+  await fsp.mkdir(stateDir, { recursive: true });
   await fsp.writeFile(filePath, '{"old":true}\n', { mode: 0o600 });
   await fsp.chmod(filePath, 0o600);
 
@@ -425,10 +391,11 @@ test("SDK writeState preserves restricted state-file mode", async () => {
 
 test("SDK writeState removes temp files when replacement fails", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-sdk-cleanup-"));
-  const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-  await fsp.mkdir(path.join(tmp, "sdk-state.json"));
+  const ctx = { env: { LOBSTER_DIR: tmp } };
+  const stateDir = path.join(tmp, "state");
+  await fsp.mkdir(path.join(stateDir, "sdk-state.json"), { recursive: true });
 
   await assert.rejects(() => writeState("sdk-state", { ok: true }, ctx));
-  const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
+  const leftovers = (await fsp.readdir(stateDir)).filter((f) => f.includes(".tmp"));
   assert.deepEqual(leftovers, []);
 });

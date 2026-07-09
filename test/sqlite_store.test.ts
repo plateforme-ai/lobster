@@ -29,7 +29,7 @@ import { withRuntimeDb } from "../src/store/sqlite.js";
 
 test("sqlite runtime store persists runs, checkpoints, approvals, and cache entries", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-sqlite-store-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const run = await createRun({
     env,
@@ -91,7 +91,7 @@ test("sqlite runtime store persists runs, checkpoints, approvals, and cache entr
     env,
     approvalId: "deadbeef",
     run,
-    stateKey: "workflow_resume_x",
+    checkpointId: checkpointId!,
     prompt: "Proceed?",
   });
 
@@ -135,7 +135,7 @@ test("sqlite runtime store persists runs, checkpoints, approvals, and cache entr
 
 test("migration id 2 adds session columns and the run_controls table", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration2-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
 
@@ -205,7 +205,7 @@ test("migration id 2 adds session columns and the run_controls table", async () 
 
 test("recordTerminalCancel transitions a waiting gate checkpoint and appends a terminal control checkpoint", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-terminal-cancel-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir, LOBSTER_CHECKPOINTS_ENABLED: "true" };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
   const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
 
   // Park the run at an approval gate with a pending approval.
@@ -216,14 +216,13 @@ test("recordTerminalCancel transitions a waiting gate checkpoint and appends a t
     stepIndex: 1,
     stepType: "approval",
     status: "waiting",
-    metadata: { stateKey: "workflow_resume_terminal" },
+    resumeState: { kind: "workflow-file", resumeAtIndex: 2 },
   });
   await createApprovalRecord({
     env,
     approvalId: "approval-terminal",
     run,
     checkpointId: gateCheckpointId,
-    stateKey: "workflow_resume_terminal",
     prompt: "Proceed?",
   });
   await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "cancel" });
@@ -256,7 +255,7 @@ test("recordTerminalCancel transitions a waiting gate checkpoint and appends a t
 
 test("setRunControl desired=cancel is observable through getJob/getRun", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cancel-desired-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
   const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
 
   await setRunControl({ env, runId: run.runId, jobId: run.jobId, desired: "cancel" });
@@ -266,7 +265,7 @@ test("setRunControl desired=cancel is observable through getJob/getRun", async (
 
 test("migration id 5 backfill splits legacy agent-prefixed session ids", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration5-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
   const run = await createRun({ env, sourceType: "workflow_file", workflowFile: "wf.lobster" });
 
   await withRuntimeDb(env, (db) => {
@@ -289,7 +288,7 @@ test("migration id 5 backfill splits legacy agent-prefixed session ids", async (
 
 test("migration id 3 adds agent/model columns and they round-trip through createRun", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration3-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const run = await createRun({
     env,
@@ -325,7 +324,7 @@ test("migration id 3 adds agent/model columns and they round-trip through create
 
 test("migration id 4 adds title/description/metadata columns and they round-trip through createRun", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration4-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const run = await createRun({
     env,
@@ -365,7 +364,7 @@ test("migration id 4 adds title/description/metadata columns and they round-trip
 
 test("migration id 8 surfaces root-run workflow identity on the job payload", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-migration8-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmpDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const run = await createRun({
     env,
@@ -405,7 +404,7 @@ test("large payloads spill to content-addressed blobs and round-trip through the
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-sqlite-blob-"));
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: tmpDir,
+    LOBSTER_DIR: tmpDir,
     // Force everything above a tiny threshold onto disk as a blob.
     LOBSTER_CHECKPOINT_INLINE_MAX_BYTES: "64",
     LOBSTER_CACHE_INLINE_MAX_BYTES: "64",

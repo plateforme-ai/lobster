@@ -8,7 +8,17 @@ import os from "node:os";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
 import { decodeResumeToken } from "../src/resume.js";
-import { readStateJson } from "../src/store/state.js";
+import { getCheckpoint } from "../src/store/runtime_store.js";
+
+// Workflow resume state now lives on the waiting checkpoint's `resume_state_json`
+// (addressed by checkpointId in the resume token) rather than a JSON file.
+async function loadResumeState(
+  env: Record<string, string | undefined>,
+  checkpointId: string,
+): Promise<any> {
+  const checkpoint = await getCheckpoint({ env, checkpointId });
+  return checkpoint?.resumeState ?? null;
+}
 
 function streamOf(items: unknown[]) {
   return (async function* () {
@@ -51,7 +61,7 @@ test("workflow file runs with approval and resume", async () => {
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -114,7 +124,7 @@ test("workflow resume cancellation cleans up resume state", async () => {
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -130,9 +140,10 @@ test("workflow resume cancellation cleans up resume state", async () => {
 
   const payload = decodeResumeToken(first.requiresApproval?.resumeToken ?? "");
   assert.equal(payload.kind, "workflow-file");
-  assert.ok(payload.stateKey);
+  assert.ok(payload.checkpointId);
 
-  await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+  const gate = await loadResumeState(env, payload.checkpointId);
+  assert.ok(gate, "waiting checkpoint should carry resume state");
 
   const cancelled = await runWorkflowFile({
     filePath,
@@ -151,73 +162,6 @@ test("workflow resume cancellation cleans up resume state", async () => {
   assert.deepEqual(cancelled.output, []);
   const files = await fsp.readdir(stateDir);
   const resumeStateFiles = files.filter((name) => name.startsWith("workflow_resume_"));
-  assert.deepEqual(resumeStateFiles, []);
-});
-
-test("workflow resume accepts workflow-resume_ state key aliases and cleans up state", async () => {
-  const workflow = {
-    steps: [
-      {
-        id: "approve_step",
-        command:
-          "node -e \"process.stdout.write(JSON.stringify({requiresApproval:{prompt:'Proceed?', items:[{id:1}]}}))\"",
-        approval: "required",
-      },
-      {
-        id: "finish",
-        command: 'node -e "process.stdout.write(JSON.stringify({done:true}))"',
-        condition: "$approve_step.approved",
-      },
-    ],
-  };
-
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-alias-"));
-  const stateDir = path.join(tmpDir, "state");
-  const filePath = path.join(tmpDir, "workflow.lobster");
-  await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-  const first = await runWorkflowFile({
-    filePath,
-    ctx: {
-      stdin: process.stdin,
-      stdout: process.stdout,
-      stderr: process.stderr,
-      env,
-      mode: "tool",
-    },
-  });
-  assert.equal(first.status, "needs_approval");
-
-  const payload = decodeResumeToken(first.requiresApproval?.resumeToken ?? "");
-  assert.equal(payload.kind, "workflow-file");
-  assert.ok(payload.stateKey?.startsWith("workflow_resume_"));
-
-  const aliasedPayload = {
-    ...payload,
-    stateKey: (payload.stateKey ?? "").replace("workflow_resume_", "workflow-resume_"),
-  };
-  assert.ok(aliasedPayload.stateKey.startsWith("workflow-resume_"));
-
-  const resumed = await runWorkflowFile({
-    filePath,
-    ctx: {
-      stdin: process.stdin,
-      stdout: process.stdout,
-      stderr: process.stderr,
-      env,
-      mode: "tool",
-    },
-    resume: aliasedPayload,
-    approved: true,
-  });
-  assert.equal(resumed.status, "ok");
-  assert.deepEqual(resumed.output, [{ done: true }]);
-
-  const files = await fsp.readdir(stateDir);
-  const resumeStateFiles = files.filter(
-    (name) => name.startsWith("workflow_resume_") || name.startsWith("workflow-resume_"),
-  );
   assert.deepEqual(resumeStateFiles, []);
 });
 
@@ -251,11 +195,10 @@ test("workflow file input steps pause and resume with structured responses", asy
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-input-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -323,11 +266,10 @@ test("workflow pipeline command input pauses and resumes the same pipeline step"
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-pipeline-input-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
   const first = await runWorkflowFile({
     filePath,
     ctx: {
@@ -344,7 +286,7 @@ test("workflow pipeline command input pauses and resumes the same pipeline step"
   assert.deepEqual(first.requiresInput?.subject, { text: '{"text":"hello"}' });
   const payload = decodeResumeToken(first.requiresInput?.resumeToken ?? "");
   assert.equal(payload.kind, "workflow-file");
-  const state = (await readStateJson({ env, key: payload.stateKey! })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId!)) as any;
   assert.equal(state.resumeAtIndex, 1);
   assert.equal(state.inputKind, "pipeline_command");
   assert.equal(state.inputStepId, "review");
@@ -421,10 +363,9 @@ test("workflow pipeline requestInput resume invariant bypasses on_error", async 
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-pipeline-invariant-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -458,7 +399,10 @@ test("workflow pipeline requestInput resume invariant bypasses on_error", async 
     /not consumed/,
   );
   assert.equal(sideEffects, 0);
-  await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+  assert.ok(
+    await loadResumeState(env, payload.checkpointId!),
+    "resume state should persist for retry after a failed resume",
+  );
 });
 
 test("workflow pipeline requestInput resume rejects changed pipeline", async () => {
@@ -501,10 +445,9 @@ test("workflow pipeline requestInput resume rejects changed pipeline", async () 
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-pipeline-change-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -541,7 +484,10 @@ test("workflow pipeline requestInput resume rejects changed pipeline", async () 
     /pipeline changed/,
   );
   assert.equal(sideEffects, 0);
-  await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+  assert.ok(
+    await loadResumeState(env, payload.checkpointId!),
+    "resume state should persist after a rejected resume",
+  );
 });
 
 test("workflow pipeline requestInput keeps full pipeline across repeated suspensions", async () => {
@@ -591,10 +537,9 @@ test("workflow pipeline requestInput keeps full pipeline across repeated suspens
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-pipeline-repeat-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -627,7 +572,7 @@ test("workflow pipeline requestInput keeps full pipeline across repeated suspens
   assert.equal(second.status, "needs_input");
   const secondPayload = decodeResumeToken(second.requiresInput?.resumeToken ?? "");
   assert.equal(secondPayload.kind, "workflow-file");
-  const state = (await readStateJson({ env, key: secondPayload.stateKey! })) as any;
+  const state = (await loadResumeState(env, secondPayload.checkpointId!)) as any;
   assert.equal(state.pipelineInput.resumeAtIndex, 1);
   assert.equal(state.pipelineInput.pipeline.length, 2);
 
@@ -697,10 +642,9 @@ test("workflow pipeline requestInput resume rejects condition bypass", async () 
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-pipeline-condition-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -737,7 +681,10 @@ test("workflow pipeline requestInput resume rejects condition bypass", async () 
     /condition changed/,
   );
   assert.equal(sideEffects, 0);
-  await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+  assert.ok(
+    await loadResumeState(env, payload.checkpointId!),
+    "resume state should persist after a rejected resume",
+  );
 });
 
 test("workflow pipeline command input preserves replayable stdin without suspended state", async () => {
@@ -782,10 +729,9 @@ test("workflow pipeline command input preserves replayable stdin without suspend
       },
     ];
     const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
-    const stateDir = path.join(tmpDir, "state");
     const filePath = path.join(tmpDir, "workflow.lobster");
     await fsp.writeFile(filePath, JSON.stringify({ name: "sample", steps }, null, 2), "utf8");
-    const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+    const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
     const first = await runWorkflowFile({
       filePath,
@@ -802,7 +748,7 @@ test("workflow pipeline command input preserves replayable stdin without suspend
 
     const payload = decodeResumeToken(first.requiresInput?.resumeToken ?? "");
     assert.equal(payload.kind, "workflow-file");
-    const state = (await readStateJson({ env, key: payload.stateKey! })) as any;
+    const state = (await loadResumeState(env, payload.checkpointId!)) as any;
     const resumed = await runWorkflowFile({
       filePath,
       ctx: {
@@ -867,13 +813,12 @@ test("workflow input resumes preserve the full subject even when the tool envelo
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-input-truncate-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_DIR: tmpDir,
     LOBSTER_MAX_TOOL_ENVELOPE_BYTES: "8192",
   };
 
@@ -933,11 +878,10 @@ test("workflow approval resumes require an explicit decision", async () => {
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-approval-required-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -990,13 +934,12 @@ test("workflow approval can require a different approver than initiator", async 
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-approval-identity-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const baseEnv = {
     ...process.env,
-    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_DIR: tmpDir,
     LOBSTER_APPROVAL_INITIATED_BY: "agent-1",
   };
 
@@ -1069,11 +1012,10 @@ test("workflow approval can require a specific approver identity", async () => {
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-required-approver-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -1163,11 +1105,10 @@ test("workflow conditions support comparisons, boolean operators, and parenthese
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-conditions-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
 
   const first = await runWorkflowFile({
     filePath,
@@ -1376,13 +1317,12 @@ test("workflow files can mix shell steps, approval-only steps, and pipeline llm 
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-mixed-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_DIR: tmpDir,
     LOBSTER_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
   };
 
@@ -1495,13 +1435,12 @@ test("workflow pipeline llm_task.invoke consumes stdin artifacts from previous s
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-llm-task-stdin-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_DIR: tmpDir,
     OPENCLAW_URL: `http://127.0.0.1:${port}`,
   };
 
@@ -1564,7 +1503,7 @@ test("workflow pipeline steps respect cwd and feed later shell steps via stdout 
       stdin: process.stdin,
       stdout: process.stdout,
       stderr: process.stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       registry,
     },

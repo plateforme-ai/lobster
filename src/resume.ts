@@ -1,23 +1,13 @@
 import { decodeToken, encodeToken } from "./token.js";
 import { decodeWorkflowResumePayload } from "./workflows/file.js";
-import { findStateKeyByApprovalId } from "./store/state.js";
-
-/**
- * Determine the resume payload kind from a state key prefix.
- * State keys use naming conventions: pipeline_resume_<uuid> or workflow_resume_<uuid>.
- */
-export function kindFromStateKey(stateKey: string): "pipeline-resume" | "workflow-file" {
-  if (stateKey.startsWith("pipeline_resume_")) return "pipeline-resume";
-  if (stateKey.startsWith("workflow_resume_")) return "workflow-file";
-  // Fallback for unknown prefixes — workflow-file is the original behavior
-  return "workflow-file";
-}
+import { findCheckpointIdByApprovalId, getCheckpoint } from "./store/runtime_store.js";
 
 export type PipelineResumePayload = {
   protocolVersion: 1;
   v: 1;
   kind: "pipeline-resume";
-  stateKey: string;
+  checkpointId: string;
+  jobId?: string;
 };
 
 export function parseResumeArgs(argv) {
@@ -99,25 +89,38 @@ export function parseResumeArgs(argv) {
 }
 
 /**
- * Resolve an approval ID to a resume token by looking up the state key.
- * Detects the kind (workflow-file vs pipeline-resume) from the state key prefix.
+ * Resolve an approval ID to a resume token by looking up the waiting checkpoint
+ * it is anchored to. The checkpoint's step type determines the resume kind
+ * (pipeline vs workflow-file).
  */
 export async function resolveApprovalId(
   approvalId: string,
   env: Record<string, string | undefined>,
 ): Promise<string> {
-  const stateKey = await findStateKeyByApprovalId({ env, approvalId });
-  if (!stateKey) {
+  const checkpointId = await findCheckpointIdByApprovalId({ env, approvalId });
+  if (!checkpointId) {
     throw new Error(`Approval ID "${approvalId}" not found or expired`);
   }
 
-  const kind = kindFromStateKey(stateKey);
+  const checkpoint = await getCheckpoint({ env, checkpointId });
+  if (!checkpoint) {
+    throw new Error(`Approval ID "${approvalId}" not found or expired`);
+  }
+
+  const resume = (checkpoint.resumeState ?? null) as { kind?: unknown } | null;
+  const kind =
+    resume?.kind === "pipeline-resume" ||
+    checkpoint.stepType === "pipeline" ||
+    checkpoint.stepType === "pipeline_input"
+      ? "pipeline-resume"
+      : "workflow-file";
 
   return encodeToken({
     protocolVersion: 1,
     v: 1,
     kind,
-    stateKey,
+    checkpointId,
+    ...(checkpoint.jobId ? { jobId: checkpoint.jobId } : null),
   });
 }
 
@@ -138,11 +141,12 @@ function decodePipelineResumePayload(payload: unknown): PipelineResumePayload | 
   const data = payload as Partial<PipelineResumePayload>;
   if (data.kind !== "pipeline-resume") return null;
   if (data.protocolVersion !== 1 || data.v !== 1) throw new Error("Unsupported token version");
-  if (!data.stateKey || typeof data.stateKey !== "string") throw new Error("Invalid token");
+  if (!data.checkpointId || typeof data.checkpointId !== "string") throw new Error("Invalid token");
   return {
     protocolVersion: 1,
     v: 1,
     kind: "pipeline-resume",
-    stateKey: data.stateKey,
+    checkpointId: data.checkpointId,
+    ...(typeof data.jobId === "string" ? { jobId: data.jobId } : null),
   };
 }

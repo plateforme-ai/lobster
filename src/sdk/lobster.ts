@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { runPipelineInternal } from "./runtime.js";
 import { encodeToken, decodeToken } from "./token.js";
 import { compileCached } from "../validation.js";
 import { validateCommandInputState, type CommandInputState } from "../input_request.js";
-import { deleteStateJson, readStateJson, writeStateJson } from "../store/state.js";
+import { deleteStateJson, readStateJson, writeStateJson } from "../store/helpers.js";
 
 type SdkResumePayload = {
   protocolVersion: 1;
@@ -435,7 +436,7 @@ function decodeSdkResumePayload(token: string): SdkResumePayload {
 
 function sdkStateEnv(options: any) {
   return options.stateDir
-    ? { ...(options.env ?? process.env), LOBSTER_STATE_DIR: options.stateDir }
+    ? { ...(options.env ?? process.env), LOBSTER_DIR: path.dirname(options.stateDir) }
     : (options.env ?? process.env);
 }
 

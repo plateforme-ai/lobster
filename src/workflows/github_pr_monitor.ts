@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import { diffAndStore } from "../store/helpers.js";
+
 function runProcess(command, argv, { env, cwd }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, argv, { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -31,8 +33,6 @@ function runProcess(command, argv, { env, cwd }) {
     });
   });
 }
-
-import { diffAndStore } from "../store/state.js";
 
 function pickSubset(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return null;

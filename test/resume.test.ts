@@ -23,7 +23,7 @@ test("state-backed resume token roundtrip and resume pipeline continues", async 
   const pipeline =
     'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "ok?" | pick a';
 
-  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
+  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_DIR: path.dirname(stateDir) });
   assert.equal(first.status, 0);
   const firstJson = JSON.parse(first.stdout);
   assert.equal(firstJson.status, "needs_approval");
@@ -31,11 +31,11 @@ test("state-backed resume token roundtrip and resume pipeline continues", async 
 
   const payload = decodeResumeToken(firstJson.requiresApproval.resumeToken);
   assert.equal(payload.kind, "pipeline-resume");
-  assert.equal(typeof payload.stateKey, "string");
+  assert.equal(typeof payload.checkpointId, "string");
 
   const resumed = runCli(
     ["resume", "--token", firstJson.requiresApproval.resumeToken, "--approve", "yes"],
-    { LOBSTER_STATE_DIR: stateDir },
+    { LOBSTER_DIR: path.dirname(stateDir) },
   );
   assert.equal(resumed.status, 0);
   const resumedJson = JSON.parse(resumed.stdout);
@@ -63,14 +63,14 @@ test("resume cancellation cleans up pipeline resume state", async () => {
   const pipeline =
     'exec --json=true node -e "process.stdout.write(JSON.stringify([{a:1}]))" | approve --prompt "ok?" | pick a';
 
-  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
+  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_DIR: path.dirname(stateDir) });
   assert.equal(first.status, 0);
   const firstJson = JSON.parse(first.stdout);
   assert.equal(firstJson.status, "needs_approval");
 
   const cancelled = runCli(
     ["resume", "--token", firstJson.requiresApproval.resumeToken, "--approve", "no"],
-    { LOBSTER_STATE_DIR: stateDir },
+    { LOBSTER_DIR: path.dirname(stateDir) },
   );
   assert.equal(cancelled.status, 0);
   const cancelledJson = JSON.parse(cancelled.stdout);
@@ -87,7 +87,7 @@ test("cli resume accepts --response-json for pipeline input requests", async () 
 
   const pipeline = `ask --prompt 'Review?' --schema '{"type":"object","properties":{"decision":{"type":"string"}},"required":["decision"]}'`;
 
-  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
+  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_DIR: path.dirname(stateDir) });
   assert.equal(first.status, 0);
   const firstJson = JSON.parse(first.stdout);
   assert.equal(firstJson.status, "needs_input");
@@ -101,7 +101,7 @@ test("cli resume accepts --response-json for pipeline input requests", async () 
       "--response-json",
       '{"decision":"approve"}',
     ],
-    { LOBSTER_STATE_DIR: stateDir },
+    { LOBSTER_DIR: path.dirname(stateDir) },
   );
   assert.equal(resumed.status, 0);
   const resumedJson = JSON.parse(resumed.stdout);

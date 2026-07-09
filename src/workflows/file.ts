@@ -2,29 +2,24 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 
-import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { PassThrough } from "node:stream";
 
 import { parsePipeline } from "../parser.js";
 import { runPipeline } from "../runtime.js";
 import { encodeToken, decodeToken } from "../token.js";
-import {
-  cleanupApprovalIndexByStateKey,
-  createApprovalIndex,
-  deleteStateJson,
-  readStateJson,
-  writeStateJson,
-} from "../store/state.js";
+import { generateApprovalId } from "../store/helpers.js";
 import type { WorkflowExecutionContext } from "../workflows/checkpoints.js";
+import type { LlmTextCompleter } from "../commands/stdlib/llm_client.js";
 import {
   appendCheckpoint,
-  checkpointsEnabled,
   clearRunControlDesired,
   createApprovalRecord,
   createCheckpointRun,
   createChildRun,
-  findWaitingCheckpointByStateKey,
+  createRun,
+  foldRunResults,
+  getCheckpoint,
   getJob,
   getRunControl,
   recordTerminalCancel,
@@ -229,6 +224,7 @@ type RunContext = {
     get: (name: string) => any;
   };
   llmAdapters?: Record<string, any>;
+  llmText?: LlmTextCompleter;
   dryRun?: boolean;
   _activeWorkflows?: Set<string>;
   checkpointRun?: WorkflowExecutionContext;
@@ -244,7 +240,7 @@ export type WorkflowResumePayload = {
   parentRunId?: string | null;
   stepPathPrefix?: string;
   depth?: number;
-  stateKey?: string;
+  checkpointId?: string;
   filePath?: string;
   resumeAtIndex?: number;
   steps?: Record<string, WorkflowStepResult>;
@@ -260,6 +256,7 @@ export type WorkflowResumePayload = {
 };
 
 type WorkflowResumeState = {
+  kind?: "workflow-file";
   jobId?: string;
   runId?: string;
   rootRunId?: string;
@@ -268,7 +265,10 @@ type WorkflowResumeState = {
   depth?: number;
   filePath: string;
   resumeAtIndex: number;
-  steps: Record<string, WorkflowStepResult>;
+  // Not persisted: the per-step results map is derived by folding the run's
+  // checkpoint log (foldRunResults). Populated in-memory when a resume state is
+  // loaded from a checkpoint, and provided inline by rewind.
+  steps?: Record<string, WorkflowStepResult>;
   args: Record<string, unknown>;
   activeChild?: WorkflowActiveChildResumeState;
   approvalStepId?: string;
@@ -290,7 +290,7 @@ type WorkflowPipelineInputResumeState = {
 
 type WorkflowActiveChildResumeState = {
   stepId: string;
-  stateKey: string;
+  checkpointId: string;
   filePath: string;
   runId?: string;
   jobId?: string;
@@ -852,12 +852,14 @@ export async function runWorkflowFile({
   argsOverride?: Record<string, unknown>;
   approvedPayloadOverride?: unknown;
 }): Promise<WorkflowRunResult> {
-  const consumedResumeStateKey =
-    resume?.stateKey && typeof resume.stateKey === "string"
-      ? await resolveWorkflowResumeStateKey(ctx.env, resume.stateKey)
-      : null;
-  const resumeState = resume?.stateKey
-    ? await loadWorkflowResumeState(ctx.env, consumedResumeStateKey ?? resume.stateKey)
+  // The waiting checkpoint is the single resume anchor. When resuming by token/
+  // id/job we load the resume context from its `resume_state_json` and derive
+  // the results map by folding the run's log. Rewind passes an inline payload
+  // (with its own folded `steps`) and no `checkpointId`.
+  const consumedResumeCheckpointId =
+    resume?.checkpointId && typeof resume.checkpointId === "string" ? resume.checkpointId : null;
+  const resumeState = consumedResumeCheckpointId
+    ? await loadWorkflowResumeStateFromCheckpoint(ctx.env, consumedResumeCheckpointId)
     : (resume ?? null);
   if (resumeState?.approvalStepId && resumeState?.inputStepId) {
     throw new Error("Invalid workflow resume state");
@@ -875,8 +877,8 @@ export async function runWorkflowFile({
       );
     }
     if (approved === false) {
-      if (consumedResumeStateKey) {
-        await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+      if (consumedResumeCheckpointId) {
+        await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
       }
       if (resumeState.runId) {
         await recordTerminalCancel({
@@ -915,6 +917,10 @@ export async function runWorkflowFile({
       ? cloneResults(resumeState.steps)
       : {};
     let startIndex = resumeState?.resumeAtIndex ?? 0;
+    // Checkpoints are always on and the DB is the single source of truth, so a
+    // fresh workflow run must be anchored to a run row even when invoked
+    // directly (outside the tool runtime, which normally creates it). Resume
+    // reuses the existing run derived from the waiting checkpoint.
     const checkpointRun =
       ctx.checkpointRun ??
       (resumeState?.runId
@@ -925,7 +931,16 @@ export async function runWorkflowFile({
             stepPathPrefix: resumeState.stepPathPrefix,
             depth: resumeState.depth,
           })
-        : undefined);
+        : resumeState || ctx.dryRun
+          ? undefined
+          : await createRun({
+              env: ctx.env,
+              sourceType: "workflow_file",
+              workflowFile: resolvedFilePath,
+              workflowName: resolveWorkflowDisplayName(workflow, resolvedFilePath),
+              workflowDescription: workflow.description ?? null,
+              args: resolvedArgs,
+            }));
     if (checkpointRun && !ctx.checkpointRun) ctx.checkpointRun = checkpointRun;
 
     // Feature 2: default in-workflow llm.invoke / openclaw.invoke steps to the
@@ -933,7 +948,7 @@ export async function runWorkflowFile({
     // explicit step value > job's stored value > current default (no session).
     // Inject into the base step env (consumed by mergeEnv); per-step args and
     // an already-set ambient value still win.
-    if (checkpointRun?.jobId && checkpointsEnabled(ctx.env)) {
+    if (checkpointRun?.jobId) {
       const job = await getJob(ctx.env, checkpointRun.jobId).catch(() => null);
       if (job) {
         if (job.externalSessionKey && ctx.env.LOBSTER_JOB_SESSION_KEY === undefined) {
@@ -948,20 +963,25 @@ export async function runWorkflowFile({
       }
     }
 
-    await appendCheckpoint({
-      env: ctx.env,
-      run: checkpointRun,
-      stepId: "workflow-start",
-      stepIndex: -1,
-      stepType: "workflow",
-      status: resumeState ? "resumed" : "started",
-      metadata: {
-        filePath: resolvedFilePath,
-        workflowName: resolveWorkflowDisplayName(workflow, resolvedFilePath),
-        startIndex,
-        args: resolvedArgs,
-      },
-    });
+    // Emit the workflow-start bookend once per run, on a fresh start only. On
+    // resume the run already has its `started` row, so re-emitting it is pure
+    // noise; a rewind creates a new run and therefore gets its own `started`.
+    if (!resumeState) {
+      await appendCheckpoint({
+        env: ctx.env,
+        run: checkpointRun,
+        stepId: "workflow-start",
+        stepIndex: -1,
+        stepType: "workflow",
+        status: "started",
+        metadata: {
+          filePath: resolvedFilePath,
+          workflowName: resolveWorkflowDisplayName(workflow, resolvedFilePath),
+          startIndex,
+          args: resolvedArgs,
+        },
+      });
+    }
 
     if (resumeState?.activeChild) {
       const child = resumeState.activeChild;
@@ -981,7 +1001,7 @@ export async function runWorkflowFile({
           protocolVersion: 1,
           v: 1,
           kind: "workflow-file",
-          stateKey: child.stateKey,
+          checkpointId: child.checkpointId,
         },
         approved,
         response,
@@ -1003,21 +1023,21 @@ export async function runWorkflowFile({
           childStepId: child.stepId,
           childFilePath: child.filePath,
         });
-        if (consumedResumeStateKey) {
-          await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+        if (consumedResumeCheckpointId) {
+          await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
         }
         return suspended;
       }
       if (childResult.status === "cancelled") {
-        if (consumedResumeStateKey) {
-          await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+        if (consumedResumeCheckpointId) {
+          await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
         }
         return { status: "cancelled", output: [] };
       }
       results[child.stepId] = workflowOutputToStepResult(child.stepId, childResult.output);
       startIndex = (stepIndexById.get(child.stepId) ?? startIndex) + 1;
-      if (consumedResumeStateKey) {
-        await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+      if (consumedResumeCheckpointId) {
+        await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
       }
     }
 
@@ -1030,6 +1050,11 @@ export async function runWorkflowFile({
           identity: resumeState.approvalIdentity,
           approvedBy,
         });
+      }
+      // The step's own succeeded checkpoint is folded before its initiatedBy is
+      // attached, so restore it from the persisted approval identity.
+      if (resumeState.approvalIdentity?.initiatedBy && !previous.initiatedBy) {
+        previous.initiatedBy = resumeState.approvalIdentity.initiatedBy;
       }
       previous.approved = approved;
       if (approvedBy) previous.approvedBy = approvedBy;
@@ -1047,7 +1072,7 @@ export async function runWorkflowFile({
         metadata: {
           approved,
           approvedBy: approvedBy ?? null,
-          resultsSnapshot: cloneResults(results),
+          stepResult: previous,
         },
       });
     }
@@ -1099,9 +1124,9 @@ export async function runWorkflowFile({
           stepId: resumeState.inputStepId,
           response,
           pipelineInput: resumeState.pipelineInput!,
-          onConsumed: consumedResumeStateKey
+          onConsumed: consumedResumeCheckpointId
             ? async () => {
-                await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+                await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
               }
             : undefined,
         };
@@ -1124,6 +1149,20 @@ export async function runWorkflowFile({
         previous.response = response;
         delete previous.skipped;
         results[resumeState.inputStepId] = previous;
+        // Persist the resolved input as this step's own stepResult so folding
+        // the log (for the next gate / rewind) reconstructs `.response`. The
+        // input gate row itself is a bare `waiting` marker with no result.
+        await appendCheckpoint({
+          env: ctx.env,
+          run: checkpointRun,
+          stepId: resumeState.inputStepId,
+          stepIndex: stepIndexById.get(resumeState.inputStepId) ?? null,
+          stepType: "input",
+          status: "resumed",
+          metadata: {
+            stepResult: previous,
+          },
+        });
       }
     }
 
@@ -1147,11 +1186,11 @@ export async function runWorkflowFile({
       // advances exactly one step and we never re-pause on the same step forever);
       // pause and step-mode then take effect before any subsequent step. Cancel is
       // honored at every boundary, including the entry step.
-      if (checkpointRun?.runId && checkpointsEnabled(ctx.env)) {
+      if (checkpointRun?.runId) {
         const control = await getRunControl({ env: ctx.env, runId: checkpointRun.rootRunId });
         if (control?.desired === "cancel") {
-          if (consumedResumeStateKey) {
-            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+          if (consumedResumeCheckpointId) {
+            await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
           }
           await recordTerminalCancel({
             env: ctx.env,
@@ -1160,7 +1199,6 @@ export async function runWorkflowFile({
             jobId: checkpointRun.jobId,
             stepId: step.id,
             stepIndex: idx,
-            metadata: { resultsSnapshot: cloneResults(results) },
           });
           return { status: "cancelled", output: [] };
         }
@@ -1168,40 +1206,34 @@ export async function runWorkflowFile({
         if (!isResumeEntryStep && (control?.desired === "pause" || control?.stepMode)) {
           const reason: WorkflowPausedInfo["reason"] =
             control.desired === "pause" ? "pause_requested" : "step_mode";
-          const stateKey = await saveWorkflowResumeState(ctx.env, {
-            ...workflowResumeContext(checkpointRun),
-            runId: checkpointRun.runId,
-            filePath: resolvedFilePath,
-            resumeAtIndex: idx,
-            steps: results,
-            args: resolvedArgs,
-            createdAt: new Date().toISOString(),
-          });
-          if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
-          }
           if (control.desired === "pause") {
             await clearRunControlDesired({ env: ctx.env, runId: checkpointRun.rootRunId });
           }
-          const resumeToken = encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "workflow-file",
-            stateKey,
-          } satisfies WorkflowResumePayload);
-          await appendCheckpoint({
+          const checkpointId = await appendCheckpoint({
             env: ctx.env,
             run: checkpointRun,
             stepId: step.id,
             stepIndex: idx,
             stepType: "pause",
             status: "waiting",
-            metadata: {
-              reason,
-              stateKey,
-              resultsSnapshot: cloneResults(results),
+            metadata: { reason },
+            resumeState: {
+              kind: "workflow-file",
+              ...workflowResumeContext(checkpointRun),
+              runId: checkpointRun.runId,
+              filePath: resolvedFilePath,
+              resumeAtIndex: idx,
+              args: resolvedArgs,
+              createdAt: new Date().toISOString(),
             },
           });
+          const resumeToken = encodeToken({
+            protocolVersion: 1,
+            v: 1,
+            kind: "workflow-file",
+            checkpointId: checkpointId ?? undefined,
+            jobId: checkpointRun.jobId,
+          } satisfies WorkflowResumePayload);
           return {
             status: "paused",
             output: [],
@@ -1225,8 +1257,10 @@ export async function runWorkflowFile({
           stepIndex: idx,
           stepType: getStepExecution(step).kind,
           status: "skipped",
-          condition: step.when ?? step.condition ?? null,
-          metadata: { resultsSnapshot: cloneResults(results) },
+          metadata: {
+            condition: step.when ?? step.condition ?? null,
+            stepResult: results[step.id],
+          },
         });
         continue;
       }
@@ -1248,46 +1282,38 @@ export async function runWorkflowFile({
             subject,
             maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
           });
-          const stateKey = await saveWorkflowResumeState(ctx.env, {
-            ...workflowResumeContext(checkpointRun),
-            runId: checkpointRun?.runId,
-            filePath: resolvedFilePath,
-            resumeAtIndex: idx + 1,
-            steps: results,
-            args: resolvedArgs,
-            inputStepId: step.id,
-            inputSchema: step.input.responseSchema,
-            // Preserve the full resolved subject for resume semantics; the tool
-            // envelope may contain a truncated preview to stay within size limits.
-            inputSubject: subject,
-            createdAt: new Date().toISOString(),
-          });
-
-          if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
-          }
-
-          const resumeToken = encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "workflow-file",
-            stateKey,
-          } satisfies WorkflowResumePayload);
-
-          await appendCheckpoint({
+          const checkpointId = await appendCheckpoint({
             env: ctx.env,
             run: checkpointRun,
             stepId: step.id,
             stepIndex: idx,
             stepType: "input",
             status: "waiting",
-            metadata: {
-              prompt: step.input.prompt,
-              stateKey,
-              resultsSnapshot: cloneResults(results),
+            metadata: { prompt: step.input.prompt },
+            resumeState: {
+              kind: "workflow-file",
+              ...workflowResumeContext(checkpointRun),
+              runId: checkpointRun?.runId,
+              filePath: resolvedFilePath,
+              resumeAtIndex: idx + 1,
+              args: resolvedArgs,
+              inputStepId: step.id,
+              inputSchema: step.input.responseSchema,
+              // Preserve the full resolved subject for resume semantics; the tool
+              // envelope may contain a truncated preview to stay within size limits.
+              inputSubject: subject,
+              createdAt: new Date().toISOString(),
             },
             io: { jsonInput: subject },
           });
+
+          const resumeToken = encodeToken({
+            protocolVersion: 1,
+            v: 1,
+            kind: "workflow-file",
+            checkpointId: checkpointId ?? undefined,
+            jobId: checkpointRun?.jobId,
+          } satisfies WorkflowResumePayload);
 
           return {
             status: "needs_input",
@@ -1322,7 +1348,7 @@ export async function runWorkflowFile({
           stepIndex: idx,
           stepType: "input",
           status: "succeeded",
-          metadata: { resultsSnapshot: cloneResults(results) },
+          metadata: { stepResult: results[step.id] },
           io: { jsonInput: subject, jsonOutput: parsed },
         });
         lastStepId = step.id;
@@ -1446,7 +1472,7 @@ export async function runWorkflowFile({
           stepIndex: idx,
           stepType: "for_each",
           status: "succeeded",
-          metadata: { resultsSnapshot: cloneResults(results) },
+          metadata: { stepResult: loopResult },
           io: { jsonOutput: iterationResults },
         });
         lastStepId = step.id;
@@ -1766,46 +1792,38 @@ export async function runWorkflowFile({
             subject: err.request.subject,
             maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
           });
-          const stateKey = await saveWorkflowResumeState(ctx.env, {
-            ...workflowResumeContext(checkpointRun),
-            runId: checkpointRun?.runId,
-            filePath: resolvedFilePath,
-            resumeAtIndex: idx,
-            steps: results,
-            args: resolvedArgs,
-            inputStepId: err.stepId,
-            inputKind: "pipeline_command",
-            inputSchema: err.request.responseSchema,
-            inputSubject: err.request.subject,
-            pipelineInput: err.pipelineInput,
-            createdAt: new Date().toISOString(),
-          });
-
-          if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
-          }
-
-          const resumeToken = encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "workflow-file",
-            stateKey,
-          } satisfies WorkflowResumePayload);
-
-          await appendCheckpoint({
+          const checkpointId = await appendCheckpoint({
             env: ctx.env,
             run: checkpointRun,
             stepId: err.stepId,
             stepIndex: idx,
             stepType: "pipeline_input",
             status: "waiting",
-            metadata: {
-              prompt: err.request.prompt,
-              stateKey,
-              resultsSnapshot: cloneResults(results),
+            metadata: { prompt: err.request.prompt },
+            resumeState: {
+              kind: "workflow-file",
+              ...workflowResumeContext(checkpointRun),
+              runId: checkpointRun?.runId,
+              filePath: resolvedFilePath,
+              resumeAtIndex: idx,
+              args: resolvedArgs,
+              inputStepId: err.stepId,
+              inputKind: "pipeline_command",
+              inputSchema: err.request.responseSchema,
+              inputSubject: err.request.subject,
+              pipelineInput: err.pipelineInput,
+              createdAt: new Date().toISOString(),
             },
             io: { jsonInput: err.request.subject },
           });
+
+          const resumeToken = encodeToken({
+            protocolVersion: 1,
+            v: 1,
+            kind: "workflow-file",
+            checkpointId: checkpointId ?? undefined,
+            jobId: checkpointRun?.jobId,
+          } satisfies WorkflowResumePayload);
 
           return {
             status: "needs_input",
@@ -1854,7 +1872,7 @@ export async function runWorkflowFile({
           status: "failed",
           finishedAt: new Date().toISOString(),
           error: { message: errorMessage },
-          metadata: { policy, resultsSnapshot: cloneResults(results) },
+          metadata: { policy, stepResult: results[step.id] },
         });
 
         if (policy === "skip_rest") {
@@ -1880,7 +1898,8 @@ export async function runWorkflowFile({
         status: "succeeded",
         finishedAt: new Date().toISOString(),
         metadata: {
-          resultsSnapshot: cloneResults(results),
+          stepResult: result,
+          branchResults: parallelBranchResults ?? undefined,
           retry: retryConfig.max > 1 ? retryConfig : undefined,
         },
         io: {
@@ -1893,7 +1912,6 @@ export async function runWorkflowFile({
       if (
         step.metadata &&
         checkpointRun?.jobId &&
-        checkpointsEnabled(ctx.env) &&
         (execution.kind === "shell" ||
           execution.kind === "pipeline" ||
           execution.kind === "workflow")
@@ -1911,8 +1929,8 @@ export async function runWorkflowFile({
         if (!metadataOutcome.ok) {
           // Metadata generation is a step sub-operation: on failure follow the
           // step's on_error policy so it can be stopped/replayed/rewound like any
-          // other step failure. The scoped `${step.id}.metadata` checkpoint is the
-          // anchor. The step's own succeeded checkpoint stays intact.
+          // other step failure. The scoped metadata checkpoint is the anchor.
+          // The step's own succeeded checkpoint stays intact.
           const metadataPolicy = step.on_error ?? "stop";
           if (metadataPolicy === "stop") {
             throw new Error(metadataOutcome.error ?? `metadata generation failed for step '${step.id}'`);
@@ -1936,37 +1954,7 @@ export async function runWorkflowFile({
         }
 
         if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
-          const stateKey = await saveWorkflowResumeState(ctx.env, {
-            ...workflowResumeContext(checkpointRun),
-            runId: checkpointRun?.runId,
-            filePath: resolvedFilePath,
-            resumeAtIndex: idx + 1,
-            steps: results,
-            args: resolvedArgs,
-            approvalStepId: step.id,
-            approvalIdentity,
-            createdAt: new Date().toISOString(),
-          });
-
-          let approvalId: string | null;
-          try {
-            approvalId = await createApprovalIndex({ env: ctx.env, stateKey });
-          } catch (err) {
-            await deleteStateJson({ env: ctx.env, key: stateKey }).catch(() => {});
-            throw err;
-          }
-
-          if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
-            await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
-          }
-
-          const resumeToken = encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "workflow-file",
-            stateKey,
-          } satisfies WorkflowResumePayload);
-
+          const approvalId = generateApprovalId();
           const approvalCheckpointId = await appendCheckpoint({
             env: ctx.env,
             run: checkpointRun,
@@ -1975,21 +1963,37 @@ export async function runWorkflowFile({
             stepType: "approval",
             status: "waiting",
             metadata: {
-              stateKey,
               approvalId,
               approval,
-              resultsSnapshot: cloneResults(results),
+            },
+            resumeState: {
+              kind: "workflow-file",
+              ...workflowResumeContext(checkpointRun),
+              runId: checkpointRun?.runId,
+              filePath: resolvedFilePath,
+              resumeAtIndex: idx + 1,
+              args: resolvedArgs,
+              approvalStepId: step.id,
+              approvalIdentity,
+              createdAt: new Date().toISOString(),
             },
             io: { jsonOutput: approval.items },
           });
 
-          if (approvalId) {
+          const resumeToken = encodeToken({
+            protocolVersion: 1,
+            v: 1,
+            kind: "workflow-file",
+            checkpointId: approvalCheckpointId ?? undefined,
+            jobId: checkpointRun?.jobId,
+          } satisfies WorkflowResumePayload);
+
+          if (approvalCheckpointId) {
             await createApprovalRecord({
               env: ctx.env,
               approvalId,
               run: checkpointRun,
               checkpointId: approvalCheckpointId,
-              stateKey,
               prompt: approval.prompt,
               metadata: approval,
               initiatedBy: approvalIdentity.initiatedBy ?? null,
@@ -2003,7 +2007,7 @@ export async function runWorkflowFile({
             requiresApproval: {
               ...approval,
               resumeToken,
-              ...(approvalId ? { approvalId } : null),
+              approvalId,
             },
           };
         }
@@ -2027,18 +2031,21 @@ export async function runWorkflowFile({
     }
 
     const output = lastStepId ? toOutputItems(results[lastStepId]) : [];
-    if (consumedResumeStateKey) {
-      await consumeWorkflowResumeState(ctx.env, consumedResumeStateKey);
+    if (consumedResumeCheckpointId) {
+      await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
     }
+    // Symmetric terminal bookend to `workflow-start`: one `workflow`/`succeeded`
+    // row closing the run. Per-step outputs already live on their own
+    // checkpoints, so no results snapshot is duplicated here.
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: "workflow-output",
+      stepId: "workflow-end",
       stepIndex: steps.length,
-      stepType: "workflow_result",
+      stepType: "workflow",
       status: "succeeded",
       finishedAt: new Date().toISOString(),
-      metadata: { lastStepId, resultsSnapshot: cloneResults(results) },
+      metadata: { lastStepId },
       io: { jsonOutput: output },
     });
     if (checkpointRun) {
@@ -2060,19 +2067,15 @@ export async function runWorkflowFile({
   }
 }
 
+// Consume a resume anchor by flipping its waiting gate checkpoint to `resumed`.
+// This is the single in-place status transition in the log (the gate lifecycle
+// resolution), replacing the old JSON-file deletion. Appending a fresh gate for
+// the same run also auto-flips prior waiting gates, so this is idempotent.
 async function consumeWorkflowResumeState(
   env: Record<string, string | undefined>,
-  stateKey: string,
+  checkpointId: string,
 ) {
-  const checkpoint = await findWaitingCheckpointByStateKey({ env, stateKey }).catch(() => null);
-  if (checkpoint) {
-    await updateCheckpointStatus({
-      env,
-      checkpointId: checkpoint.checkpointId,
-      status: "resumed",
-    });
-  }
-  await deleteStateJson({ env, key: stateKey });
+  await updateCheckpointStatus({ env, checkpointId, status: "resumed" }).catch(() => {});
 }
 
 async function wrapChildSuspension({
@@ -2102,8 +2105,10 @@ async function wrapChildSuspension({
     childResult.requiresApproval?.resumeToken ??
     childResult.requiresInput?.resumeToken ??
     childResult.paused?.resumeToken;
-  const childStateKey = childResumeToken ? decodeStateKeyFromResumeToken(childResumeToken) : null;
-  if (!childStateKey) {
+  const childCheckpointId = childResumeToken
+    ? decodeCheckpointIdFromResumeToken(childResumeToken)
+    : null;
+  if (!childCheckpointId) {
     throw new Error(`Workflow step ${childStepId} sub-workflow did not return a resume state`);
   }
 
@@ -2114,38 +2119,43 @@ async function wrapChildSuspension({
     await updateRun({ env: ctx.env, runId: parentRun.runId, status: "waiting" });
   }
 
-  await cleanupApprovalIndexByStateKey({ env: ctx.env, stateKey: childStateKey }).catch(() => {});
+  // The child's own gate stays as the executable anchor for the sub-workflow;
+  // the parent wraps it with a gate whose resume state points back to it via
+  // `activeChild.checkpointId`. The child's approval row is superseded by the
+  // parent gate that now fronts the wait.
   await resolveApprovalRecord({
     env: ctx.env,
-    stateKey: childStateKey,
+    checkpointId: childCheckpointId,
     status: "cancelled",
     decision: "superseded_by_parent",
   });
 
-  const parentStateKey = await saveWorkflowResumeState(ctx.env, {
+  const parentResumeState = {
+    kind: "workflow-file" as const,
     ...workflowResumeContext(parentRun),
     filePath: parentFilePath,
     resumeAtIndex: parentResumeAtIndex,
-    steps: parentResults,
     args: parentArgs,
     activeChild: {
       stepId: childStepId,
-      stateKey: childStateKey,
+      checkpointId: childCheckpointId,
       filePath: childFilePath,
       ...(childRun ? workflowResumeContext(childRun) : null),
     },
     createdAt: new Date().toISOString(),
-  });
+  };
 
-  const resumeToken = encodeToken({
-    protocolVersion: 1,
-    v: 1,
-    kind: "workflow-file",
-    stateKey: parentStateKey,
-  } satisfies WorkflowResumePayload);
+  const encodeParentToken = (checkpointId: string | null) =>
+    encodeToken({
+      protocolVersion: 1,
+      v: 1,
+      kind: "workflow-file",
+      checkpointId: checkpointId ?? undefined,
+      jobId: parentRun?.jobId,
+    } satisfies WorkflowResumePayload);
 
   if (childResult.status === "needs_approval" && childResult.requiresApproval) {
-    const approvalId = await createApprovalIndex({ env: ctx.env, stateKey: parentStateKey });
+    const approvalId = generateApprovalId();
     const approvalCheckpointId = await appendCheckpoint({
       env: ctx.env,
       run: parentRun,
@@ -2154,20 +2164,19 @@ async function wrapChildSuspension({
       stepType: "approval",
       status: "waiting",
       metadata: {
-        stateKey: parentStateKey,
         approvalId,
         nested: true,
         childStepId,
       },
+      resumeState: parentResumeState,
       io: { jsonOutput: childResult.requiresApproval.items },
     });
-    if (approvalId) {
+    if (approvalCheckpointId) {
       await createApprovalRecord({
         env: ctx.env,
         approvalId,
         run: childRun ?? parentRun,
         checkpointId: approvalCheckpointId,
-        stateKey: parentStateKey,
         prompt: childResult.requiresApproval.prompt,
         metadata: {
           ...childResult.requiresApproval,
@@ -2181,25 +2190,35 @@ async function wrapChildSuspension({
       output: [],
       requiresApproval: {
         ...childResult.requiresApproval,
-        resumeToken,
-        ...(approvalId ? { approvalId } : null),
+        resumeToken: encodeParentToken(approvalCheckpointId),
+        approvalId,
       },
     };
   }
 
   if (childResult.status === "needs_input" && childResult.requiresInput) {
+    const inputCheckpointId = await appendCheckpoint({
+      env: ctx.env,
+      run: parentRun,
+      stepId: childStepId,
+      stepIndex: parentResumeAtIndex,
+      stepType: "input",
+      status: "waiting",
+      metadata: { nested: true, childStepId },
+      resumeState: parentResumeState,
+    });
     return {
       status: "needs_input",
       output: [],
       requiresInput: {
         ...childResult.requiresInput,
-        resumeToken,
+        resumeToken: encodeParentToken(inputCheckpointId),
       },
     };
   }
 
   if (childResult.status === "paused" && childResult.paused) {
-    await appendCheckpoint({
+    const pauseCheckpointId = await appendCheckpoint({
       env: ctx.env,
       run: parentRun,
       stepId: childStepId,
@@ -2208,10 +2227,10 @@ async function wrapChildSuspension({
       status: "waiting",
       metadata: {
         reason: childResult.paused.reason,
-        stateKey: parentStateKey,
         nested: true,
         childStepId,
       },
+      resumeState: parentResumeState,
     });
     return {
       status: "paused",
@@ -2219,7 +2238,7 @@ async function wrapChildSuspension({
       paused: {
         ...childResult.paused,
         nextStepId: childStepId,
-        resumeToken,
+        resumeToken: encodeParentToken(pauseCheckpointId),
       },
     };
   }
@@ -2249,6 +2268,7 @@ async function applyStepMetadata({
   output: WorkflowStepResult;
 }): Promise<StepMetadataOutcome> {
   const meta = step.metadata as NormalizedWorkflowStepMetadata;
+  const stepPath = workflowSubStepPath(checkpointRun, step.id, "metadata");
   try {
     const updates: {
       title?: string;
@@ -2298,7 +2318,8 @@ async function applyStepMetadata({
       await appendCheckpoint({
         env: ctx.env,
         run: checkpointRun,
-        stepId: `${step.id}.metadata`,
+        stepId: 'metadata',
+        stepPath,
         stepIndex,
         stepType: "metadata",
         status: "failed",
@@ -2317,7 +2338,8 @@ async function applyStepMetadata({
       await appendCheckpoint({
         env: ctx.env,
         run: checkpointRun,
-        stepId: `${step.id}.metadata`,
+        stepId: 'metadata',
+        stepPath,
         stepIndex,
         stepType: "metadata",
         status: "succeeded",
@@ -2337,7 +2359,8 @@ async function applyStepMetadata({
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: `${step.id}.metadata`,
+      stepId: 'metadata',
+      stepPath,
       stepIndex,
       stepType: "metadata",
       status: "failed",
@@ -2417,10 +2440,18 @@ function workflowStepPath(run: WorkflowExecutionContext | undefined, stepId: str
   return run?.stepPathPrefix ? `${run.stepPathPrefix}.${stepId}` : stepId;
 }
 
-function decodeStateKeyFromResumeToken(token: string) {
+function workflowSubStepPath(
+  run: WorkflowExecutionContext | undefined,
+  stepId: string,
+  subStepId: string,
+) {
+  return `${workflowStepPath(run, stepId)}.${subStepId}`;
+}
+
+function decodeCheckpointIdFromResumeToken(token: string) {
   try {
-    const decoded = decodeToken(token) as { stateKey?: string } | null;
-    return typeof decoded?.stateKey === "string" ? decoded.stateKey : null;
+    const decoded = decodeToken(token) as { checkpointId?: string } | null;
+    return typeof decoded?.checkpointId === "string" ? decoded.checkpointId : null;
   } catch {
     return null;
   }
@@ -2717,24 +2748,17 @@ export function decodeWorkflowResumePayload(payload: unknown): WorkflowResumePay
   const data = payload as Partial<WorkflowResumePayload>;
   if (data.kind !== "workflow-file") return null;
   if (data.protocolVersion !== 1 || data.v !== 1) throw new Error("Unsupported token version");
-  if (data.stateKey && typeof data.stateKey === "string") {
+  // DB-anchored token: the waiting checkpoint id is the resume anchor.
+  if (data.checkpointId && typeof data.checkpointId === "string") {
     return data as WorkflowResumePayload;
   }
+  // Inline payload (rewind): carries its own folded steps + entry index.
   if (!data.filePath || typeof data.filePath !== "string")
     throw new Error("Invalid workflow token");
   if (typeof data.resumeAtIndex !== "number") throw new Error("Invalid workflow token");
   if (!data.steps || typeof data.steps !== "object") throw new Error("Invalid workflow token");
   if (!data.args || typeof data.args !== "object") throw new Error("Invalid workflow token");
   return data as WorkflowResumePayload;
-}
-
-async function saveWorkflowResumeState(
-  env: Record<string, string | undefined>,
-  state: WorkflowResumeState,
-) {
-  const stateKey = `workflow_resume_${randomUUID()}`;
-  await writeStateJson({ env, key: stateKey, value: state });
-  return stateKey;
 }
 
 function workflowResumeContext(run: WorkflowExecutionContext | undefined) {
@@ -2750,52 +2774,23 @@ function workflowResumeContext(run: WorkflowExecutionContext | undefined) {
     : {};
 }
 
-function alternateWorkflowResumeStateKey(stateKey: string): string | null {
-  if (stateKey.includes("workflow-resume_")) {
-    return stateKey.replace("workflow-resume_", "workflow_resume_");
-  }
-  if (stateKey.includes("workflow_resume_")) {
-    return stateKey.replace("workflow_resume_", "workflow-resume_");
-  }
-  return null;
-}
-
-async function resolveWorkflowResumeStateKey(
+/**
+ * Load a workflow resume context from its waiting checkpoint and derive the
+ * per-step results map by folding the run's log up to that gate. Replaces the
+ * former JSON resume-file store; the checkpoint's `resume_state_json` is the
+ * durable source of truth.
+ */
+async function loadWorkflowResumeStateFromCheckpoint(
   env: Record<string, string | undefined>,
-  stateKey: string,
-): Promise<string> {
-  const stored = await readStateJson({ env, key: stateKey });
-  if (stored && typeof stored === "object") {
-    return stateKey;
-  }
-  const altKey = alternateWorkflowResumeStateKey(stateKey);
-  if (!altKey) {
-    return stateKey;
-  }
-  const altStored = await readStateJson({ env, key: altKey });
-  if (altStored && typeof altStored === "object") {
-    return altKey;
-  }
-  return stateKey;
-}
-
-async function loadWorkflowResumeState(env: Record<string, string | undefined>, stateKey: string) {
-  let stored = await readStateJson({ env, key: stateKey });
-  if ((!stored || typeof stored !== "object") && typeof stateKey === "string") {
-    const altKey = alternateWorkflowResumeStateKey(stateKey);
-    if (altKey) {
-      stored = await readStateJson({ env, key: altKey });
-    }
-  }
-  if (!stored || typeof stored !== "object") {
-    throw new Error("Workflow resume state not found");
-  }
-  const data = stored as Partial<WorkflowResumeState>;
+  checkpointId: string,
+): Promise<WorkflowResumeState> {
+  const checkpoint = await getCheckpoint({ env, checkpointId });
+  if (!checkpoint) throw new Error("Workflow resume state not found");
+  const data = (checkpoint.resumeState ?? null) as Partial<WorkflowResumeState> | null;
+  if (!data || typeof data !== "object") throw new Error("Workflow resume state not found");
   if (!data.filePath || typeof data.filePath !== "string")
     throw new Error("Invalid workflow resume state");
   if (typeof data.resumeAtIndex !== "number") throw new Error("Invalid workflow resume state");
-  if (!data.steps || typeof data.steps !== "object")
-    throw new Error("Invalid workflow resume state");
   if (!data.args || typeof data.args !== "object") throw new Error("Invalid workflow resume state");
   if (
     data.inputKind !== undefined &&
@@ -2810,6 +2805,12 @@ async function loadWorkflowResumeState(env: Record<string, string | undefined>, 
   } else if (data.pipelineInput !== undefined) {
     throw new Error("Invalid workflow resume state");
   }
+  data.runId = data.runId ?? checkpoint.runId;
+  data.steps = await foldRunResults({
+    env,
+    runId: checkpoint.runId,
+    uptoSeq: checkpoint.seq,
+  });
   return data as WorkflowResumeState;
 }
 
@@ -3848,6 +3849,7 @@ async function runPipelineStep({
     cwd,
     signal: ctx.signal,
     llmAdapters: ctx.llmAdapters,
+    llmText: ctx.llmText,
     input: resume ? resume.pipelineInput.items : inputValueToPipelineItems(inputValue),
     requestInputEnabled,
     requestInputResume: resume

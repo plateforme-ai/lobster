@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import path, { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runPipeline } from "../src/runtime.js";
@@ -121,7 +121,8 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
     },
   ];
 
-  const stateDir = await mkdtemp(join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -189,7 +190,7 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
       env: {
         ...process.env,
         CLAWD_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_STATE_DIR: stateDir,
+        LOBSTER_DIR: path.dirname(stateDir),
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",
@@ -222,7 +223,7 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
       env: {
         ...process.env,
         CLAWD_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_STATE_DIR: stateDir,
+        LOBSTER_DIR: path.dirname(stateDir),
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",
@@ -242,7 +243,8 @@ test("email.triage --llm uses llm_task.invoke to draft replies (and can emit dra
 
 test("email.triage --llm honors OPENCLAW_URL (not just CLAWD_URL)", async () => {
   const registry = createDefaultRegistry();
-  const stateDir = await mkdtemp(join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const emails = [
     {
@@ -309,7 +311,7 @@ test("email.triage --llm honors OPENCLAW_URL (not just CLAWD_URL)", async () => 
       env: {
         ...process.env,
         OPENCLAW_URL: `http://127.0.0.1:${port}`,
-        LOBSTER_STATE_DIR: stateDir,
+        LOBSTER_DIR: path.dirname(stateDir),
         LLM_TASK_FORCE_REFRESH: "1",
       },
       mode: "tool",

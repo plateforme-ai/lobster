@@ -33,8 +33,7 @@ test("nested approval bubbles up through the tool envelope and resumes to comple
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({
@@ -84,8 +83,7 @@ test("nested approval reject through the tool envelope cancels the job and recor
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({

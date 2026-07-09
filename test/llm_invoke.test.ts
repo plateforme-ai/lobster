@@ -23,7 +23,8 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd, "llm.invoke should be registered");
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -69,7 +70,7 @@ test("llm.invoke auto-detects OpenClaw provider and normalizes output", async ()
         prompt: "Summarize",
       },
       ctx: baseCtx(
-        { OPENCLAW_URL: `http://localhost:${port}`, LOBSTER_STATE_DIR: stateDir },
+        { OPENCLAW_URL: `http://localhost:${port}`, LOBSTER_DIR: path.dirname(stateDir) },
         registry,
       ),
     } as any);
@@ -96,7 +97,8 @@ test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -148,7 +150,7 @@ test("llm.invoke defaults to local OpenClaw and sends artifacts as input", async
           LOBSTER_LLM_PROVIDER: undefined,
           LOBSTER_PI_LLM_ADAPTER_URL: undefined,
           LOBSTER_LLM_ADAPTER_URL: undefined,
-          LOBSTER_STATE_DIR: stateDir,
+          LOBSTER_DIR: path.dirname(stateDir),
         },
         registry,
       ),
@@ -174,7 +176,8 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -226,7 +229,7 @@ test("llm.invoke uses Pi adapter over local HTTP bridge", async () => {
         {
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: "anthropic/claude-sonnet-4-5",
-          LOBSTER_STATE_DIR: stateDir,
+          LOBSTER_DIR: path.dirname(stateDir),
         },
         registry,
       ),
@@ -252,7 +255,9 @@ test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
+
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
     let buf = "";
@@ -284,7 +289,7 @@ test("llm.invoke falls back to LOBSTER_JOB_MODEL", async () => {
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: undefined,
           LOBSTER_JOB_MODEL: "job/model",
-          LOBSTER_STATE_DIR: stateDir,
+          LOBSTER_DIR: path.dirname(stateDir),
         },
         registry,
       ),
@@ -303,7 +308,9 @@ test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => 
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm.invoke");
   assert.ok(cmd);
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
+
   const requestLog: any[] = [];
   const server = http.createServer((req, res) => {
     let buf = "";
@@ -335,7 +342,7 @@ test("llm.invoke prefers LOBSTER_LLM_MODEL over LOBSTER_JOB_MODEL", async () => 
           LOBSTER_PI_LLM_ADAPTER_URL: `http://127.0.0.1:${port}`,
           LOBSTER_LLM_MODEL: "llm/model",
           LOBSTER_JOB_MODEL: "job/model",
-          LOBSTER_STATE_DIR: stateDir,
+          LOBSTER_DIR: path.dirname(stateDir),
         },
         registry,
       ),

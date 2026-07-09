@@ -1,6 +1,6 @@
 import { promises as fsp } from "node:fs";
 
-import { defaultStateDir, ensureDirectory, keyToPath, writeFileAtomic } from "../../store/state.js";
+import { getStateDir, ensureDirectory, keyToPath, writeFileAtomic } from "../../store/helpers.js";
 
 export const stateGetCommand = {
   name: "state.get",
@@ -16,13 +16,13 @@ export const stateGetCommand = {
     sideEffects: ["reads_state"],
   },
   help() {
-    return `state.get — read a JSON value from Lobster state\n\nUsage:\n  state.get <key>\n\nEnv:\n  LOBSTER_STATE_DIR overrides storage directory\n`;
+    return `state.get — read a JSON value from Lobster state\n\nUsage:\n  state.get <key>\n\nEnv:\n  LOBSTER_DIR overrides storage directory\n`;
   },
   async run({ args, ctx }) {
     const key = args._[0];
     if (!key) throw new Error("state.get requires a key");
 
-    const stateDir = defaultStateDir(ctx.env);
+    const stateDir = getStateDir(ctx.env);
     const filePath = keyToPath(stateDir, key);
 
     let value = null;
@@ -66,7 +66,7 @@ export const stateSetCommand = {
 
     const value = items.length === 1 ? items[0] : items;
 
-    const stateDir = defaultStateDir(ctx.env);
+    const stateDir = getStateDir(ctx.env);
     const filePath = keyToPath(stateDir, key);
 
     await ensureDirectory(stateDir);

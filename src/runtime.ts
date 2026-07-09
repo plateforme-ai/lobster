@@ -1,5 +1,6 @@
 import { createJsonRenderer } from "./renderers/json.js";
 import type { WorkflowExecutionContext } from "./workflows/checkpoints.js";
+import type { LlmTextCompleter } from "./commands/stdlib/llm_client.js";
 import { appendCheckpoint } from "./store/runtime_store.js";
 import {
   InputRequestSuspension,
@@ -21,6 +22,7 @@ export async function runPipeline({
   input,
   cwd = undefined,
   llmAdapters = undefined,
+  llmText = undefined,
   signal = undefined,
   dryRun = false,
   requestInputResume = undefined,
@@ -37,6 +39,7 @@ export async function runPipeline({
   input?: any;
   cwd?: string | undefined;
   llmAdapters?: Record<string, any> | undefined;
+  llmText?: LlmTextCompleter | undefined;
   signal?: AbortSignal | undefined;
   dryRun?: boolean;
   requestInputResume?: CommandInputResume | undefined;
@@ -62,6 +65,7 @@ export async function runPipeline({
     mode,
     cwd,
     llmAdapters,
+    llmText,
     signal,
   };
 
@@ -241,7 +245,7 @@ export async function runPipeline({
     run: checkpointRun,
     stepId: "pipeline-output",
     stepIndex: pipeline.length,
-    stepType: "pipeline_result",
+    stepType: "pipeline_output",
     status: halted ? "waiting" : "succeeded",
     finishedAt: new Date().toISOString(),
     io: { jsonOutput: items },

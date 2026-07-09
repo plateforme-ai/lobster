@@ -15,8 +15,7 @@ async function runWorkflow(
     dryRun?: boolean;
   },
 ) {
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-step-timeout-"));
-  const stateDir = path.join(tmpDir, "state");
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-"));
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -30,7 +29,7 @@ async function runWorkflow(
       stdin: process.stdin,
       stdout: process.stdout,
       stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       signal: opts?.signal,
       dryRun: opts?.dryRun,
@@ -42,7 +41,7 @@ async function runWorkflow(
 }
 
 async function writeWorkflow(workflow: unknown) {
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-step-timeout-load-"));
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-"));
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
   return filePath;

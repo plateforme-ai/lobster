@@ -56,6 +56,20 @@ export type AdapterConfig = {
   sourceForProvider?: (provider: SupportedProvider) => string;
 };
 
+/**
+ * In-process text completion hook for internal, text-only generation
+ * (currently `metadata: auto`). Deliberately narrow: it takes a prompt and
+ * returns text, with no structured `data`/schema channel. A host that runs
+ * lobster embedded (e.g. the OpenClaw plugin) can provide this to keep internal
+ * text generation on the run's critical path (abortable, no gateway round-trip)
+ * without shimming a text-only adapter in front of structured `llm.invoke`.
+ */
+export type LlmTextCompleter = (params: {
+  prompt: string;
+  model?: string | null;
+  signal?: AbortSignal;
+}) => Promise<{ text: string | null } | null>;
+
 export function resolveProvider(
   args: any,
   env: any,
@@ -75,11 +89,10 @@ export function resolveProvider(
     throw new Error(`Unsupported llm provider: ${explicit}`);
   }
   if (defaultProvider) return defaultProvider;
-  const directAdapters =
-    ctx?.llmAdapters && typeof ctx.llmAdapters === "object"
-      ? Object.keys(ctx.llmAdapters).filter((key) => getDirectAdapter(ctx, key))
-      : [];
-  if (directAdapters.length === 1) return directAdapters[0];
+  // Resolution is explicit only. A registered direct adapter never becomes the
+  // implicit global default (that footgun let a single provider-keyed adapter
+  // silently capture every unqualified call); use --provider / LOBSTER_LLM_PROVIDER
+  // to select one, or configure a transport via env URL.
   if (String(env.LOBSTER_PI_LLM_ADAPTER_URL ?? "").trim()) return "pi";
   if (String(env.OPENCLAW_URL ?? env.CLAWD_URL ?? "").trim()) return "openclaw";
   if (String(env.LOBSTER_LLM_ADAPTER_URL ?? "").trim()) return "http";
@@ -121,8 +134,8 @@ export function resolveAdapter({
     return {
       provider,
       source: config.sourceForProvider?.(provider) ?? "openclaw",
-      async invoke({ payload }) {
-        return invokeOpenClawAdapter({ endpoint, token, payload, sessionKey, agent });
+      async invoke({ payload, signal }) {
+        return invokeOpenClawAdapter({ endpoint, token, payload, sessionKey, agent, signal });
       },
     };
   }
@@ -136,8 +149,8 @@ export function resolveAdapter({
     return {
       provider,
       source: config.sourceForProvider?.(provider) ?? "pi",
-      async invoke({ payload }) {
-        return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload });
+      async invoke({ payload, signal }) {
+        return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload, signal });
       },
     };
   }
@@ -150,8 +163,8 @@ export function resolveAdapter({
   return {
     provider,
     source: config.sourceForProvider?.(provider) ?? "http",
-    async invoke({ payload }) {
-      return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload });
+    async invoke({ payload, signal }) {
+      return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload, signal });
     },
   };
 }
@@ -181,12 +194,14 @@ async function invokeOpenClawAdapter({
   payload,
   sessionKey,
   agent,
+  signal,
 }: {
   endpoint: URL;
   token: string;
   payload: any;
   sessionKey?: string | null;
   agent?: string | null;
+  signal?: AbortSignal;
 }) {
   const args = toOpenClawToolArgs(payload);
   const res = await fetch(endpoint, {
@@ -202,6 +217,7 @@ async function invokeOpenClawAdapter({
       ...(sessionKey ? { sessionKey: String(sessionKey) } : null),
       ...(agent ? { agent: String(agent) } : null),
     }),
+    ...(signal ? { signal } : null),
   });
 
   const text = await res.text();
@@ -309,10 +325,12 @@ async function invokeHttpAdapter({
   endpoint,
   token,
   payload,
+  signal,
 }: {
   endpoint: URL;
   token: string;
   payload: any;
+  signal?: AbortSignal;
 }) {
   const res = await fetch(endpoint, {
     method: "POST",
@@ -321,6 +339,7 @@ async function invokeHttpAdapter({
       ...(token ? { authorization: `Bearer ${token}` } : null),
     },
     body: JSON.stringify(payload),
+    ...(signal ? { signal } : null),
   });
 
   const text = await res.text();
@@ -394,15 +413,15 @@ export async function invokeLlmText({
 }): Promise<string | null> {
   const args: any = {};
   if (model) args.model = model;
-  const provider = resolveProvider(args, env, null, ctx);
-  const adapter = resolveAdapter({ provider, env, args, config: { name: "metadata.auto" }, ctx });
+
+  // Prefer the host-provided in-process text completer when present. This keeps
+  // internal text generation (metadata: auto) in-process and abortable, and
+  // crucially does NOT route through `llmAdapters`, so a host can offer text
+  // completion without hijacking structured `llm.invoke` (which must reach a
+  // real transport/gateway for `output.data` + output-schema).
+  const textCompleter: LlmTextCompleter | undefined =
+    typeof ctx?.llmText === "function" ? ctx.llmText : undefined;
   const resolvedModel = resolveModel(args, env, false);
-  const payload: Record<string, any> = {
-    prompt,
-    artifacts: [],
-    artifactHashes: [],
-    ...(resolvedModel ? { model: resolvedModel } : null),
-  };
 
   const timeoutController = new AbortController();
   const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0;
@@ -433,6 +452,25 @@ export async function invokeLlmText({
   });
 
   try {
+    if (textCompleter) {
+      const result = await Promise.race([
+        textCompleter({ prompt, model: resolvedModel || model || null, signal: combinedSignal }),
+        abortPromise,
+      ]);
+      const text = typeof result?.text === "string" ? result.text.trim() : "";
+      return text || null;
+    }
+
+    // Fallback (standalone core, no in-process completer): resolve a transport
+    // adapter exactly like `llm.invoke` and read its text output.
+    const provider = resolveProvider(args, env, null, ctx);
+    const adapter = resolveAdapter({ provider, env, args, config: { name: "metadata.auto" }, ctx });
+    const payload: Record<string, any> = {
+      prompt,
+      artifacts: [],
+      artifactHashes: [],
+      ...(resolvedModel ? { model: resolvedModel } : null),
+    };
     const envelope = await Promise.race([
       adapter.invoke({ env, args, payload, signal: combinedSignal }),
       abortPromise,

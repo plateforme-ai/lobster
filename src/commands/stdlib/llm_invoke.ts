@@ -7,7 +7,7 @@ import {
   readStateJson,
   stableStringify,
   writeStateJson,
-} from "../../store/state.js";
+} from "../../store/helpers.js";
 import {
   readCacheEntry as readSqliteCacheEntry,
   writeCacheEntry as writeSqliteCacheEntry,
@@ -395,7 +395,7 @@ async function runLlmInvoke({
 
     let responseEnvelope: LlmResponseEnvelope;
     try {
-      responseEnvelope = await adapter.invoke({ env, args, payload });
+      responseEnvelope = await adapter.invoke({ env, args, payload, signal: ctx.signal });
     } catch (err: any) {
       throw new Error(`${config.name} request failed: ${err?.message ?? String(err)}`);
     }

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { promises as fsp } from "node:fs";
 
-import { defaultStateDir, ensureDirectory, writeFileAtomic } from "./state.js";
+import { getPrefixDir, ensureDirectory, writeFileAtomic } from "./helpers.js";
 import { serializeBounded, type SerializedPayload } from "./serialization.js";
 
 export type StoredPayload = {
@@ -13,7 +13,7 @@ export type StoredPayload = {
 };
 
 export function blobRoot(env: Record<string, string | undefined>) {
-  return path.join(defaultStateDir(env), "blobs", "sha256");
+  return path.join(getPrefixDir(env), "blobs", "sha256");
 }
 
 export async function writeContentAddressedBlob(params: {
@@ -37,7 +37,7 @@ export async function writeContentAddressedBlob(params: {
     sha256: hash,
     byteLength: params.payload.byteLength,
     contentType: params.contentType ?? "application/json",
-    storagePath: path.relative(defaultStateDir(params.env), filePath),
+    storagePath: path.relative(getPrefixDir(params.env), filePath),
     createdAt: new Date().toISOString(),
   };
 }

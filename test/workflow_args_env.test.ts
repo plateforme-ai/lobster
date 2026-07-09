@@ -23,11 +23,10 @@ test("workflow file exposes args as LOBSTER_ARG_* env vars (safe for quotes)", a
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-args-env-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
   const text = 'hello "world" $HOME `backticks` $(whoami)';
 
   const result = await runWorkflowFile({

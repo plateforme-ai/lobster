@@ -106,15 +106,14 @@ Expected: no `invalid response envelope` error.
 Checkpoint/cache validation:
 
 ```powershell
-$env:LOBSTER_CHECKPOINTS_ENABLED="true"
-$env:LOBSTER_STATE_DIR="$PWD\.lobster-state"
+$env:LOBSTER_DIR="$PWD\.lobster"
 lobster run --mode tool 'exec --json node -e "process.stdout.write(JSON.stringify({ok:true}))"'
 ```
 
 Expected: the tool envelope includes a `jobId`, `runId`, and `rootRunId`, and
-`$env:LOBSTER_STATE_DIR\lobster.db` is created. LLM cache entries are stored in
+`$env:LOBSTER_DIR\lobster.db` is created. LLM cache entries are stored in
 the same SQLite runtime store with TTL metadata; large payloads are stored under
-`$env:LOBSTER_STATE_DIR\blobs`.
+`$env:LOBSTER_DIR\blobs`.
 
 Nested workflow validation should show one `jobId` shared by root and child
 workflow invocations, with a distinct `runId` per invocation and stable

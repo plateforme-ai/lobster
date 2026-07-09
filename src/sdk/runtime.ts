@@ -128,6 +128,7 @@ export async function runPipelineInternal({
     mode: runtimeCtx.mode ?? "sdk",
     cwd: runtimeCtx.cwd,
     llmAdapters: runtimeCtx.llmAdapters,
+    llmText: runtimeCtx.llmText,
     signal: runtimeCtx.signal,
     input: normalizeSdkOutput(input),
     requestInputResume,

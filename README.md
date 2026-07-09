@@ -175,14 +175,15 @@ From this folder:
 
 ## Durable OpenClaw Runtime Store
 
-This package can persist OpenClaw-oriented run history in SQLite using Node's built-in `node:sqlite` runtime. Enable checkpoint capture with:
+This package persists OpenClaw-oriented run history in SQLite using Node's built-in `node:sqlite` runtime. Checkpoint capture is always on; the store location defaults to `<LOBSTER_DIR>/lobster.db` and can be overridden:
 
 ```txt
-LOBSTER_CHECKPOINTS_ENABLED=true
-LOBSTER_SQLITE_PATH=<LOBSTER_STATE_DIR>/lobster.db
+LOBSTER_DIR=~/.lobster
 ```
 
-The SQLite store owns durable job, run, checkpoint, approval, cache index, and blob metadata records. Jobs, workflow runs, checkpoints, and approval history are retained by default so OpenClaw can list jobs, inspect step history, rerun from the start, and rewind from supported checkpoints.
+The SQLite store is the single source of truth. It owns durable job, run, checkpoint, approval, cache index, and blob metadata records. The `checkpoints` table is an append-only log per run; resume and rewind state are derived by folding that log (no JSON resume/approval side files). Each waiting gate carries its executable resume context in `resume_state_json` on that checkpoint row, and resume tokens encode the waiting `checkpointId`. Jobs, workflow runs, checkpoints, and approval history are retained by default so OpenClaw can list jobs, inspect step history, rerun from the start, and rewind from supported checkpoints.
+
+The schema is a fresh v1 stamped via `PRAGMA user_version`; there is no in-place migration path, so a database created by an older, incompatible schema is discarded and recreated (existing jobs/checkpoints do not carry over).
 
 Runtime identifiers use these meanings:
 
@@ -198,7 +199,7 @@ Nested workflows share the same `jobId` and get separate child `runId` rows. Chi
 
 Current rewind support is strongest for linear root and child workflow checkpoints. Rewind inside `parallel`, `for_each`, or command-level pipeline suspension may return `replay_not_supported` until those replay boundaries are fully captured.
 
-Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are stored inline; larger cached inputs/outputs are written as content-addressed blobs under `LOBSTER_STATE_DIR/blobs/` and referenced from SQLite.
+Cache entries are stored as TTL-managed SQLite rows. Small cache payloads are stored inline; larger cached inputs/outputs are written as content-addressed blobs under `LOBSTER_DIR/blobs/` and referenced from SQLite.
 
 Useful cache settings:
 
@@ -251,13 +252,18 @@ A job can carry a reference to an external chat session (created by the OpenClaw
 
 When a job has a bound session/agent/model, in-workflow `openclaw.invoke` and `llm.invoke` (OpenClaw adapter) steps default to them so the call runs inside the job's chat session. Resolution precedence is **explicit step value > job's stored value > current default (no session)**. Core injects the job's values into the base step env (`LOBSTER_JOB_SESSION_KEY`, `LOBSTER_JOB_AGENT`, `LOBSTER_JOB_MODEL`) once per run, so per-step `--session-key`/`--agent`/`--model` (and an already-set ambient env value) still win. `llm.invoke` keeps `LOBSTER_LLM_MODEL` as the preferred LLM-specific default and falls back to `LOBSTER_JOB_MODEL` when no LLM-specific model is set. These are sent best-effort on the `/tools/invoke` body; gateways that do not yet honor them simply ignore the extra fields.
 
-#### In-process LLM adapters (`ctx.llmAdapters`)
+#### LLM routing: structured transport vs. in-process text hook
 
-LLM resolution (`resolveProvider`/`resolveAdapter`) checks `ctx.llmAdapters` before any HTTP transport: if the host provides a single direct adapter, or a step names it explicitly by provider key, the call runs through that adapter in-process instead of posting to `/tools/invoke`. The OpenClaw plugin uses this to route `llm.invoke` steps and `metadata: auto` generation through the host's in-process LLM (avoiding a nested gateway round-trip and honoring the run's `AbortSignal`). `pi`/`http` remain explicit HTTP opt-outs.
+Lobster splits LLM work into two purpose-scoped paths so structured output is never lost to a text-only shim:
+
+- **Structured `llm.invoke`** resolves a transport via `resolveProvider`/`resolveAdapter`: `--provider` → `LOBSTER_LLM_PROVIDER` → `config.defaultProvider` → env-URL transport → `openclaw`. This is the only path that returns structured `output.data` and honors `--output-schema`. The `openclaw` provider posts to the gateway `llm-task` transport (`/tools/invoke`); `pi`/`http` post to their adapter URLs. A host may inject a **structured** provider-keyed override via `ctx.llmAdapters[<provider>]`, which is used when that provider is selected explicitly (or by env). Resolution is explicit only — a registered adapter never becomes the implicit global default. The `AbortSignal` is threaded into the transport `fetch`, so gateway calls stay cancellable.
+- **Internal text-only generation** (currently `metadata: auto`) prefers an optional in-process text hook, `ctx.llmText({ prompt, model?, signal? }) => { text }`. When present it runs in-process (no gateway round-trip, cancellable via the run's `AbortSignal`); when absent (standalone core) it falls back to the same transport resolution as `llm.invoke`. `ctx.llmText` is text-only by design and never intercepts structured `llm.invoke`.
+
+The OpenClaw plugin provides `ctx.llmText` (wrapping the host's in-process `runtime.llm.complete`) for `metadata: auto`, and leaves structured `llm.invoke` on the gateway `llm-task` transport (using the inherited `OPENCLAW_URL`/`CLAWD_URL` env).
 
 #### Per-step job metadata (`metadata: auto`)
 
-A step's `metadata` can set the job `title`/`description`/custom keys, either literally or with `"auto"` (LLM-generated from the step input/output via the resolved LLM adapter). Metadata is applied after the step's own `succeeded` checkpoint and always emits a terminal scoped `metadata` checkpoint (`stepType: "metadata"`, id `${stepId}.metadata`): `succeeded` (carrying the resolved values, visible alongside `llm.invoke`/`pipeline-output` checkpoints) or `failed`. A failure is either a thrown error (`reason: "metadata_generation_failed"`) or requested `auto` output that came back empty (`reason: "metadata_generation_empty"` - no longer a silent no-op). Metadata generation follows the step's `on_error` policy, so a failure behaves like any step failure: with the default `on_error: stop` it halts the run at the scoped `${stepId}.metadata` checkpoint (replay/rewind-able); `on_error: continue` records the failed checkpoint and proceeds; `on_error: skip_rest` stops remaining steps while keeping prior output.
+A step's `metadata` can set the job `title`/`description`/custom keys, either literally or with `"auto"` (LLM-generated from the step input/output via the in-process `ctx.llmText` hook, falling back to the transport when the hook is absent). Metadata is applied after the step's own `succeeded` checkpoint and always emits a terminal scoped `metadata` checkpoint (`stepType: "metadata"`, id `${stepId}.metadata`): `succeeded` (carrying the resolved values, visible alongside `llm.invoke`/`pipeline-output` checkpoints) or `failed`. A failure is either a thrown error (`reason: "metadata_generation_failed"`) or requested `auto` output that came back empty (`reason: "metadata_generation_empty"` - no longer a silent no-op). Metadata generation follows the step's `on_error` policy, so a failure behaves like any step failure: with the default `on_error: stop` it halts the run at the scoped `${stepId}.metadata` checkpoint (replay/rewind-able); `on_error: continue` records the failed checkpoint and proceeds; `on_error: skip_rest` stops remaining steps while keeping prior output.
 
 ### Launching durable jobs from a command: `openclaw.lobster`
 
@@ -367,11 +373,13 @@ llm.invoke --provider openclaw --prompt 'Summarize this diff'
 llm.invoke --provider pi --prompt 'Summarize this diff'
 ```
 
-Provider resolution order:
+Provider resolution order (explicit only — a registered `ctx.llmAdapters` entry never becomes the implicit default):
 
 - `--provider`
 - `LOBSTER_LLM_PROVIDER`
-- auto-detect from environment
+- the pipeline's `config.defaultProvider`
+- env-URL transport (`LOBSTER_PI_LLM_ADAPTER_URL` → `pi`, `OPENCLAW_URL`/`CLAWD_URL` → `openclaw`, `LOBSTER_LLM_ADAPTER_URL` → `http`)
+- `openclaw` (default)
 
 Built-in providers today:
 

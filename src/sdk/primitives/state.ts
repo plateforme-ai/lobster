@@ -20,6 +20,8 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { getStateDir } from "../../store/helpers.js";
+
 /**
  * Rename a file with retry.
  * @param {string} from
@@ -64,7 +66,13 @@ async function writeFileAtomic(filePath, data) {
   let cleanup = true;
   try {
     try {
-      mode = (await fsp.stat(filePath)).mode & 0o777;
+      const stat = await fsp.stat(filePath);
+      if (stat.isDirectory()) {
+        const err = new Error(`Cannot replace directory with file: ${filePath}`);
+        (err as NodeJS.ErrnoException).code = "EISDIR";
+        throw err;
+      }
+      mode = stat.mode & 0o777;
     } catch (err) {
       if (err?.code !== "ENOENT") throw err;
     }
@@ -80,19 +88,6 @@ async function writeFileAtomic(filePath, data) {
     if (handle) await handle.close().catch(() => {});
     if (cleanup) await fsp.rm(tmpPath, { force: true }).catch(() => {});
   }
-}
-
-/**
- * Get the state directory
- * @param {Object} ctx
- * @returns {string}
- */
-function getStateDir(ctx) {
-  return (
-    ctx?.stateDir ||
-    (ctx?.env?.LOBSTER_STATE_DIR && String(ctx.env.LOBSTER_STATE_DIR).trim()) ||
-    path.join(os.homedir(), ".lobster", "state")
-  );
 }
 
 /**
@@ -130,7 +125,7 @@ export function stateGet(key) {
         // no-op
       }
 
-      const stateDir = getStateDir(ctx);
+      const stateDir = ctx.stateDir || getStateDir(ctx.env);
       const filePath = keyToPath(stateDir, key);
 
       let value = null;
@@ -175,7 +170,7 @@ export function stateSet(key) {
 
       const value = items.length === 1 ? items[0] : items;
 
-      const stateDir = getStateDir(ctx);
+      const stateDir = ctx.stateDir || getStateDir(ctx.env);
       const filePath = keyToPath(stateDir, key);
 
       await fsp.mkdir(stateDir, { recursive: true });
@@ -212,8 +207,8 @@ export const state = {
  * @param {Object} [ctx]
  * @returns {Promise<any>}
  */
-export async function readState(key, ctx = {}) {
-  const stateDir = getStateDir(ctx);
+export async function readState(key, ctx: any = {}) {
+  const stateDir = ctx.stateDir || getStateDir(ctx.env);
   const filePath = keyToPath(stateDir, key);
 
   try {
@@ -232,8 +227,8 @@ export async function readState(key, ctx = {}) {
  * @param {Object} [ctx]
  * @returns {Promise<void>}
  */
-export async function writeState(key, value, ctx = {}) {
-  const stateDir = getStateDir(ctx);
+export async function writeState(key, value, ctx: any = {}) {
+  const stateDir = ctx.stateDir || getStateDir(ctx.env);
   const filePath = keyToPath(stateDir, key);
 
   await fsp.mkdir(stateDir, { recursive: true });

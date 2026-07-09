@@ -1,19 +1,17 @@
-import { randomUUID } from "node:crypto";
-
 import { encodeToken } from "./token.js";
-import {
-  cleanupApprovalIndexByStateKey,
-  createApprovalIndex,
-  deleteStateJson,
-  readStateJson,
-  writeStateJson,
-} from "./store/state.js";
+import { generateApprovalId } from "./store/helpers.js";
 import { compileCached } from "./validation.js";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
 import type { WorkflowExecutionContext } from "./workflows/checkpoints.js";
-import { createApprovalRecord } from "./store/runtime_store.js";
+import {
+  appendCheckpoint,
+  createApprovalRecord,
+  getCheckpoint,
+  updateCheckpointStatus,
+} from "./store/runtime_store.js";
 
 export type PipelineResumeState = {
+  kind: "pipeline-resume";
   jobId?: string;
   runId?: string;
   rootRunId?: string;
@@ -104,12 +102,13 @@ export async function finalizePipelineToolRun(params: {
   env: Record<string, string | undefined>;
   pipeline: PipelineResumeState["pipeline"];
   output: PipelineRunOutput;
-  previousStateKey?: string;
+  previousCheckpointId?: string;
   checkpointRun?: WorkflowExecutionContext;
 }): Promise<PipelineToolRunResolution> {
   const { approval, inputRequest } = extractPipelineHalt(params.output);
   if (approval) {
-    const nextStateKey = await savePipelineResumeState(params.env, {
+    const resumeState: PipelineResumeState = {
+      kind: "pipeline-resume",
       pipeline: params.pipeline,
       jobId: params.checkpointRun?.jobId,
       runId: params.checkpointRun?.runId,
@@ -122,24 +121,20 @@ export async function finalizePipelineToolRun(params: {
       haltType: "approval_request",
       prompt: approval.prompt,
       createdAt: new Date().toISOString(),
+    };
+    const approvalId = generateApprovalId();
+    const checkpointId = await appendPipelineWaitCheckpoint(params.env, {
+      run: params.checkpointRun,
+      stepType: "approval",
+      resumeState,
+      metadata: { approvalId, prompt: approval.prompt },
     });
-    if (params.previousStateKey) {
-      await cleanupApprovalIndexByStateKey({ env: params.env, stateKey: params.previousStateKey });
-      await deleteStateJson({ env: params.env, key: params.previousStateKey });
-    }
-    let approvalId: string | null;
-    try {
-      approvalId = await createApprovalIndex({ env: params.env, stateKey: nextStateKey });
-    } catch (err) {
-      await deleteStateJson({ env: params.env, key: nextStateKey }).catch(() => {});
-      throw err;
-    }
-    if (approvalId) {
+    if (checkpointId) {
       await createApprovalRecord({
         env: params.env,
         approvalId,
         run: params.checkpointRun,
-        stateKey: nextStateKey,
+        checkpointId,
         prompt: approval.prompt,
         metadata: approval,
       });
@@ -148,7 +143,8 @@ export async function finalizePipelineToolRun(params: {
       protocolVersion: 1,
       v: 1,
       kind: "pipeline-resume",
-      stateKey: nextStateKey,
+      checkpointId,
+      ...(params.checkpointRun?.jobId ? { jobId: params.checkpointRun.jobId } : null),
     });
     return {
       status: "needs_approval",
@@ -156,7 +152,7 @@ export async function finalizePipelineToolRun(params: {
       requiresApproval: {
         ...approval,
         resumeToken,
-        ...(approvalId ? { approvalId } : null),
+        ...(checkpointId ? { approvalId } : null),
       },
       requiresInput: null,
     };
@@ -164,7 +160,8 @@ export async function finalizePipelineToolRun(params: {
 
   if (inputRequest) {
     const resumeMode = inputRequest.commandInput ? "same_stage" : "next_stage";
-    const nextStateKey = await savePipelineResumeState(params.env, {
+    const resumeState: PipelineResumeState = {
+      kind: "pipeline-resume",
       pipeline: params.pipeline,
       jobId: params.checkpointRun?.jobId,
       runId: params.checkpointRun?.runId,
@@ -183,16 +180,19 @@ export async function finalizePipelineToolRun(params: {
       prompt: inputRequest.prompt,
       ...(inputRequest.commandInput ? { commandInput: inputRequest.commandInput } : null),
       createdAt: new Date().toISOString(),
+    };
+    const checkpointId = await appendPipelineWaitCheckpoint(params.env, {
+      run: params.checkpointRun,
+      stepType: "pipeline_input",
+      resumeState,
+      metadata: { prompt: inputRequest.prompt },
     });
-    if (params.previousStateKey) {
-      await cleanupApprovalIndexByStateKey({ env: params.env, stateKey: params.previousStateKey });
-      await deleteStateJson({ env: params.env, key: params.previousStateKey });
-    }
     const resumeToken = encodeToken({
       protocolVersion: 1,
       v: 1,
       kind: "pipeline-resume",
-      stateKey: nextStateKey,
+      checkpointId,
+      ...(params.checkpointRun?.jobId ? { jobId: params.checkpointRun.jobId } : null),
     });
     return {
       status: "needs_input",
@@ -209,9 +209,12 @@ export async function finalizePipelineToolRun(params: {
     };
   }
 
-  if (params.previousStateKey) {
-    await cleanupApprovalIndexByStateKey({ env: params.env, stateKey: params.previousStateKey });
-    await deleteStateJson({ env: params.env, key: params.previousStateKey });
+  if (params.previousCheckpointId) {
+    await updateCheckpointStatus({
+      env: params.env,
+      checkpointId: params.previousCheckpointId,
+      status: "resumed",
+    });
   }
   return {
     status: "ok",
@@ -221,21 +224,42 @@ export async function finalizePipelineToolRun(params: {
   };
 }
 
-export async function savePipelineResumeState(
+/**
+ * Persist pipeline resume state on a fresh waiting checkpoint and return its id.
+ * Replaces the former JSON state-file dual-store: the checkpoint's
+ * `resume_state_json` is the single source of truth, and appending it auto-
+ * supersedes any prior waiting gate on the same run.
+ */
+async function appendPipelineWaitCheckpoint(
   env: Record<string, string | undefined>,
-  state: PipelineResumeState,
-) {
-  const stateKey = `pipeline_resume_${randomUUID()}`;
-  await writeStateJson({ env, key: stateKey, value: state });
-  return stateKey;
+  args: {
+    run?: WorkflowExecutionContext;
+    stepType: "approval" | "pipeline_input";
+    resumeState: PipelineResumeState;
+    metadata?: unknown;
+  },
+): Promise<string | null> {
+  return appendCheckpoint({
+    env,
+    run: args.run,
+    stepId: args.stepType === "approval" ? "pipeline-approval" : "pipeline-input",
+    stepType: args.stepType,
+    status: "waiting",
+    metadata: args.metadata,
+    resumeState: args.resumeState,
+  });
 }
 
 export async function loadPipelineResumeState(
   env: Record<string, string | undefined>,
-  stateKey: string,
+  checkpointId: string,
 ) {
-  const stored = await readStateJson({ env, key: stateKey });
-  if (!stored || typeof stored !== "object") {
+  const checkpoint = await getCheckpoint({ env, checkpointId });
+  const stored = checkpoint?.resumeState;
+  // Only a still-waiting gate is resumable. Once consumed (status flipped to
+  // "resumed") or superseded, the resume state is spent — re-resuming must fail
+  // rather than replay the run.
+  if (!stored || typeof stored !== "object" || checkpoint?.status !== "waiting") {
     throw new Error("Pipeline resume state not found");
   }
   const data = stored as Partial<PipelineResumeState>;

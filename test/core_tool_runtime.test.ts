@@ -37,12 +37,14 @@ function createDirectAdapter(resultText: string) {
 
 test("runToolRequest executes pipeline with injected llm adapter", async () => {
   const { adapter, calls } = createDirectAdapter('{"recommendation":"no jacket"}');
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-tool-runtime-run-"));
   const envelope = await runToolRequest({
     pipeline:
       'exec --json=true node -e "process.stdout.write(JSON.stringify({location:\'Phoenix\',temp_f:73.8}))" | llm.invoke --provider pi --prompt "Should I wear a jacket?" --disable-cache',
     ctx: {
       env: {
         ...process.env,
+        LOBSTER_DIR: tmpDir,
         LOBSTER_LLM_PROVIDER: "pi",
         LOBSTER_LLM_MODEL: "test/model",
       },
@@ -95,7 +97,7 @@ test("resumeToolRequest completes approval-gated workflow with injected llm adap
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_DIR: tmpDir,
     LOBSTER_LLM_PROVIDER: "pi",
     LOBSTER_LLM_MODEL: "test/model",
   };
@@ -171,7 +173,7 @@ test("runToolRequest/resumeToolRequest handles needs_input workflow pauses", asy
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({
@@ -195,20 +197,16 @@ test("runToolRequest/resumeToolRequest handles needs_input workflow pauses", asy
   assert.deepEqual(resumed.output, [{ decision: "approve", subject: "hello" }]);
 });
 
-function createMetadataAdapter() {
-  const calls: Array<Record<string, unknown>> = [];
+function createMetadataTextHook() {
+  const calls: Array<{ prompt: string; model?: string | null }> = [];
   return {
     calls,
-    adapter: {
-      source: "test-metadata",
-      async invoke({ payload }: { payload: Record<string, unknown> }) {
-        calls.push(payload);
-        const prompt = String(payload.prompt ?? "");
-        const text = /concise title/.test(prompt)
-          ? "Weather Summary"
-          : "The step summarized the current weather reading.";
-        return { ok: true, result: { output: { text, data: null, format: "text" } } };
-      },
+    llmText: async ({ prompt, model }: { prompt: string; model?: string | null; signal?: AbortSignal }) => {
+      calls.push({ prompt, model: model ?? null });
+      const text = /concise title/.test(prompt)
+        ? "Weather Summary"
+        : "The step summarized the current weather reading.";
+      return { text };
     },
   };
 }
@@ -239,23 +237,22 @@ async function writeAutoMetadataWorkflow(
   return filePath;
 }
 
-test("metadata:auto resolves in-process via ctx.llmAdapters, writes job title/description, and emits a succeeded metadata checkpoint", async () => {
-  const { adapter, calls } = createMetadataAdapter();
+test("metadata:auto resolves in-process via ctx.llmText, writes job title/description, and emits a succeeded metadata checkpoint", async () => {
+  const { llmText, calls } = createMetadataTextHook();
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-metadata-"));
   const filePath = await writeAutoMetadataWorkflow(tmpDir);
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
-  const ctx = { cwd: tmpDir, env, llmAdapters: { openclaw: adapter } };
+  const ctx = { cwd: tmpDir, env, llmText };
 
   const result = await runToolRequest({ filePath, ctx });
   assert.equal(result.ok, true);
   assert.equal(result.status, "ok");
   assert.ok(result.jobId);
 
-  // Resolution used the injected in-process adapter (one call per auto field), no HTTP.
+  // Resolution used the injected in-process text hook (one call per auto field), no adapter/HTTP.
   assert.equal(calls.length, 2);
 
   const job = await getJob({ jobId: result.jobId!, ctx });
@@ -267,26 +264,23 @@ test("metadata:auto resolves in-process via ctx.llmAdapters, writes job title/de
     (cp) => cp.stepType === "metadata" && cp.status === "succeeded",
   );
   assert.ok(metadataCheckpoint, "expected a succeeded metadata checkpoint");
-  assert.equal(metadataCheckpoint?.stepId, "summarize.metadata");
+  assert.equal(metadataCheckpoint?.stepId, "metadata");
+  assert.ok(metadataCheckpoint?.stepPath?.endsWith("summarize.metadata"));
 });
 
 test("metadata:auto failure follows the step's default on_error (stop) and errors the run", async () => {
-  const calls: Array<Record<string, unknown>> = [];
-  const failingAdapter = {
-    source: "test-metadata-failing",
-    async invoke({ payload }: { payload: Record<string, unknown> }) {
-      calls.push(payload);
-      throw new Error("llm exploded");
-    },
+  const calls: string[] = [];
+  const failingText = async ({ prompt }: { prompt: string }) => {
+    calls.push(prompt);
+    throw new Error("llm exploded");
   };
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-metadata-fail-"));
   const filePath = await writeAutoMetadataWorkflow(tmpDir);
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
-  const ctx = { cwd: tmpDir, env, llmAdapters: { openclaw: failingAdapter } };
+  const ctx = { cwd: tmpDir, env, llmText: failingText };
 
   const result = await runToolRequest({ filePath, ctx });
   // Default on_error is "stop": the metadata failure halts the run like any step failure.
@@ -296,22 +290,18 @@ test("metadata:auto failure follows the step's default on_error (stop) and error
 });
 
 test("metadata:auto failure with on_error continue records a scoped failed checkpoint and finishes the run", async () => {
-  const calls: Array<Record<string, unknown>> = [];
-  const failingAdapter = {
-    source: "test-metadata-failing",
-    async invoke({ payload }: { payload: Record<string, unknown> }) {
-      calls.push(payload);
-      throw new Error("llm exploded");
-    },
+  const calls: string[] = [];
+  const failingText = async ({ prompt }: { prompt: string }) => {
+    calls.push(prompt);
+    throw new Error("llm exploded");
   };
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-metadata-cont-"));
   const filePath = await writeAutoMetadataWorkflow(tmpDir, { onError: "continue" });
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
-  const ctx = { cwd: tmpDir, env, llmAdapters: { openclaw: failingAdapter } };
+  const ctx = { cwd: tmpDir, env, llmText: failingText };
 
   const result = await runToolRequest({ filePath, ctx });
   assert.equal(result.ok, true);
@@ -325,7 +315,8 @@ test("metadata:auto failure with on_error continue records a scoped failed check
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
   const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "summarize.metadata");
+  assert.equal(failed?.stepId, "metadata");
+  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
   assert.ok(
     !checkpoints.some((cp) => cp.stepType === "metadata" && cp.status === "succeeded"),
     "no succeeded metadata checkpoint should be recorded on failure",
@@ -333,22 +324,18 @@ test("metadata:auto failure with on_error continue records a scoped failed check
 });
 
 test("metadata:auto empty output is a failure (metadata_generation_empty), not a silent no-op", async () => {
-  const calls: Array<Record<string, unknown>> = [];
-  const emptyAdapter = {
-    source: "test-metadata-empty",
-    async invoke({ payload }: { payload: Record<string, unknown> }) {
-      calls.push(payload);
-      return { ok: true, result: { output: { text: "", data: null, format: "text" } } };
-    },
+  const calls: string[] = [];
+  const emptyText = async ({ prompt }: { prompt: string }) => {
+    calls.push(prompt);
+    return { text: "" };
   };
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-metadata-empty-"));
   const filePath = await writeAutoMetadataWorkflow(tmpDir, { onError: "continue" });
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
-  const ctx = { cwd: tmpDir, env, llmAdapters: { openclaw: emptyAdapter } };
+  const ctx = { cwd: tmpDir, env, llmText: emptyText };
 
   const result = await runToolRequest({ filePath, ctx });
   assert.equal(result.ok, true);
@@ -362,7 +349,8 @@ test("metadata:auto empty output is a failure (metadata_generation_empty), not a
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
   const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "summarize.metadata");
+  assert.equal(failed?.stepId, "metadata");
+  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
   assert.equal((failed?.metadata as { reason?: string } | undefined)?.reason, "metadata_generation_empty");
 });
 
@@ -406,19 +394,15 @@ test("invokeLlmText propagates an external abort signal immediately", async () =
 });
 
 test("metadata:auto timeout follows on_error continue and records a failed checkpoint", async () => {
-  const hangingAdapter = {
-    source: "test-metadata-hang",
-    invoke: () => new Promise<never>(() => {}),
-  };
+  const hangingText = () => new Promise<never>(() => {});
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-metadata-timeout-"));
   const filePath = await writeAutoMetadataWorkflow(tmpDir, { onError: "continue" });
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
     LOBSTER_METADATA_TIMEOUT_MS: "300",
   };
-  const ctx = { cwd: tmpDir, env, llmAdapters: { openclaw: hangingAdapter } };
+  const ctx = { cwd: tmpDir, env, llmText: hangingText };
 
   const result = await runToolRequest({ filePath, ctx });
   assert.equal(result.ok, true);
@@ -431,9 +415,126 @@ test("metadata:auto timeout follows on_error continue and records a failed check
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
   const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "summarize.metadata");
+  assert.equal(failed?.stepId, "metadata");
+  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
   assert.equal(
     (failed?.metadata as { reason?: string } | undefined)?.reason,
     "metadata_generation_failed",
   );
+});
+
+test("invokeLlmText prefers ctx.llmText and never touches llmAdapters", async () => {
+  const hookCalls: Array<{ prompt: string; model?: string | null }> = [];
+  const adapterCalls: unknown[] = [];
+  const ctx = {
+    llmText: async ({ prompt, model }: { prompt: string; model?: string | null }) => {
+      hookCalls.push({ prompt, model: model ?? null });
+      return { text: "hook result" };
+    },
+    // Present but must be ignored by the internal text path.
+    llmAdapters: {
+      openclaw: {
+        source: "should-not-run",
+        async invoke() {
+          adapterCalls.push(true);
+          return { ok: true, result: { output: { text: "adapter result", data: null } } };
+        },
+      },
+    },
+  };
+  const env = {};
+  const text = await invokeLlmText({ ctx, env, prompt: "summarize", model: "m/x", timeoutMs: 5_000 });
+  assert.equal(text, "hook result");
+  assert.equal(hookCalls.length, 1);
+  assert.equal(hookCalls[0]!.model, "m/x");
+  assert.equal(adapterCalls.length, 0);
+});
+
+test("nested-workflow condition passes when structured llm.invoke returns output.data (regression)", async () => {
+  // A structured provider-keyed transport override (like the gateway) returns
+  // output.data; the child workflow gets its args and its condition passes. This
+  // guards the regression where a text-only adapter nulled output.data and made
+  // every conditional nested workflow skip.
+  const structuredAdapter = {
+    source: "test-structured",
+    async invoke({ payload }: { payload: Record<string, unknown> }) {
+      return {
+        ok: true,
+        result: {
+          runId: "route_1",
+          prompt: payload.prompt,
+          status: "completed",
+          output: {
+            format: "json",
+            text: '{"run_child":true,"ticket_id":"T-202"}',
+            data: { run_child: true, ticket_id: "T-202" },
+          },
+        },
+      };
+    },
+  };
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-nested-route-"));
+  const childPath = path.join(tmpDir, "child.lobster");
+  await fsp.writeFile(
+    childPath,
+    JSON.stringify(
+      {
+        args: { ticket_id: { default: "" } },
+        steps: [
+          {
+            id: "handle",
+            command:
+              'node -e "process.stdout.write(JSON.stringify({handled: process.env.LOBSTER_ARG_TICKET_ID}))"',
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const parentPath = path.join(tmpDir, "parent.lobster");
+  await fsp.writeFile(
+    parentPath,
+    JSON.stringify(
+      {
+        steps: [
+          {
+            id: "route",
+            pipeline: 'llm.invoke --provider pi --prompt "route" --disable-cache',
+          },
+          {
+            id: "run-child",
+            workflow: "child.lobster",
+            workflow_args: { ticket_id: "$route.json.output.data.ticket_id" },
+            condition: "$route.json.output.data.run_child",
+          },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+
+  const env = {
+    ...process.env,
+    LOBSTER_DIR: tmpDir,
+    LOBSTER_LLM_PROVIDER: "pi",
+    LOBSTER_LLM_MODEL: "test/model",
+  };
+  const ctx = { cwd: tmpDir, env, llmAdapters: { pi: structuredAdapter } };
+
+  const result = await runToolRequest({ filePath: parentPath, ctx });
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "ok");
+  // The nested workflow ran (condition true) and received ticket_id from output.data.
+  assert.deepEqual(result.output, [{ handled: "T-202" }]);
+
+  const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
+  const childStep = checkpoints.find((cp) => cp.stepId === "run-child");
+  assert.ok(childStep, "expected a checkpoint for the nested workflow step");
+  assert.notEqual(childStep?.status, "skipped");
 });

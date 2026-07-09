@@ -50,8 +50,7 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   // Step mode pauses before the parent's first step. Advance through the parent
@@ -123,8 +122,7 @@ test("pipeline run records do not set workflowName", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pipeline-run-name-"));
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const result = await runToolRequest({ pipeline: "json", ctx: { cwd: tmpDir, env } });
@@ -158,8 +156,7 @@ test("runToolRequest persists job title, description, and metadata", async () =>
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const result = await runToolRequest({
@@ -194,8 +191,7 @@ test("runToolRequest rejects invalid metadata", async () => {
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const arrayResult = await runToolRequest({

@@ -23,7 +23,8 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd, "llm_task.invoke should be registered");
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -74,7 +75,7 @@ test("llm_task.invoke posts to /tools/invoke (clawd) and normalizes result", asy
         prompt: "Summarize",
       },
       ctx: baseCtx(
-        { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` },
+        { LOBSTER_DIR: path.dirname(stateDir), CLAWD_URL: `http://localhost:${port}` },
         registry,
       ),
     } as any);
@@ -108,7 +109,8 @@ test("llm_task.invoke retries when schema validation fails", async () => {
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   let calls = 0;
   const server = http.createServer((req, res) => {
@@ -148,7 +150,7 @@ test("llm_task.invoke retries when schema validation fails", async () => {
         "max-validation-retries": 2,
       },
       ctx: baseCtx(
-        { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` },
+        { LOBSTER_DIR: path.dirname(stateDir), CLAWD_URL: `http://localhost:${port}` },
         registry,
       ),
     } as any);
@@ -165,7 +167,9 @@ test("llm_task.invoke retries when schema validation fails", async () => {
 });
 
 test("llm_task.invoke persists to run state so resume skips remote call", async () => {
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
+
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -194,7 +198,7 @@ test("llm_task.invoke persists to run state so resume skips remote call", async 
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  const ctxEnv = { LOBSTER_STATE_DIR: stateDir };
+  const ctxEnv = { LOBSTER_DIR: path.dirname(stateDir) };
 
   try {
     const first = await cmd.run({
@@ -232,7 +236,9 @@ test("llm_task.invoke persists to run state so resume skips remote call", async 
 });
 
 test("llm_task.invoke reuses file cache when URL unavailable", async () => {
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
+
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -261,7 +267,7 @@ test("llm_task.invoke reuses file cache when URL unavailable", async () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  const ctxEnv = { LOBSTER_STATE_DIR: stateDir, CLAWD_URL: `http://localhost:${port}` };
+  const ctxEnv = { LOBSTER_DIR: path.dirname(stateDir), CLAWD_URL: `http://localhost:${port}` };
 
   try {
     const first = await cmd.run({
@@ -298,7 +304,9 @@ test("llm_task.invoke reuses file cache when URL unavailable", async () => {
 });
 
 test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites them", async () => {
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-expire-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
+
   const registry = createDefaultRegistry();
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
@@ -326,7 +334,7 @@ test("llm_task.invoke treats expired sqlite cache entries as misses and rewrites
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
   const ctxEnv = {
-    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_DIR: path.dirname(stateDir),
     LOBSTER_CACHE_TTL_DAYS: "0.000001",
     CLAWD_URL: `http://localhost:${port}`,
   };
@@ -376,7 +384,8 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
   const cmd = registry.get("llm_task.invoke");
   assert.ok(cmd);
 
-  const stateDir = await mkdtemp(path.join(tmpdir(), "lobster-state-"));
+  const tmpDir = await mkdtemp(path.join(tmpdir(), "lobster-"));
+  const stateDir = path.join(tmpDir, "state");
 
   const bodyLog: any[] = [];
   const server = http.createServer((req, res) => {
@@ -424,7 +433,7 @@ test("llm_task.invoke uses CLAWD_URL (/tools/invoke) without requiring --url/--m
         refresh: true,
       },
       ctx: baseCtx(
-        { CLAWD_URL: `http://localhost:${port}`, LOBSTER_STATE_DIR: stateDir },
+        { CLAWD_URL: `http://localhost:${port}`, LOBSTER_DIR: path.dirname(stateDir) },
         registry,
       ),
     } as any);

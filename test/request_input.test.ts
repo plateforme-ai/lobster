@@ -8,7 +8,31 @@ import path from "node:path";
 import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { runPipeline } from "../src/runtime.js";
 import { decodeResumeToken } from "../src/resume.js";
-import { readStateJson, writeStateJson } from "../src/store/state.js";
+import { getCheckpoint } from "../src/store/runtime_store.js";
+import { withRuntimeDb } from "../src/store/sqlite.js";
+
+// Pipeline resume state now lives on the waiting checkpoint's `resume_state_json`
+// column (keyed by checkpointId in the resume token) instead of a JSON file.
+async function loadResumeState(
+  env: Record<string, string | undefined>,
+  checkpointId: string,
+): Promise<any> {
+  const checkpoint = await getCheckpoint({ env, checkpointId });
+  return checkpoint?.resumeState ?? null;
+}
+
+async function saveResumeState(
+  env: Record<string, string | undefined>,
+  checkpointId: string,
+  value: unknown,
+): Promise<void> {
+  await withRuntimeDb(env, (db) => {
+    db.prepare("UPDATE checkpoints SET resume_state_json = ? WHERE checkpoint_id = ?").run(
+      JSON.stringify(value),
+      checkpointId,
+    );
+  });
+}
 
 const responseSchema = {
   type: "object",
@@ -43,7 +67,7 @@ function runCli(args: string[], env: Record<string, string | undefined>) {
 
 test("ctx.requestInput suspends and resumes the same tool command with state-backed metadata", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let calls = 0;
   const choose = {
     name: "choose",
@@ -64,8 +88,14 @@ test("ctx.requestInput suspends and resumes the same tool command with state-bac
   assert.ok(first.requiresInput?.resumeToken);
 
   const payload = decodeResumeToken(first.requiresInput.resumeToken);
-  assert.deepEqual(Object.keys(payload).sort(), ["kind", "protocolVersion", "stateKey", "v"]);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  assert.deepEqual(Object.keys(payload).sort(), [
+    "checkpointId",
+    "jobId",
+    "kind",
+    "protocolVersion",
+    "v",
+  ]);
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   assert.equal(state.resumeMode, "same_stage");
   assert.equal(state.resumeAtIndex, 0);
   assert.deepEqual(state.items, []);
@@ -82,7 +112,7 @@ test("ctx.requestInput suspends and resumes the same tool command with state-bac
 
 test("ctx.requestInput carries bounded prior responses across multiple suspensions", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-chain-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const choose = {
     name: "choose",
     async run({ ctx }: any) {
@@ -107,7 +137,7 @@ test("ctx.requestInput carries bounded prior responses across multiple suspensio
   });
   assert.equal(second.status, "needs_input");
   const payload = decodeResumeToken(second.requiresInput!.resumeToken);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   assert.equal(state.commandInput.pending.requestIndex, 1);
   assert.equal(state.commandInput.history.length, 1);
 
@@ -122,7 +152,7 @@ test("ctx.requestInput carries bounded prior responses across multiple suspensio
 
 test("ctx.requestInput does not leak consumed suspended state into later requests", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-state-leak-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const choose = {
     name: "choose",
     async run({ ctx }: any) {
@@ -152,7 +182,7 @@ test("ctx.requestInput does not leak consumed suspended state into later request
   });
   assert.equal(second.status, "needs_input");
   const payload = decodeResumeToken(second.requiresInput!.resumeToken);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   assert.equal(state.commandInput.pending.suspendedState, undefined);
 });
 
@@ -163,7 +193,7 @@ test("ctx.requestInput snapshots response history before command mutation", asyn
     required: ["count"],
   };
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-response-copy-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const choose = {
     name: "choose",
     async run({ ctx }: any) {
@@ -199,7 +229,7 @@ test("ctx.requestInput snapshots response history before command mutation", asyn
 
 test("ctx.requestInput rejects a response rebound to changed request metadata", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-rebind-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let prompt = "Pick one";
   const choose = {
     name: "choose",
@@ -227,7 +257,7 @@ test("ctx.requestInput rejects a response rebound to changed request metadata", 
 
 test("malformed same-stage requestInput state is rejected before resume execution", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-corrupt-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let calls = 0;
   const choose = {
     name: "choose",
@@ -243,9 +273,9 @@ test("malformed same-stage requestInput state is rejected before resume executio
     ctx: { env, registry: registry({ choose }) },
   });
   const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   state.commandInput.pending.requestIndex = 5;
-  await writeStateJson({ env, key: payload.stateKey, value: state });
+  await saveResumeState(env, payload.checkpointId, state);
 
   const resumed = await resumeToolRequest({
     token: first.requiresInput!.resumeToken,
@@ -259,7 +289,7 @@ test("malformed same-stage requestInput state is rejected before resume executio
 
 test("unconsumed requestInput resume fails before downstream side effects", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-side-effect-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let calls = 0;
   let sideEffects = 0;
   const choose = {
@@ -295,7 +325,7 @@ test("unconsumed requestInput resume fails before downstream side effects", asyn
 
 test("unconsumed requestInput resume wins over rerun errors", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-rerun-error-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let calls = 0;
   const choose = {
     name: "choose",
@@ -322,7 +352,7 @@ test("unconsumed requestInput resume wins over rerun errors", async () => {
 
 test("unconsumed requestInput resume wins over lazy output errors", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-lazy-error-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let calls = 0;
   const choose = {
     name: "choose",
@@ -361,7 +391,7 @@ test("unconsumed requestInput resume wins over lazy output errors", async () => 
 
 test("consumed requestInput resume token is invalid after downstream failure", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-consumed-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let sideEffects = 0;
   const choose = {
     name: "choose",
@@ -720,7 +750,7 @@ test("ctx.requestInput accepts compact suspended state without buffering unread 
 
 test("ctx.requestInput restores compact suspended state before lazy input is read on resume", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-restore-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   let produced = 0;
   let chooseRuns = 0;
   const produce = {
@@ -762,7 +792,7 @@ test("ctx.requestInput restores compact suspended state before lazy input is rea
   assert.equal(first.status, "needs_input");
   assert.equal(produced, 1);
   const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   assert.equal(state.resumeMode, "same_stage");
   assert.equal(state.resumeAtIndex, 1);
   assert.deepEqual(state.items, []);
@@ -826,7 +856,7 @@ test("ctx.requestInput cleanup accepts direct async iterator return results", as
 
 test("ctx.requestInput rejects suspension after command stdout output", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-output-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const choose = {
     name: "choose",
     async run({ ctx }: any) {
@@ -849,7 +879,7 @@ test("ctx.requestInput rejects suspension after command stdout output", async ()
 
 test("ctx.requestInput rejects suspension after an earlier stage wrote stdout", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-prior-output-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const write = {
     name: "write",
     async run({ ctx }: any) {
@@ -878,7 +908,7 @@ test("ctx.requestInput rejects suspension after an earlier stage wrote stdout", 
 
 test("ctx.requestInput suspends from terminal lazy output", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-lazy-output-"));
-  const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+  const env = { LOBSTER_DIR: tmpDir };
   const lazy = {
     name: "lazy",
     async run({ ctx }: any) {
@@ -897,7 +927,7 @@ test("ctx.requestInput suspends from terminal lazy output", async () => {
   });
   assert.equal(first.status, "needs_input");
   const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-  const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+  const state = (await loadResumeState(env, payload.checkpointId)) as any;
   assert.equal(state.resumeAtIndex, 0);
 
   const resumed = await resumeToolRequest({
@@ -972,7 +1002,7 @@ test("built CLI ask restores subject state across processes", async () => {
   });
   const pipeline = `exec --json=true node -e "process.stdout.write(JSON.stringify([{draft:'hello'}]))" | ask --subject-from-stdin --prompt "Review?" --schema ${JSON.stringify(schema)} | pick decision`;
 
-  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_STATE_DIR: stateDir });
+  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_DIR: path.dirname(stateDir) });
   assert.equal(first.status, 0, first.stderr);
   const firstJson = JSON.parse(first.stdout);
   assert.equal(firstJson.status, "needs_input");
@@ -980,10 +1010,10 @@ test("built CLI ask restores subject state across processes", async () => {
   assert.deepEqual(firstJson.requiresInput.subject, { text: '{"draft":"hello"}' });
 
   const payload = decodeResumeToken(firstJson.requiresInput.resumeToken);
-  const state = (await readStateJson({
-    env: { LOBSTER_STATE_DIR: stateDir },
-    key: payload.stateKey,
-  })) as any;
+  const state = (await loadResumeState(
+    { LOBSTER_DIR: path.dirname(stateDir) },
+    payload.checkpointId,
+  )) as any;
   assert.equal(state.resumeMode, "same_stage");
   assert.equal(state.resumeAtIndex, 1);
   assert.deepEqual(state.items, []);
@@ -1000,7 +1030,7 @@ test("built CLI ask restores subject state across processes", async () => {
       "--response-json",
       '{"decision":"approve"}',
     ],
-    { LOBSTER_STATE_DIR: stateDir },
+    { LOBSTER_DIR: path.dirname(stateDir) },
   );
   assert.equal(resumed.status, 0, resumed.stderr);
   const resumedJson = JSON.parse(resumed.stdout);

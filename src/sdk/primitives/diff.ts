@@ -17,20 +17,7 @@
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureDirectory, isJsonSyntaxError, writeFileAtomic } from "../../store/state.js";
-
-/**
- * Get the state directory
- * @param {Object} ctx
- * @returns {string}
- */
-function getStateDir(ctx) {
-  return (
-    ctx?.stateDir ||
-    (ctx?.env?.LOBSTER_STATE_DIR && String(ctx.env.LOBSTER_STATE_DIR).trim()) ||
-    path.join(os.homedir(), ".lobster", "state")
-  );
-}
+import { getStateDir, ensureDirectory, isJsonSyntaxError, writeFileAtomic } from "../../store/helpers.js";
 
 /**
  * Convert a key to a safe file path
@@ -95,7 +82,7 @@ export function diffLast(key, options: any = {}) {
 
       const value = items.length === 1 ? items[0] : items;
 
-      const stateDir = getStateDir(ctx);
+      const stateDir = ctx.stateDir || getStateDir(ctx.env);
       const filePath = keyToPath(stateDir, key);
 
       // Read previous value
@@ -150,8 +137,8 @@ export function diffLast(key, options: any = {}) {
  * @param {Object} [ctx]
  * @returns {Promise<{before: any, after: any, changed: boolean}>}
  */
-export async function diffAndStoreValue(key, value, ctx = {}) {
-  const stateDir = getStateDir(ctx);
+export async function diffAndStoreValue(key, value, ctx: any = {}) {
+  const stateDir = ctx.stateDir || getStateDir(ctx.env);
   const filePath = keyToPath(stateDir, key);
 
   // Read previous value

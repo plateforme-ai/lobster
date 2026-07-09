@@ -22,7 +22,7 @@ async function runWorkflow(workflow: unknown) {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr: process.stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
     },
   });

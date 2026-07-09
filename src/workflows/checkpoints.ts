@@ -7,7 +7,6 @@ export type JobWaitSnapshot = {
   checkpointId?: string | null;
   stepId?: string | null;
   stepType?: string | null;
-  stateKey?: string | null;
   approvalId?: string | null;
   nextStepId?: string | null;
   reason?: "pause_requested" | "step_mode" | null;
@@ -94,22 +93,20 @@ export type CheckpointStatus =
 
 export type CheckpointRecord = {
   checkpointId: string;
+  seq: number;
   jobId: string;
   runId: string;
   rootRunId: string;
   parentRunId?: string | null;
-  parentCheckpointId?: string | null;
   stepId?: string | null;
   stepPath?: string | null;
   stepIndex?: number | null;
   stepType?: string | null;
-  attempt?: number | null;
   status: CheckpointStatus;
   startedAt?: string | null;
   finishedAt?: string | null;
-  condition?: unknown;
-  dependencyEdges?: unknown;
   metadata?: unknown;
+  resumeState?: unknown;
   error?: unknown;
   exitStatus?: number | null;
   createdAt: string;
@@ -134,7 +131,6 @@ export type ApprovalRecord = {
   parentRunId?: string | null;
   checkpointId?: string | null;
   stepPath?: string | null;
-  stateKey?: string | null;
   status: ApprovalStatus;
   prompt?: string | null;
   metadata?: unknown;

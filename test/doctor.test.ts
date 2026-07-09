@@ -7,7 +7,7 @@ test("doctor returns tool-mode ok with version", () => {
   const bin = path.join(process.cwd(), "bin", "lobster.js");
   const res = spawnSync("node", [bin, "doctor"], {
     encoding: "utf8",
-    env: { ...process.env, LOBSTER_STATE_DIR: path.join(process.cwd(), ".tmp-test-state") },
+    env: { ...process.env, LOBSTER_DIR: path.join(process.cwd(), ".tmp-test-state") },
   });
   assert.equal(res.status, 0);
   const out = JSON.parse(res.stdout);

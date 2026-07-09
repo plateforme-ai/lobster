@@ -3,15 +3,9 @@ import path from "node:path";
 
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../parser.js";
-import { decodeResumeToken, kindFromStateKey } from "../resume.js";
+import { decodeResumeToken } from "../resume.js";
 import { runPipeline } from "../runtime.js";
 import { encodeToken } from "../token.js";
-import {
-  deleteStateJson,
-  deleteApprovalId,
-  findStateKeyByApprovalId,
-  cleanupApprovalIndexByStateKey,
-} from "../store/state.js";
 import {
   WorkflowResumeArgumentError,
   readWorkflowDescription,
@@ -25,11 +19,12 @@ import {
 } from "../pipeline_resume_state.js";
 import {
   cancelSupersededRuns,
-  checkpointsEnabled,
   createCheckpointRun,
   createRewindRun,
   createRun,
-  findHeadResumeStateKey,
+  findCheckpointIdByApprovalId,
+  findHeadResumeCheckpoint,
+  foldRunResults,
   resetJobControlDesired,
   getCheckpoint as getStoredCheckpoint,
   getJob as getStoredJob,
@@ -45,9 +40,11 @@ import {
   recordTerminalCancel,
   setJobExternalSession as setStoredJobExternalSession,
   setRunControl,
+  updateCheckpointStatus,
   updateRun,
 } from "../store/runtime_store.js";
 import type { WorkflowExecutionContext } from "../workflows/checkpoints.js";
+import type { LlmTextCompleter } from "../commands/stdlib/llm_client.js";
 
 type ToolRunContext = {
   cwd?: string;
@@ -59,6 +56,7 @@ type ToolRunContext = {
   signal?: AbortSignal;
   registry?: any;
   llmAdapters?: Record<string, any>;
+  llmText?: LlmTextCompleter;
 };
 
 type PausedInfo = {
@@ -272,6 +270,7 @@ export async function runToolRequest({
       mode: "tool",
       cwd: runtime.cwd,
       llmAdapters: runtime.llmAdapters,
+      llmText: runtime.llmText,
       signal: runtime.signal,
       checkpointRun,
     });
@@ -327,31 +326,25 @@ export async function resumeToolRequest({
   let resolvedApprovalId = approvalId ?? null;
 
   try {
-    // Resolve short approval ID to token if provided
+    // Resolve short approval ID / job / run to the waiting checkpoint token.
     let resolvedToken: string;
     if (approvalId) {
-      const stateKey = await findStateKeyByApprovalId({ env: runtime.env, approvalId });
-      if (!stateKey) {
+      const checkpointId = await findCheckpointIdByApprovalId({ env: runtime.env, approvalId });
+      if (!checkpointId) {
         return errorEnvelope("parse_error", `Approval ID "${approvalId}" not found or expired`);
       }
-      const kind = kindFromStateKey(stateKey);
-      resolvedToken = encodeToken({
-        protocolVersion: 1,
-        v: 1,
-        kind,
-        stateKey,
-      });
+      resolvedToken = await encodeCheckpointResumeToken(runtime.env, checkpointId);
     } else if (token) {
       resolvedToken = token;
     } else if (jobId || runId) {
       const isContinueIntent = approved === undefined && response === undefined;
-      const stateKey = await findHeadResumeStateKey({
+      const head = await findHeadResumeCheckpoint({
         env: runtime.env,
         jobId,
         runId,
         allowedStepTypes: isContinueIntent ? ["pause"] : undefined,
       });
-      if (!stateKey) {
+      if (!head) {
         const wait = isContinueIntent
           ? await resolveJobHeadWait({ env: runtime.env, jobId, runId })
           : null;
@@ -365,8 +358,9 @@ export async function resumeToolRequest({
       resolvedToken = encodeToken({
         protocolVersion: 1,
         v: 1,
-        kind: kindFromStateKey(stateKey),
-        stateKey,
+        kind: head.resumeKind,
+        checkpointId: head.checkpointId,
+        ...(jobId ? { jobId } : null),
       });
     } else {
       return errorEnvelope("parse_error", "resume requires token, approvalId, jobId, or runId");
@@ -376,19 +370,10 @@ export async function resumeToolRequest({
     return errorEnvelope("parse_error", err?.message ?? String(err));
   }
 
-  // Helper: clean up approval ID index after successful use
-  const cleanupIndex = async () => {
-    if (resolvedApprovalId) {
-      await deleteApprovalId({ env: runtime.env, approvalId: resolvedApprovalId });
-    } else if (payload?.stateKey) {
-      await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey: payload.stateKey });
-    }
-  };
-
   if (payload.kind === "workflow-file") {
     try {
-      const loadedRun = payload.stateKey
-        ? await loadWorkflowRunContext(runtime.env, payload.stateKey)
+      const loadedRun = payload.checkpointId
+        ? await loadWorkflowRunContext(runtime.env, payload.checkpointId)
         : undefined;
       const output = await runWorkflowFile({
         filePath: payload.filePath,
@@ -431,11 +416,10 @@ export async function resumeToolRequest({
           ...pausedExtra(output),
         });
       }
-      await cleanupIndex();
       await resolveApprovalRecord({
         env: runtime.env,
         approvalId: resolvedApprovalId,
-        stateKey: payload.stateKey,
+        checkpointId: payload.checkpointId,
         status:
           approved === false
             ? "rejected"
@@ -463,7 +447,7 @@ export async function resumeToolRequest({
 
   let resumeState;
   try {
-    resumeState = await loadPipelineResumeState(runtime.env, payload.stateKey);
+    resumeState = await loadPipelineResumeState(runtime.env, payload.checkpointId);
   } catch (err: any) {
     return errorEnvelope("runtime_error", err?.message ?? String(err));
   }
@@ -497,16 +481,21 @@ export async function resumeToolRequest({
       );
     }
     if (approved !== true) {
-      await cleanupIndex();
-      await deleteStateJson({ env: runtime.env, key: payload.stateKey });
       await resolveApprovalRecord({
         env: runtime.env,
         approvalId: resolvedApprovalId,
-        stateKey: payload.stateKey,
+        checkpointId: payload.checkpointId,
         status: "rejected",
         decision: "reject",
         approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
       });
+      if (payload.checkpointId) {
+        await updateCheckpointStatus({
+          env: runtime.env,
+          checkpointId: payload.checkpointId,
+          status: "resumed",
+        });
+      }
       if (pipelineCheckpointRun?.runId) {
         await recordTerminalCancel({
           env: runtime.env,
@@ -533,8 +522,13 @@ export async function resumeToolRequest({
         state: resumeState.commandInput!,
         response,
         onConsumed: async () => {
-          await cleanupIndex();
-          await deleteStateJson({ env: runtime.env, key: payload.stateKey });
+          if (payload.checkpointId) {
+            await updateCheckpointStatus({
+              env: runtime.env,
+              checkpointId: payload.checkpointId,
+              status: "resumed",
+            });
+          }
         },
       }
     : undefined;
@@ -550,17 +544,17 @@ export async function resumeToolRequest({
       mode: "tool",
       cwd: runtime.cwd,
       llmAdapters: runtime.llmAdapters,
+      llmText: runtime.llmText,
       signal: runtime.signal,
       input,
       requestInputResume,
       checkpointRun: pipelineCheckpointRun,
     });
 
-    await cleanupIndex();
     await resolveApprovalRecord({
       env: runtime.env,
       approvalId: resolvedApprovalId,
-      stateKey: payload.stateKey,
+      checkpointId: payload.checkpointId,
       status: approved === true ? "approved" : "cancelled",
       decision: approved === true ? "approve" : response !== undefined ? "response" : null,
       approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
@@ -569,7 +563,7 @@ export async function resumeToolRequest({
       env: runtime.env,
       pipeline: remaining,
       output,
-      previousStateKey: payload.stateKey,
+      previousCheckpointId: payload.checkpointId,
       checkpointRun: pipelineCheckpointRun,
     });
     await maybeUpdateRun(
@@ -602,6 +596,7 @@ export function createToolContext(ctx: ToolRunContext = {}) {
     signal: ctx.signal,
     registry: ctx.registry ?? createDefaultRegistry(),
     llmAdapters: ctx.llmAdapters,
+    llmText: ctx.llmText,
   };
 }
 
@@ -858,17 +853,24 @@ export async function rewindToolRequest({
   if (targetRun.sourceType !== "workflow_file" || !targetRun.workflowFile) {
     return errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only");
   }
-  const metadata = checkpoint.metadata as any;
-  if (!metadata?.resultsSnapshot || typeof checkpoint.stepIndex !== "number") {
+  if (typeof checkpoint.stepIndex !== "number") {
     return errorEnvelope(
       "replay_not_supported",
       "Checkpoint does not contain workflow replay state",
     );
   }
 
+  // Fold the run's append-only log up to (and including) this checkpoint into
+  // the per-step results map. The log is the single source of truth — there is
+  // no per-checkpoint snapshot to read.
+  let steps = await foldRunResults({
+    env: runtime.env,
+    runId: checkpoint.runId,
+    uptoSeq: checkpoint.seq,
+  });
+
   // Apply per-step input overrides into the replay snapshot so downstream steps
   // and conditions observe the edited prior outputs.
-  let steps = metadata.resultsSnapshot as Record<string, any>;
   if (inputOverride && Object.keys(inputOverride).length > 0) {
     steps = { ...steps };
     for (const [stepId, patch] of Object.entries(inputOverride)) {
@@ -1022,18 +1024,10 @@ export async function cancelRun(params: {
       await resolveApprovalRecord({
         env: runtime.env,
         approvalId: wait.approvalId,
-        stateKey: wait.stateKey,
+        checkpointId: wait.checkpointId,
         status: "cancelled",
         decision: "cancelled",
       });
-    }
-    if (wait.approvalId) {
-      await deleteApprovalId({ env: runtime.env, approvalId: wait.approvalId });
-    } else if (wait.stateKey) {
-      await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey: wait.stateKey });
-    }
-    if (wait.stateKey) {
-      await deleteStateJson({ env: runtime.env, key: wait.stateKey });
     }
     await recordTerminalCancel({
       env: runtime.env,
@@ -1146,10 +1140,6 @@ async function maybeCreateRun(params: {
     rootJobId?: string | null;
   };
 }) {
-  const hasLineage = Boolean(
-    params.lineage?.parentRunId || params.lineage?.parentJobId || params.lineage?.rootJobId,
-  );
-  if (!checkpointsEnabled(params.runtime.env) && !hasLineage) return undefined;
   return createRun({
     env: params.runtime.env,
     sourceType: params.sourceType,
@@ -1233,20 +1223,48 @@ async function maybeUpdateRun(
 
 async function loadWorkflowRunContext(
   env: Record<string, string | undefined>,
-  stateKey: string,
+  checkpointId: string,
 ): Promise<WorkflowExecutionContext | undefined> {
-  const { readStateJson } = await import("../store/state.js");
-  const stored = await readStateJson({ env, key: stateKey }).catch(() => null);
-  const runId = typeof stored?.runId === "string" ? stored.runId : null;
-  return runId
-    ? createCheckpointRun(runId, {
-        jobId: typeof stored?.jobId === "string" ? stored.jobId : runId,
-        rootRunId: typeof stored?.rootRunId === "string" ? stored.rootRunId : runId,
-        parentRunId: typeof stored?.parentRunId === "string" ? stored.parentRunId : null,
-        stepPathPrefix: typeof stored?.stepPathPrefix === "string" ? stored.stepPathPrefix : "root",
-        depth: typeof stored?.depth === "number" ? stored.depth : 0,
-      })
-    : undefined;
+  const checkpoint = await getStoredCheckpoint({ env, checkpointId }).catch(() => null);
+  const runId = checkpoint?.runId ?? null;
+  if (!runId) return undefined;
+  const resume = (checkpoint?.resumeState ?? null) as
+    | { stepPathPrefix?: unknown; depth?: unknown }
+    | null;
+  return createCheckpointRun(runId, {
+    jobId: checkpoint?.jobId ?? runId,
+    rootRunId: checkpoint?.rootRunId ?? runId,
+    parentRunId: checkpoint?.parentRunId ?? null,
+    stepPathPrefix:
+      typeof resume?.stepPathPrefix === "string" ? resume.stepPathPrefix : "root",
+    depth: typeof resume?.depth === "number" ? resume.depth : 0,
+    latestCheckpointId: checkpointId,
+  });
+}
+
+/**
+ * Build a resume token from a waiting checkpoint id, deriving the resume kind
+ * from the checkpoint's persisted resume state / step type.
+ */
+async function encodeCheckpointResumeToken(
+  env: Record<string, string | undefined>,
+  checkpointId: string,
+): Promise<string> {
+  const checkpoint = await getStoredCheckpoint({ env, checkpointId });
+  const resume = (checkpoint?.resumeState ?? null) as { kind?: unknown } | null;
+  const kind =
+    resume?.kind === "pipeline-resume" ||
+    checkpoint?.stepType === "pipeline" ||
+    checkpoint?.stepType === "pipeline_input"
+      ? "pipeline-resume"
+      : "workflow-file";
+  return encodeToken({
+    protocolVersion: 1,
+    v: 1,
+    kind,
+    checkpointId,
+    ...(checkpoint?.jobId ? { jobId: checkpoint.jobId } : null),
+  });
 }
 
 function mergePatch(base: unknown, patch: Record<string, unknown> | undefined) {

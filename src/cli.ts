@@ -2,7 +2,6 @@ import { parsePipeline } from "./parser.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { runPipeline } from "./runtime.js";
 import { decodeResumeToken, parseResumeArgs, resolveApprovalId } from "./resume.js";
-import { cleanupApprovalIndexByStateKey, deleteApprovalId } from "./store/state.js";
 import {
   WorkflowResumeArgumentError,
   loadWorkflowFile,
@@ -11,13 +10,19 @@ import {
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
-import { deleteStateJson } from "./store/state.js";
 import {
   finalizePipelineToolRun,
   loadPipelineResumeState,
   validatePipelineInputResponse,
 } from "./pipeline_resume_state.js";
-import { recordTerminalCancel, resolveApprovalRecord } from "./store/runtime_store.js";
+import {
+  createCheckpointRun,
+  createRun,
+  recordTerminalCancel,
+  resolveApprovalRecord,
+  updateCheckpointStatus,
+  updateRun,
+} from "./store/runtime_store.js";
 
 export async function runCli(argv) {
   const registry = createDefaultRegistry();
@@ -344,6 +349,17 @@ async function handleRun({ argv, registry }) {
   }
 
   try {
+    // Tool-mode runs are checkpointed: create a run so any approval/input halt
+    // can persist its resume state on a waiting checkpoint (the DB is the single
+    // source of truth for resume).
+    const checkpointRun =
+      normalizedMode === "tool" && !dryRun
+        ? await createRun({
+            env: process.env,
+            sourceType: "pipeline",
+            pipelineText: pipelineString,
+          })
+        : undefined;
     const output = await runPipeline({
       pipeline,
       registry,
@@ -354,6 +370,7 @@ async function handleRun({ argv, registry }) {
       env: process.env,
       mode: normalizedMode,
       dryRun,
+      checkpointRun,
     });
 
     if (normalizedMode === "tool") {
@@ -361,7 +378,17 @@ async function handleRun({ argv, registry }) {
         env: process.env,
         pipeline,
         output,
+        checkpointRun,
       });
+      if (checkpointRun) {
+        await updateRun({
+          env: process.env,
+          runId: checkpointRun.runId,
+          status: finalized.status === "ok" ? "succeeded" : "waiting",
+          latestCheckpointId: checkpointRun.latestCheckpointId ?? null,
+          finalOutput: finalized.output,
+        });
+      }
       writeToolEnvelope({
         ok: true,
         status: finalized.status,
@@ -611,15 +638,6 @@ async function handleResume({ argv, registry }) {
     return;
   }
 
-  // Helper: clean up approval ID index after successful use
-  const cleanupIndex = async () => {
-    if (resolvedApprovalId) {
-      await deleteApprovalId({ env: process.env, approvalId: resolvedApprovalId });
-    } else if (payload.stateKey) {
-      await cleanupApprovalIndexByStateKey({ env: process.env, stateKey: payload.stateKey });
-    }
-  };
-
   if (payload.kind === "workflow-file") {
     try {
       const output = await runWorkflowFile({
@@ -671,7 +689,6 @@ async function handleResume({ argv, registry }) {
         return;
       }
 
-      await cleanupIndex();
       if (output.status === "cancelled") {
         writeToolEnvelope({
           ok: true,
@@ -705,10 +722,10 @@ async function handleResume({ argv, registry }) {
       return;
     }
   }
-  const previousStateKey = payload.stateKey;
+  const previousCheckpointId = payload.checkpointId;
   let resumeState;
   try {
-    resumeState = await loadPipelineResumeState(process.env, previousStateKey);
+    resumeState = await loadPipelineResumeState(process.env, previousCheckpointId);
   } catch (err) {
     writeToolEnvelope({
       ok: false,
@@ -717,6 +734,15 @@ async function handleResume({ argv, registry }) {
     process.exitCode = 1;
     return;
   }
+  const pipelineCheckpointRun = resumeState.runId
+    ? createCheckpointRun(resumeState.runId, {
+        jobId: resumeState.jobId,
+        rootRunId: resumeState.rootRunId,
+        parentRunId: resumeState.parentRunId,
+        stepPathPrefix: resumeState.stepPathPrefix,
+        depth: resumeState.depth,
+      })
+    : undefined;
   if (resumeState.haltType === "input_request") {
     if (approved !== undefined) {
       writeToolEnvelope({
@@ -763,16 +789,21 @@ async function handleResume({ argv, registry }) {
       return;
     }
     if (approved !== true) {
-      await cleanupIndex();
-      await deleteStateJson({ env: process.env, key: previousStateKey });
       await resolveApprovalRecord({
         env: process.env,
         approvalId: resolvedApprovalId,
-        stateKey: previousStateKey,
+        checkpointId: previousCheckpointId,
         status: "rejected",
         decision: "reject",
         approvedBy: String(process.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
       });
+      if (previousCheckpointId) {
+        await updateCheckpointStatus({
+          env: process.env,
+          checkpointId: previousCheckpointId,
+          status: "resumed",
+        });
+      }
       if (resumeState.runId) {
         await recordTerminalCancel({
           env: process.env,
@@ -806,8 +837,13 @@ async function handleResume({ argv, registry }) {
         state: resumeState.commandInput!,
         response,
         onConsumed: async () => {
-          await cleanupIndex();
-          await deleteStateJson({ env: process.env, key: previousStateKey });
+          if (previousCheckpointId) {
+            await updateCheckpointStatus({
+              env: process.env,
+              checkpointId: previousCheckpointId,
+              status: "resumed",
+            });
+          }
         },
       }
     : undefined;
@@ -823,13 +859,14 @@ async function handleResume({ argv, registry }) {
       mode,
       input,
       requestInputResume,
+      checkpointRun: pipelineCheckpointRun,
     });
-    await cleanupIndex();
     const finalized = await finalizePipelineToolRun({
       env: process.env,
       pipeline: remaining,
       output,
-      previousStateKey,
+      previousCheckpointId,
+      checkpointRun: pipelineCheckpointRun,
     });
     writeToolEnvelope({
       ok: true,

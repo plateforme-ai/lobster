@@ -1,4 +1,4 @@
-import { diffAndStore } from "../../store/state.js";
+import { diffAndStore } from "../../store/helpers.js";
 
 export const diffLastCommand = {
   name: "diff.last",

@@ -13,7 +13,7 @@ function streamOf(items) {
 
 test("diff.last reports changed on first run and not changed on same input", async () => {
   const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-"));
-  const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
+  const env = { ...process.env, LOBSTER_DIR: tmp };
   const registry = createDefaultRegistry();
   const cmd = registry.get("diff.last");
 

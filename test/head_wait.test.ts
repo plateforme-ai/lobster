@@ -16,8 +16,7 @@ import { createApprovalRecord } from "../src/store/runtime_store.js";
 function makeEnv(tmpDir: string) {
   return {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 }
 
@@ -119,7 +118,6 @@ test("stale approval does not intercept job-scoped continue when head is pause",
     jobId: first.jobId,
     runId: first.runId,
     rootRunId: first.rootRunId,
-    stateKey: "workflow_resume_stale",
     prompt: "Stale approval?",
   });
 

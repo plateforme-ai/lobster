@@ -24,7 +24,9 @@ test("cli: run --file passes --args-json into workflow args", async () => {
 
   await fsp.writeFile(filePath, workflow, "utf8");
 
-  const res = runLobster(["run", "--file", filePath, "--args-json", '{"task":"test"}']);
+  const res = runLobster(["run", "--file", filePath, "--args-json", '{"task":"test"}'], {
+    env: { LOBSTER_DIR: tmpDir },
+  });
 
   assert.equal(
     res.status,

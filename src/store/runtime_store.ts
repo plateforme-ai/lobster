@@ -26,15 +26,11 @@ type WaitGateStepType = (typeof WAIT_GATE_STEP_TYPES)[number];
 const DEFAULT_CHECKPOINT_INLINE_BYTES = 65_536;
 const DEFAULT_CHECKPOINT_PREVIEW_BYTES = 16_384;
 const DEFAULT_CACHE_INLINE_BYTES = 65_536;
-const DEFAULT_CACHE_TTL_DAYS = 30;
+const DEFAULT_CACHE_TTL_DAYS = 1;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 200;
 const WAIT_GATE_STEP_TYPES = ["pause", "approval", "input", "pipeline_input"] as const;
 const WAIT_GATE_STEP_TYPE_SQL = WAIT_GATE_STEP_TYPES.map(() => "?").join(", ");
-
-export function checkpointsEnabled(env: Record<string, string | undefined>) {
-  return String(env.LOBSTER_CHECKPOINTS_ENABLED ?? "").toLowerCase() === "true";
-}
 
 export function createCheckpointRun(
   runId: string,
@@ -542,10 +538,6 @@ export async function recordTerminalCancel(params: {
   const rootRunId = params.rootRunId ?? run?.rootRunId ?? params.runId;
   const parentRunId = params.parentRunId ?? run?.parentRunId ?? null;
   await clearRunControlDesired({ env: params.env, runId: params.runId });
-  if (!checkpointsEnabled(params.env)) {
-    await updateRun({ env: params.env, runId: params.runId, status: "cancelled" });
-    return null;
-  }
   const now = new Date().toISOString();
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
@@ -641,48 +633,86 @@ export async function resolveJobHeadWait(params: {
   });
 }
 
-export async function findHeadResumeStateKey(params: {
+export type HeadResumeCheckpoint = {
+  checkpointId: string;
+  kind: JobWaitKind;
+  stepType: string | null;
+  resumeKind: "workflow-file" | "pipeline-resume";
+};
+
+/**
+ * Resolve the head waiting checkpoint that a job/run can resume from. Returns
+ * the checkpoint id (the DB resume anchor) plus enough to decide how to route
+ * the resume. Replaces the former state-key lookup.
+ */
+export async function findHeadResumeCheckpoint(params: {
   env: Record<string, string | undefined>;
   jobId?: string | null;
   runId?: string | null;
   allowedStepTypes?: readonly WaitGateStepType[];
-}): Promise<string | null> {
+}): Promise<HeadResumeCheckpoint | null> {
   const wait = await resolveJobHeadWait(params);
-  if (!wait?.stateKey) return null;
+  if (!wait?.checkpointId) return null;
   if (
     params.allowedStepTypes &&
     !params.allowedStepTypes.includes(wait.stepType as WaitGateStepType)
   ) {
     return null;
   }
-  return wait.stateKey;
+  const checkpoint = await getCheckpoint({ env: params.env, checkpointId: wait.checkpointId });
+  const resumeState = checkpoint?.resumeState as { kind?: unknown } | null;
+  const resumeKind =
+    resumeState && resumeState.kind === "pipeline-resume" ? "pipeline-resume" : "workflow-file";
+  return {
+    checkpointId: wait.checkpointId,
+    kind: wait.kind,
+    stepType: wait.stepType ?? null,
+    resumeKind,
+  };
 }
 
-export async function findLatestResumeStateKey(params: {
+/**
+ * Fold a run's append-only checkpoint log into the per-step results map. Each
+ * step persists its own `WorkflowStepResult` once (in the step checkpoint's
+ * `metadata.stepResult`); replaying them in `seq` order reconstructs the
+ * `Record<stepId, WorkflowStepResult>` that resume/rewind need — no per-
+ * checkpoint snapshot duplication. `uptoSeq` bounds the fold to a gate.
+ */
+export async function foldRunResults(params: {
   env: Record<string, string | undefined>;
-  jobId?: string | null;
-  runId?: string | null;
-}): Promise<string | null> {
-  return findHeadResumeStateKey(params);
-}
-
-export async function findWaitingCheckpointByStateKey(params: {
-  env: Record<string, string | undefined>;
-  stateKey: string;
-}): Promise<CheckpointRecord | null> {
-  const rows = await withRuntimeDb(
-    params.env,
-    (db) =>
-      db
-        .prepare(
-          `SELECT * FROM checkpoints
-          WHERE status = 'waiting' AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
-          ORDER BY created_at DESC`,
-        )
-        .all(...WAIT_GATE_STEP_TYPES) as any[],
-  );
-  const row = rows.find((entry) => metadataStateKey(entry.metadata_json) === params.stateKey);
-  return row ? rowToCheckpoint(row) : null;
+  runId: string;
+  uptoSeq?: number | null;
+}): Promise<Record<string, any>> {
+  const rows = await withRuntimeDb(params.env, (db) => {
+    if (typeof params.uptoSeq === "number") {
+      return db
+        .prepare("SELECT * FROM checkpoints WHERE run_id = ? AND seq <= ? ORDER BY seq")
+        .all(params.runId, params.uptoSeq) as any[];
+    }
+    return db
+      .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq")
+      .all(params.runId) as any[];
+  });
+  const results: Record<string, any> = {};
+  for (const row of rows) {
+    const metadata = parseJsonSafe(row.metadata_json ?? null) as
+      | { stepResult?: unknown; branchResults?: unknown }
+      | null;
+    if (!metadata) continue;
+    if (metadata.branchResults && typeof metadata.branchResults === "object") {
+      for (const [branchId, branchResult] of Object.entries(
+        metadata.branchResults as Record<string, unknown>,
+      )) {
+        results[branchId] = branchResult;
+      }
+    }
+    if (metadata.stepResult && typeof metadata.stepResult === "object") {
+      const stepResult = metadata.stepResult as { id?: unknown };
+      const stepId = typeof stepResult.id === "string" ? stepResult.id : row.step_id;
+      if (stepId) results[stepId] = stepResult;
+    }
+  }
+  return results;
 }
 
 export async function updateCheckpointStatus(params: {
@@ -700,13 +730,6 @@ export async function updateCheckpointStatus(params: {
   });
 }
 
-function metadataStateKey(metadataJson: string | null | undefined): string | null {
-  const metadata = parseJsonSafe(metadataJson ?? null) as { stateKey?: unknown } | null;
-  return metadata && typeof metadata.stateKey === "string" && metadata.stateKey
-    ? metadata.stateKey
-    : null;
-}
-
 function waitKindFromStepType(stepType: string | null | undefined): JobWaitKind | null {
   if (stepType === "pause") return "pause";
   if (stepType === "approval") return "approval";
@@ -720,27 +743,21 @@ function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobW
   if (!kind) return null;
 
   const metadata = parseJsonSafe(row.metadata_json ?? null) as {
-    stateKey?: unknown;
     approvalId?: unknown;
     reason?: unknown;
     nextStepId?: unknown;
   } | null;
-  const stateKey =
-    metadata && typeof metadata.stateKey === "string" && metadata.stateKey
-      ? metadata.stateKey
-      : null;
   const approval = (
     kind === "approval"
       ? db
           .prepare(
-            `SELECT approval_id, state_key FROM approvals
-            WHERE status = 'waiting'
-              AND (checkpoint_id = ? OR (state_key IS NOT NULL AND state_key = ?))
+            `SELECT approval_id FROM approvals
+            WHERE status = 'waiting' AND checkpoint_id = ?
             ORDER BY created_at DESC LIMIT 1`,
           )
-          .get(row.checkpoint_id, stateKey)
+          .get(row.checkpoint_id)
       : null
-  ) as { approval_id?: string | null; state_key?: string | null } | null;
+  ) as { approval_id?: string | null } | null;
   const reason =
     metadata?.reason === "pause_requested" || metadata?.reason === "step_mode"
       ? metadata.reason
@@ -753,7 +770,6 @@ function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobW
     checkpointId: row.checkpoint_id,
     stepId: row.step_id ?? null,
     stepType: row.step_type ?? null,
-    stateKey: stateKey ?? approval?.state_key ?? null,
     approvalId:
       typeof metadata?.approvalId === "string"
         ? metadata.approvalId
@@ -763,13 +779,12 @@ function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobW
 }
 
 function approvalRowToWaitSnapshot(row: any | null | undefined): JobWaitSnapshot | null {
-  if (!row || row.status !== "waiting" || !row.state_key) return null;
+  if (!row || row.status !== "waiting" || !row.checkpoint_id) return null;
   return {
     kind: "approval",
     checkpointId: row.checkpoint_id ?? null,
     stepId: null,
     stepType: "approval",
-    stateKey: row.state_key,
     approvalId: row.approval_id ?? null,
   };
 }
@@ -879,10 +894,6 @@ export async function listPendingApprovals(params: {
       headClauses.push("checkpoint_id = ?");
       values.push(headWait.checkpointId);
     }
-    if (headWait.stateKey) {
-      headClauses.push("state_key = ?");
-      values.push(headWait.stateKey);
-    }
     if (!headClauses.length) {
       return { approvals: [], nextCursor: null };
     }
@@ -930,13 +941,11 @@ export async function appendCheckpoint(params: {
   stepPath?: string | null;
   stepIndex?: number | null;
   stepType?: string | null;
-  attempt?: number | null;
   status: CheckpointRecord["status"];
   startedAt?: string | null;
   finishedAt?: string | null;
-  condition?: unknown;
-  dependencyEdges?: unknown;
   metadata?: unknown;
+  resumeState?: unknown;
   error?: unknown;
   exitStatus?: number | null;
   io?: CheckpointIORecord;
@@ -950,31 +959,32 @@ export async function appendCheckpoint(params: {
   const checkpointId = randomUUID();
   const createdAt = new Date().toISOString();
   await withRuntimeDb(params.env, (db) => {
+    // `seq` is a per-database monotonic ordinal computed inside the INSERT so
+    // fold/replay ordering is deterministic and independent of UUIDs or equal
+    // ISO timestamps. Checkpoints are append-only (never deleted), so MAX+1 is
+    // stable; concurrent writers serialize under WAL + busy_timeout.
     db.prepare(
       `INSERT INTO checkpoints (
-        checkpoint_id, job_id, run_id, root_run_id, parent_run_id,
-        parent_checkpoint_id, step_id, step_path, step_index, step_type,
-        attempt, status, started_at, finished_at, condition_json, dependency_edges_json,
-        metadata_json, error_json, exit_status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        checkpoint_id, seq, job_id, run_id, root_run_id, parent_run_id,
+        step_id, step_path, step_index, step_type,
+        status, started_at, finished_at,
+        metadata_json, resume_state_json, error_json, exit_status, created_at
+      ) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM checkpoints), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       checkpointId,
       jobId,
       runId,
       rootRunId,
       parentRunId,
-      params.run?.latestCheckpointId ?? null,
       params.stepId ?? null,
       stepPath,
       params.stepIndex ?? null,
       params.stepType ?? null,
-      params.attempt ?? null,
       params.status,
       params.startedAt ?? createdAt,
       params.finishedAt ?? null,
-      params.condition === undefined ? null : stringifySafe(params.condition),
-      params.dependencyEdges === undefined ? null : stringifySafe(params.dependencyEdges),
       params.metadata === undefined ? null : stringifySafe(params.metadata),
+      params.resumeState === undefined ? null : stringifySafe(params.resumeState),
       params.error === undefined ? null : stringifySafe(params.error),
       params.exitStatus ?? null,
       createdAt,
@@ -1017,7 +1027,7 @@ export async function listRunCheckpoints(params: {
     params.env,
     (db) =>
       db
-        .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY step_index, created_at")
+        .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq")
         .all(params.runId) as any[],
   );
   return rows.map(rowToCheckpoint);
@@ -1031,7 +1041,7 @@ export async function listJobCheckpoints(params: {
     params.env,
     (db) =>
       db
-        .prepare("SELECT * FROM checkpoints WHERE job_id = ? ORDER BY created_at")
+        .prepare("SELECT * FROM checkpoints WHERE job_id = ? ORDER BY seq")
         .all(params.jobId) as any[],
   );
   return rows.map(rowToCheckpoint);
@@ -1091,7 +1101,6 @@ export async function createApprovalRecord(params: {
   parentRunId?: string | null;
   checkpointId?: string | null;
   stepPath?: string | null;
-  stateKey?: string | null;
   prompt?: string | null;
   metadata?: unknown;
   initiatedBy?: string | null;
@@ -1102,9 +1111,9 @@ export async function createApprovalRecord(params: {
     db.prepare(
       `INSERT OR REPLACE INTO approvals (
         approval_id, job_id, run_id, root_run_id, parent_run_id, checkpoint_id,
-        step_path, state_key, status, prompt, metadata_json,
+        step_path, status, prompt, metadata_json,
         initiated_by, required_approver, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       params.approvalId,
       params.jobId ?? params.run?.jobId ?? null,
@@ -1113,7 +1122,6 @@ export async function createApprovalRecord(params: {
       params.parentRunId ?? params.run?.parentRunId ?? null,
       params.checkpointId ?? params.run?.latestCheckpointId ?? null,
       params.stepPath ?? null,
-      params.stateKey ?? null,
       "waiting",
       params.prompt ?? null,
       params.metadata === undefined ? null : stringifySafe(params.metadata),
@@ -1127,7 +1135,7 @@ export async function createApprovalRecord(params: {
 export async function resolveApprovalRecord(params: {
   env: Record<string, string | undefined>;
   approvalId?: string | null;
-  stateKey?: string | null;
+  checkpointId?: string | null;
   status: ApprovalRecord["status"];
   decision?: string | null;
   approvedBy?: string | null;
@@ -1146,18 +1154,41 @@ export async function resolveApprovalRecord(params: {
       );
       return;
     }
-    if (params.stateKey) {
+    if (params.checkpointId) {
       db.prepare(
-        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ? WHERE state_key = ? AND status = 'waiting'`,
+        `UPDATE approvals SET status = ?, decision = ?, approved_by = ?, resolved_at = ? WHERE checkpoint_id = ? AND status = 'waiting'`,
       ).run(
         params.status,
         params.decision ?? null,
         params.approvedBy ?? null,
         now,
-        params.stateKey,
+        params.checkpointId,
       );
     }
   });
+}
+
+/**
+ * Resolve a short approval id to its waiting checkpoint anchor. Replaces the
+ * former file-based approval index: the mapping now lives in the approvals row
+ * (`approval_id` -> `checkpoint_id`).
+ */
+export async function findCheckpointIdByApprovalId(params: {
+  env: Record<string, string | undefined>;
+  approvalId: string;
+}): Promise<string | null> {
+  // Only a still-waiting approval is resumable. Once resolved (approved /
+  // rejected / cancelled / superseded) the short id no longer maps to an
+  // actionable gate, so a second `--id` resume reports "not found or expired"
+  // rather than replaying the run.
+  const row = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare("SELECT checkpoint_id FROM approvals WHERE approval_id = ? AND status = 'waiting'")
+        .get(params.approvalId) as { checkpoint_id?: string | null } | undefined,
+  );
+  return row?.checkpoint_id ?? null;
 }
 
 export async function readCacheEntry(params: {
@@ -1419,22 +1450,20 @@ function controlSnapshotFromRow(row: any): RunControlSnapshot {
 function rowToCheckpoint(row: any): CheckpointRecord {
   return {
     checkpointId: row.checkpoint_id,
+    seq: Number(row.seq ?? 0),
     jobId: row.job_id,
     runId: row.run_id,
     rootRunId: row.root_run_id,
     parentRunId: row.parent_run_id,
-    parentCheckpointId: row.parent_checkpoint_id,
     stepId: row.step_id,
     stepPath: row.step_path,
     stepIndex: row.step_index,
     stepType: row.step_type,
-    attempt: row.attempt,
     status: row.status,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
-    condition: parseJsonSafe(row.condition_json),
-    dependencyEdges: parseJsonSafe(row.dependency_edges_json),
     metadata: parseJsonSafe(row.metadata_json),
+    resumeState: parseJsonSafe(row.resume_state_json),
     error: parseJsonSafe(row.error_json),
     exitStatus: row.exit_status,
     createdAt: row.created_at,
@@ -1482,7 +1511,6 @@ function rowToApproval(row: any): ApprovalRecord {
     parentRunId: row.parent_run_id,
     checkpointId: row.checkpoint_id,
     stepPath: row.step_path,
-    stateKey: row.state_key,
     status: row.status,
     prompt: row.prompt,
     metadata: parseJsonSafe(row.metadata_json),

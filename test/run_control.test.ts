@@ -105,13 +105,12 @@ async function writeSlowFirstStepWorkflow(tmpDir: string) {
 function makeEnv(tmpDir: string) {
   return {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 }
 
 test("step mode pauses before each step and continues to completion", async () => {
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-stepmode-"));
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-"));
   const filePath = await writeThreeStepWorkflow(tmpDir);
   const env = makeEnv(tmpDir);
   const ctx = { cwd: tmpDir, env };
@@ -138,7 +137,7 @@ test("step mode pauses before each step and continues to completion", async () =
 });
 
 test("step mode pauses before the first step of a nested workflow too", async () => {
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-stepmode-nested-"));
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-"));
   const childPath = path.join(tmpDir, "child.lobster");
   const parentPath = path.join(tmpDir, "parent.lobster");
   await fsp.writeFile(

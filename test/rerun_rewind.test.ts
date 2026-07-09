@@ -40,8 +40,7 @@ test("rerun creates a linked run and rewind creates a child run from checkpoint 
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
@@ -94,8 +93,7 @@ test("rewind applies per-step input overrides to downstream steps", async () => 
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
@@ -135,8 +133,7 @@ test("rewind rejects an input override for an unknown step", async () => {
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
@@ -183,8 +180,7 @@ test("resume can edit workflow args via argsPatch", async () => {
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
@@ -229,8 +225,7 @@ test("resume can edit the approved payload (edit-then-approve)", async () => {
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env } });
@@ -273,8 +268,7 @@ test("rerun and rewind copy job title, description, and metadata", async () => {
 
   const env = {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 
   const first = await runToolRequest({

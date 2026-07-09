@@ -9,7 +9,6 @@ import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
 
 async function runWorkflow(workflow: unknown) {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-parallel-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -19,7 +18,7 @@ async function runWorkflow(workflow: unknown) {
       stdin: process.stdin,
       stdout: process.stdout,
       stderr: process.stderr,
-      env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
+      env: { ...process.env, LOBSTER_DIR: tmpDir },
       mode: "tool",
       registry: createDefaultRegistry(),
     },

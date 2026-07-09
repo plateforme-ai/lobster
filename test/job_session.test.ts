@@ -45,8 +45,7 @@ test("job session/agent/model are injected into the step env on resume", async (
     cwd: tmpDir,
     env: {
       ...process.env,
-      LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-      LOBSTER_CHECKPOINTS_ENABLED: "true",
+      LOBSTER_DIR: tmpDir,
     },
   };
 
@@ -105,8 +104,7 @@ test("explicit step env still wins over the injected job session", async () => {
     cwd: tmpDir,
     env: {
       ...process.env,
-      LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-      LOBSTER_CHECKPOINTS_ENABLED: "true",
+      LOBSTER_DIR: tmpDir,
     },
   };
 
@@ -153,8 +151,7 @@ test("continue envelope and getJob carry the external session identity, checkpoi
     cwd: tmpDir,
     env: {
       ...process.env,
-      LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-      LOBSTER_CHECKPOINTS_ENABLED: "true",
+      LOBSTER_DIR: tmpDir,
     },
   };
 

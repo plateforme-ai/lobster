@@ -51,8 +51,7 @@ async function writeApprovalWorkflow(tmpDir: string) {
 function makeEnv(tmpDir: string) {
   return {
     ...process.env,
-    LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-    LOBSTER_CHECKPOINTS_ENABLED: "true",
+    LOBSTER_DIR: tmpDir,
   };
 }
 

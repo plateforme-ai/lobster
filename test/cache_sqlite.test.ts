@@ -63,7 +63,7 @@ test("llm_task.invoke uses sqlite cache with TTL metadata", async () => {
 
   try {
     const env = {
-      LOBSTER_STATE_DIR: tmpDir,
+      LOBSTER_DIR: tmpDir,
       LOBSTER_CACHE_TTL_DAYS: "7",
       CLAWD_URL: `http://localhost:${port}`,
     };
