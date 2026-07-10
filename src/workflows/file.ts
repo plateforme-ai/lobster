@@ -18,12 +18,13 @@ import {
   createCheckpointRun,
   createChildRun,
   createRun,
+  findWaitingFrameCheckpoint,
   foldRunResults,
   getCheckpoint,
   getJob,
+  getRun,
   getRunControl,
   recordTerminalCancel,
-  resolveApprovalRecord,
   updateCheckpointStatus,
   updateJobMetadata,
   updateRun,
@@ -245,7 +246,6 @@ export type WorkflowResumePayload = {
   resumeAtIndex?: number;
   steps?: Record<string, WorkflowStepResult>;
   args?: Record<string, unknown>;
-  activeChild?: WorkflowActiveChildResumeState;
   approvalStepId?: string;
   approvalIdentity?: WorkflowApprovalIdentity;
   inputStepId?: string;
@@ -270,7 +270,6 @@ type WorkflowResumeState = {
   // loaded from a checkpoint, and provided inline by rewind.
   steps?: Record<string, WorkflowStepResult>;
   args: Record<string, unknown>;
-  activeChild?: WorkflowActiveChildResumeState;
   approvalStepId?: string;
   approvalIdentity?: WorkflowApprovalIdentity;
   inputStepId?: string;
@@ -286,18 +285,6 @@ type WorkflowPipelineInputResumeState = {
   resumeAtIndex: number;
   items: unknown[];
   commandInput: CommandInputState;
-};
-
-type WorkflowActiveChildResumeState = {
-  stepId: string;
-  checkpointId: string;
-  filePath: string;
-  runId?: string;
-  jobId?: string;
-  rootRunId?: string;
-  parentRunId?: string | null;
-  stepPathPrefix?: string;
-  depth?: number;
 };
 
 export class WorkflowResumeArgumentError extends Error {
@@ -985,65 +972,6 @@ export async function runWorkflowFile({
       });
     }
 
-    if (resumeState?.activeChild) {
-      const child = resumeState.activeChild;
-      const childRun = child.runId
-        ? createCheckpointRun(child.runId, {
-            jobId: child.jobId,
-            rootRunId: child.rootRunId,
-            parentRunId: child.parentRunId,
-            stepPathPrefix: child.stepPathPrefix,
-            depth: child.depth,
-            ...(checkpointRun?.observer ? { observer: checkpointRun.observer } : {}),
-          })
-        : undefined;
-      const childResult = await runWorkflowFile({
-        filePath: child.filePath,
-        ctx: { ...ctx, checkpointRun: childRun },
-        resume: {
-          protocolVersion: 1,
-          v: 1,
-          kind: "workflow-file",
-          checkpointId: child.checkpointId,
-        },
-        approved,
-        response,
-      });
-      if (
-        childResult.status === "needs_approval" ||
-        childResult.status === "needs_input" ||
-        childResult.status === "paused"
-      ) {
-        const suspended = await wrapChildSuspension({
-          ctx,
-          parentRun: checkpointRun,
-          childRun,
-          childResult,
-          parentFilePath: resolvedFilePath,
-          parentResumeAtIndex: stepIndexById.get(child.stepId) ?? startIndex,
-          parentResults: results,
-          parentArgs: resolvedArgs,
-          childStepId: child.stepId,
-          childFilePath: child.filePath,
-        });
-        if (consumedResumeCheckpointId) {
-          await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
-        }
-        return suspended;
-      }
-      if (childResult.status === "cancelled") {
-        if (consumedResumeCheckpointId) {
-          await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
-        }
-        return { status: "cancelled", output: [] };
-      }
-      results[child.stepId] = workflowOutputToStepResult(child.stepId, childResult.output);
-      startIndex = (stepIndexById.get(child.stepId) ?? startIndex) + 1;
-      if (consumedResumeCheckpointId) {
-        await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
-      }
-    }
-
     if (resumeState?.approvalStepId && typeof approved === "boolean") {
       const previous = results[resumeState.approvalStepId] ?? { id: resumeState.approvalStepId };
       const approvedBy = String(ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
@@ -1709,10 +1637,8 @@ export async function runWorkflowFile({
                   childResult: subResult,
                   parentFilePath: resolvedFilePath,
                   parentResumeAtIndex: idx,
-                  parentResults: results,
                   parentArgs: resolvedArgs,
                   childStepId: step.id,
-                  childFilePath: resolvedWorkflowPath,
                 }),
               );
             }
@@ -2128,10 +2054,8 @@ async function wrapChildSuspension({
   childResult,
   parentFilePath,
   parentResumeAtIndex,
-  parentResults,
   parentArgs,
   childStepId,
-  childFilePath,
 }: {
   ctx: RunContext;
   parentRun?: WorkflowExecutionContext;
@@ -2139,10 +2063,8 @@ async function wrapChildSuspension({
   childResult: WorkflowRunResult;
   parentFilePath: string;
   parentResumeAtIndex: number;
-  parentResults: Record<string, WorkflowStepResult>;
   parentArgs: Record<string, unknown>;
   childStepId: string;
-  childFilePath: string;
 }): Promise<WorkflowRunResult> {
   const childResumeToken =
     childResult.requiresApproval?.resumeToken ??
@@ -2162,134 +2084,214 @@ async function wrapChildSuspension({
     await updateRun({ env: ctx.env, runId: parentRun.runId, status: "waiting" });
   }
 
-  // The child's own gate stays as the executable anchor for the sub-workflow;
-  // the parent wraps it with a gate whose resume state points back to it via
-  // `activeChild.checkpointId`. The child's approval row is superseded by the
-  // parent gate that now fronts the wait.
-  await resolveApprovalRecord({
-    env: ctx.env,
-    checkpointId: childCheckpointId,
-    status: "cancelled",
-    decision: "superseded_by_parent",
-  });
-
+  // The single wait/approval lives on the child's own gate — the step that
+  // actually triggered the suspension. We keep it intact and bubble the child's
+  // resume token + approvalId outward unchanged. The parent only records a pure
+  // call-stack `nested` frame carrying the parent continuation state (file,
+  // args, and the index to resume at once the child finishes). The frame is
+  // never a wait/approval anchor and is skipped by the head-wait resolver, so
+  // the deepest child gate always fronts the wait. Resume is child-first: the
+  // child gate runs to terminal, then `continueParentChain` reads this frame to
+  // continue the parent past the workflow-call step (see tool_runtime).
   const parentResumeState = {
     kind: "workflow-file" as const,
     ...workflowResumeContext(parentRun),
     filePath: parentFilePath,
     resumeAtIndex: parentResumeAtIndex,
     args: parentArgs,
-    activeChild: {
-      stepId: childStepId,
-      checkpointId: childCheckpointId,
-      filePath: childFilePath,
-      ...(childRun ? workflowResumeContext(childRun) : null),
-    },
     createdAt: new Date().toISOString(),
   };
-
-  const encodeParentToken = (checkpointId: string | null) =>
-    encodeToken({
-      protocolVersion: 1,
-      v: 1,
-      kind: "workflow-file",
-      checkpointId: checkpointId ?? undefined,
-      jobId: parentRun?.jobId,
-    } satisfies WorkflowResumePayload);
+  await appendCheckpoint({
+    env: ctx.env,
+    run: parentRun,
+    stepId: childStepId,
+    stepIndex: parentResumeAtIndex,
+    kind: "nested",
+    name:
+      childResult.status === "needs_approval"
+        ? "approval"
+        : childResult.status === "needs_input"
+          ? "input"
+          : "pause",
+    status: "waiting",
+    metadata: { childStepId },
+    resumeState: parentResumeState,
+  });
 
   if (childResult.status === "needs_approval" && childResult.requiresApproval) {
-    const approvalId = generateApprovalId();
-    const approvalCheckpointId = await appendCheckpoint({
-      env: ctx.env,
-      run: parentRun,
-      stepId: childStepId,
-      stepIndex: parentResumeAtIndex,
-      kind: "gate",
-      name: "approval",
-      status: "waiting",
-      metadata: {
-        approvalId,
-        nested: true,
-        childStepId,
-      },
-      resumeState: parentResumeState,
-      io: { jsonOutput: childResult.requiresApproval.items },
-    });
-    if (approvalCheckpointId) {
-      await createApprovalRecord({
-        env: ctx.env,
-        approvalId,
-        run: childRun ?? parentRun,
-        checkpointId: approvalCheckpointId,
-        prompt: childResult.requiresApproval.prompt,
-        metadata: {
-          ...childResult.requiresApproval,
-          nested: true,
-          childStepId,
-        },
-      });
-    }
-    return {
-      status: "needs_approval",
-      output: [],
-      requiresApproval: {
-        ...childResult.requiresApproval,
-        resumeToken: encodeParentToken(approvalCheckpointId),
-        approvalId,
-      },
-    };
+    return { status: "needs_approval", output: [], requiresApproval: childResult.requiresApproval };
   }
-
   if (childResult.status === "needs_input" && childResult.requiresInput) {
-    const inputCheckpointId = await appendCheckpoint({
-      env: ctx.env,
-      run: parentRun,
-      stepId: childStepId,
-      stepIndex: parentResumeAtIndex,
-      kind: "gate",
-      name: "input",
-      status: "waiting",
-      metadata: { nested: true, childStepId },
-      resumeState: parentResumeState,
-    });
-    return {
-      status: "needs_input",
-      output: [],
-      requiresInput: {
-        ...childResult.requiresInput,
-        resumeToken: encodeParentToken(inputCheckpointId),
-      },
-    };
+    return { status: "needs_input", output: [], requiresInput: childResult.requiresInput };
   }
-
   if (childResult.status === "paused" && childResult.paused) {
-    const pauseCheckpointId = await appendCheckpoint({
-      env: ctx.env,
-      run: parentRun,
-      stepId: childStepId,
-      stepIndex: parentResumeAtIndex,
-      kind: "gate",
-      name: "pause",
-      status: "waiting",
-      metadata: {
-        reason: childResult.paused.reason,
-        nested: true,
-        childStepId,
-      },
-      resumeState: parentResumeState,
-    });
-    return {
-      status: "paused",
-      output: [],
-      paused: {
-        ...childResult.paused,
-        nextStepId: childStepId,
-        resumeToken: encodeParentToken(pauseCheckpointId),
-      },
-    };
+    return { status: "paused", output: [], paused: childResult.paused };
   }
 
   throw new Error(`Workflow step ${childStepId} sub-workflow did not suspend`);
+}
+
+/**
+ * Continue the parent call chain after a child workflow reaches a terminal state.
+ *
+ * Nested suspensions anchor their single wait/approval on the child gate and
+ * write a pure `nested` frame on each parent recording the parent continuation
+ * state. Resume is child-first: the child gate runs to terminal, then this
+ * walk-up marks each parent's workflow-call step done (succeeded or cancelled),
+ * consumes the parent frame, and resumes the parent just past the call step —
+ * recursing up to the root. If a parent re-suspends (its own next gate, or a
+ * further nested child) that gate becomes the new head wait and the walk stops.
+ *
+ * Returns the top-most result reached plus the root run / job it belongs to so
+ * the caller can build the resume envelope.
+ */
+export async function continueParentChain(params: {
+  ctx: RunContext;
+  childRunId: string;
+  childStatus: "ok" | "cancelled";
+  childOutput: unknown[];
+}): Promise<{ result: WorkflowRunResult; topRunId: string; jobId: string }> {
+  const { ctx } = params;
+  let curRunId = params.childRunId;
+  let curStatus: "ok" | "cancelled" = params.childStatus;
+  let curOutput = params.childOutput;
+  let topResult: WorkflowRunResult =
+    curStatus === "ok" ? { status: "ok", output: curOutput } : { status: "cancelled", output: [] };
+  let topRunId = curRunId;
+  let jobId = "";
+
+  while (true) {
+    const run = await getRun(ctx.env, curRunId);
+    if (!run) return { result: topResult, topRunId, jobId };
+    jobId = run.jobId;
+    topRunId = run.rootRunId ?? curRunId;
+    if (!run.parentRunId) return { result: topResult, topRunId, jobId };
+
+    const parentRun = await getRun(ctx.env, run.parentRunId);
+    const frame = await findWaitingFrameCheckpoint({ env: ctx.env, runId: run.parentRunId });
+    if (!parentRun || !frame) return { result: topResult, topRunId, jobId };
+
+    const frameState = (frame.resumeState ?? {}) as Partial<WorkflowResumeState>;
+    const callStepId = run.parentStepId ?? frame.stepId ?? "";
+    const callStepIndex = typeof frame.stepIndex === "number" ? frame.stepIndex : 0;
+    const callStepPath = run.parentStepPath ?? frame.stepPath ?? callStepId;
+
+    const parentRunCtx = createCheckpointRun(parentRun.runId, {
+      jobId: parentRun.jobId,
+      rootRunId: parentRun.rootRunId,
+      parentRunId: parentRun.parentRunId ?? null,
+      stepPathPrefix: frameState.stepPathPrefix ?? "root",
+      depth: typeof frameState.depth === "number" ? frameState.depth : parentRun.depth,
+      ...(ctx.checkpointRun?.observer ? { observer: ctx.checkpointRun.observer } : {}),
+    });
+
+    if (curStatus === "cancelled") {
+      // Mark the workflow-call step cancelled and cancel the parent run; the
+      // parent frame is flipped off `waiting` by recordTerminalCancel. Then keep
+      // propagating the cancel to the grandparent.
+      await appendCheckpoint({
+        env: ctx.env,
+        run: parentRunCtx,
+        stepId: callStepId,
+        stepIndex: callStepIndex,
+        stepPath: callStepPath,
+        kind: "step",
+        name: "cancelled",
+        status: "cancelled",
+        finishedAt: new Date().toISOString(),
+        metadata: { reason: "child_cancelled", childRunId: curRunId },
+      });
+      await recordTerminalCancel({
+        env: ctx.env,
+        runId: parentRun.runId,
+        jobId: parentRun.jobId,
+        rootRunId: parentRun.rootRunId,
+        parentRunId: parentRun.parentRunId ?? null,
+        stepId: callStepId,
+        stepPath: callStepPath,
+        metadata: { reason: "child_cancelled" },
+      });
+      topResult = { status: "cancelled", output: [] };
+      curRunId = parentRun.runId;
+      curStatus = "cancelled";
+      curOutput = [];
+      continue;
+    }
+
+    if (!frameState.filePath) {
+      // Defensive: without the parent's continuation file we cannot resume it.
+      return { result: topResult, topRunId, jobId };
+    }
+
+    // Record the workflow-call step's success on the parent run (so the log and
+    // any later fold/rewind see the child output), consume the parent frame, and
+    // resume the parent just past the call step. The step results are folded up
+    // to the frame plus the freshly-produced call-step result injected inline.
+    const callStepResult = workflowOutputToStepResult(callStepId, curOutput);
+    await appendCheckpoint({
+      env: ctx.env,
+      run: parentRunCtx,
+      stepId: callStepId,
+      stepIndex: callStepIndex,
+      stepPath: callStepPath,
+      kind: "step",
+      name: callStepId,
+      status: "succeeded",
+      finishedAt: new Date().toISOString(),
+      metadata: { stepResult: callStepResult },
+      io: { jsonOutput: curOutput },
+    });
+    await consumeWorkflowResumeState(ctx.env, frame.checkpointId);
+
+    const priorSteps = await foldRunResults({
+      env: ctx.env,
+      runId: parentRun.runId,
+      uptoSeq: frame.seq,
+    });
+    priorSteps[callStepId] = callStepResult;
+
+    const parentResult = await runWorkflowFile({
+      filePath: frameState.filePath,
+      ctx: { ...ctx, checkpointRun: parentRunCtx },
+      resume: {
+        protocolVersion: 1,
+        v: 1,
+        kind: "workflow-file",
+        jobId: parentRun.jobId,
+        runId: parentRun.runId,
+        rootRunId: parentRun.rootRunId,
+        parentRunId: parentRun.parentRunId ?? null,
+        stepPathPrefix: parentRunCtx.stepPathPrefix,
+        depth: parentRunCtx.depth,
+        filePath: frameState.filePath,
+        resumeAtIndex: callStepIndex + 1,
+        args: (frameState.args ?? {}) as Record<string, unknown>,
+        steps: priorSteps,
+      },
+    });
+
+    topResult = parentResult;
+    if (
+      parentResult.status === "needs_approval" ||
+      parentResult.status === "needs_input" ||
+      parentResult.status === "paused"
+    ) {
+      return {
+        result: parentResult,
+        topRunId: parentRun.rootRunId ?? parentRun.runId,
+        jobId: parentRun.jobId,
+      };
+    }
+    if (parentResult.status === "cancelled") {
+      curRunId = parentRun.runId;
+      curStatus = "cancelled";
+      curOutput = [];
+      continue;
+    }
+    curRunId = parentRun.runId;
+    curStatus = "ok";
+    curOutput = parentResult.output;
+  }
 }
 
 type StepMetadataOutcome = { ok: boolean; error?: string };

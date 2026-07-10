@@ -118,6 +118,40 @@ test("foldCheckpointsIntoSteps surfaces an active waiting gate as the step bound
   assert.equal(steps[0].boundaryCheckpointId, "gate");
 });
 
+test("foldCheckpointsIntoSteps ignores a nested parent anchor and keeps only the child gate visible", () => {
+  // A suspended child workflow leaves two waiting rows: the child's own gate
+  // (kind "gate", the real visible waiting step) and the parent resume anchor
+  // (kind "nested", fronting the job head wait). Folding must surface only the
+  // child gate so the workflow-call step does not double up as a second waiting
+  // row.
+  const steps = foldCheckpointsIntoSteps([
+    cp({
+      checkpointId: "child_gate",
+      seq: 1,
+      kind: "gate",
+      name: "pause",
+      status: "waiting",
+      stepPath: "root.run-bug-workflow.debug",
+      stepId: "debug",
+      stepIndex: 0,
+    }),
+    cp({
+      checkpointId: "parent_anchor",
+      seq: 2,
+      kind: "nested",
+      name: "pause",
+      status: "waiting",
+      stepPath: "root.run-bug-workflow",
+      stepId: "run-bug-workflow",
+      stepIndex: 2,
+    }),
+  ]);
+  assert.equal(steps.length, 1, "the nested parent anchor must not become its own step");
+  assert.equal(steps[0].stepPath, "root.run-bug-workflow.debug");
+  assert.equal(steps[0].status, "waiting");
+  assert.deepEqual(steps[0].gate, { checkpointId: "child_gate", name: "pause" });
+});
+
 test("foldCheckpointsIntoSteps folds an llm-invoke step's stages into a single StepRecord", () => {
   // All of a step's checkpoints share the SAME owning step_path/step_id/step_index;
   // the sub-operations differ only in `name`. Grouping is a pure GROUP BY step_path.

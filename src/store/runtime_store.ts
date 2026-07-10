@@ -177,9 +177,10 @@ export async function createRewindRun(params: {
 /**
  * Mark every run of a job that is still `running`/`waiting` (except
  * `exceptRunId`) as `superseded` — a rewind replaced them, which is distinct
- * from a real user cancel. Their still-`waiting` gate checkpoints/approvals are
- * flipped to `cancelled` so no zombie waiting gates survive the rewind replay,
- * while any `succeeded` step checkpoints on the run stay intact and queryable.
+ * from a real user cancel. Their still-`waiting` gate/nested checkpoints and
+ * approvals are flipped to `cancelled` so no zombie waiting anchors survive the
+ * rewind replay, while any `succeeded` step checkpoints on the run stay intact
+ * and queryable.
  */
 export async function cancelSupersededRuns(params: {
   env: Record<string, string | undefined>;
@@ -196,7 +197,7 @@ export async function cancelSupersededRuns(params: {
     ).run(now, params.jobId, except, except);
     db.prepare(
       `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
-        WHERE job_id = ? AND status = 'waiting' AND kind = 'gate'
+        WHERE job_id = ? AND status = 'waiting' AND kind IN ('gate', 'nested')
         AND (? IS NULL OR run_id != ?)`,
     ).run(now, params.jobId, except, except);
     db.prepare(
@@ -545,7 +546,7 @@ export async function recordTerminalCancel(params: {
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
       `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
-        WHERE run_id = ? AND status = 'waiting' AND kind = 'gate'`,
+        WHERE run_id = ? AND status = 'waiting' AND kind IN ('gate', 'nested')`,
     ).run(now, params.runId);
   });
   const checkpointId = await appendCheckpoint({
@@ -599,20 +600,23 @@ export async function resolveJobHeadWait(params: {
     const resolvedHead = checkpointRowToWaitSnapshot(db, headCheckpoint);
     if (resolvedHead) return resolvedHead;
 
+    // The head wait resolves to the deepest waiting child `gate`. Parent
+    // `nested` frames are call-stack markers only and are skipped here, so the
+    // child gate that actually triggered the suspension always wins.
     const fallbackCheckpoint = (
       params.runId
         ? db
             .prepare(
               `SELECT * FROM checkpoints
               WHERE status = 'waiting' AND run_id = ? AND kind = 'gate'
-              ORDER BY created_at DESC LIMIT 1`,
+              ORDER BY seq DESC LIMIT 1`,
             )
             .get(params.runId)
         : db
             .prepare(
               `SELECT * FROM checkpoints
               WHERE status = 'waiting' AND job_id = ? AND kind = 'gate'
-              ORDER BY created_at DESC LIMIT 1`,
+              ORDER BY seq DESC LIMIT 1`,
             )
             .get(scope.job_id ?? params.jobId)
     ) as any;
@@ -760,6 +764,11 @@ function waitKindFromName(name: string | null | undefined): JobWaitKind | null {
 }
 
 function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobWaitSnapshot | null {
+  // A `gate` (leaf step suspension) is the only valid head-wait anchor. A
+  // `nested` checkpoint is a pure parent call-stack frame — it holds the parent
+  // continuation state but never a wait/approval, so the head wait always
+  // resolves to the deepest waiting child gate (the step that actually
+  // triggered the suspension), never the parent frame.
   if (!row || row.status !== "waiting" || row.kind !== "gate") return null;
   const kind = waitKindFromName(row.name);
   if (!kind) return null;
@@ -1023,13 +1032,13 @@ export async function appendCheckpoint(params: {
       .prepare("SELECT seq FROM checkpoints WHERE checkpoint_id = ?")
       .get(checkpointId) as { seq?: number } | undefined;
     seq = Number(seqRow?.seq ?? 0);
-    if (params.status === "waiting" && params.kind === "gate") {
+    if (params.status === "waiting" && (params.kind === "gate" || params.kind === "nested")) {
       db.prepare(
         `UPDATE checkpoints
         SET status = 'resumed', finished_at = ?
         WHERE run_id = ?
           AND status = 'waiting'
-          AND kind = 'gate'
+          AND kind IN ('gate', 'nested')
           AND checkpoint_id != ?`,
       ).run(createdAt, runId, checkpointId);
       db.prepare(
@@ -1090,6 +1099,30 @@ export async function listRunCheckpoints(params: {
   return rows.map(rowToCheckpoint);
 }
 
+/**
+ * Locate the single waiting `nested` frame on a run. A `nested` checkpoint is a
+ * parent call-stack frame written when a child workflow suspends; the parent
+ * walk-up reads its resume state to continue the parent past the workflow-call
+ * step once the child reaches a terminal state.
+ */
+export async function findWaitingFrameCheckpoint(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}): Promise<CheckpointRecord | null> {
+  const row = await withRuntimeDb(
+    params.env,
+    (db) =>
+      db
+        .prepare(
+          `SELECT * FROM checkpoints
+          WHERE run_id = ? AND status = 'waiting' AND kind = 'nested'
+          ORDER BY seq DESC LIMIT 1`,
+        )
+        .get(params.runId) as any,
+  );
+  return row ? rowToCheckpoint(row) : null;
+}
+
 export async function listJobCheckpoints(params: {
   env: Record<string, string | undefined>;
   jobId: string;
@@ -1115,9 +1148,12 @@ const TERMINAL_STEP_STATUSES: ReadonlySet<CheckpointRecord["status"]> = new Set(
  * per owning `step_path`). Every checkpoint of a step shares that step's
  * identity, so grouping is a pure GROUP BY `step_path`: no prefix matching.
  * `step`/`gate` rows define the boundary; `detail` rows are the step's
- * sub-operations; `internal` rows are ignored. Run-scoped rows with no
- * `step_path` (e.g. `start`/`end` bookends) belong to no step and are skipped.
- * Status precedence per step: the latest terminal outcome
+ * sub-operations; `internal` and `nested` rows are ignored. A `nested` row is a
+ * parent resume anchor fronting a suspended child workflow — the visible waiting
+ * step is the child gate it wraps (folded from the child run), so folding the
+ * parent must not surface a second waiting step for the workflow-call step.
+ * Run-scoped rows with no `step_path` (e.g. `start`/`end` bookends) belong to no
+ * step and are skipped. Status precedence per step: the latest terminal outcome
  * (`succeeded`/`failed`/`skipped`) wins, else an active `waiting` gate, else the
  * latest boundary status (e.g. a resumed/in-flight step).
  */
@@ -1161,7 +1197,7 @@ export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepR
   };
 
   for (const cp of [...checkpoints].sort((a, b) => a.seq - b.seq)) {
-    if (cp.kind === "internal") continue;
+    if (cp.kind === "internal" || cp.kind === "nested") continue;
     const key = cp.stepPath;
     if (!key) continue;
     const acc = ensure(cp, key);

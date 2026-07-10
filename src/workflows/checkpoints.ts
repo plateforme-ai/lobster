@@ -104,17 +104,24 @@ export type CheckpointStatus =
  * Structural classification of a checkpoint, orthogonal to `name` (the row's own
  * descriptor) and `status` (the lifecycle state). Governs visibility and
  * rewindability:
- * - `step`   the terminal outcome of a workflow step (succeeded/failed/skipped).
- *            The rewindable boundary and the primary user-visible row.
- * - `gate`   a suspension of a step (approval/input/pause). Also a rewindable
- *            boundary; renders as the step's waiting state.
- * - `detail` a sub-operation attributed to its owning step (auto-metadata, and
- *            pipeline stages nested inside a workflow step). Hidden by default;
- *            never an independent rewind target.
- * - `internal` engine bookkeeping (run start/end bookends, pipeline output
- *            envelope, cancel sentinel, resumed markers). Hidden; not rewindable.
+ * - `step`:      The terminal outcome of a workflow step (succeeded/failed/skipped).
+ *                The rewindable boundary and the primary user-visible row.
+ * - `gate`:      A suspension of a step (approval/input/pause).
+ *                Also a rewindable boundary; renders as the step's waiting state.
+ * - `detail`:    A sub-operation attributed to its owning step (auto-metadata, and pipeline stages nested inside a
+ *                workflow step). Hidden by default; never an independent rewind target.
+ * - `internal`:  Engine bookkeeping (run start/end bookends, pipeline output envelope, cancel sentinel,
+ *                resumed markers). Hidden; not rewindable.
+ * - `nested`:    A pure parent call-stack frame written when a child workflow suspends.
+ *                It carries ONLY the parent continuation resume state (file, args, and the index to resume at once
+ *                the child finishes); it never holds a wait or approval. The single wait/approval lives on the child
+ *                gate that actually triggered the suspension, and the head-wait resolver skips `nested` frames so the
+ *                deepest child gate always fronts the wait. On resume the child runs to terminal,
+ *                then the walk-up (`continueParentChain`) reads this frame to continue the parent past
+ *                the workflow-call step. Hidden from folded steps and session mirrors, and never an independent
+ *                rewind target. `name` mirrors the child suspension flavor (approval/input/pause).
  */
-export type CheckpointKind = "step" | "gate" | "detail" | "internal";
+export type CheckpointKind = "step" | "gate" | "detail" | "internal" | "nested";
 
 /**
  * A checkpoint carries two orthogonal descriptors:

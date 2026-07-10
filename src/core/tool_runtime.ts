@@ -8,6 +8,7 @@ import { runPipeline } from "../runtime.js";
 import { encodeToken } from "../token.js";
 import {
   WorkflowResumeArgumentError,
+  continueParentChain,
   readWorkflowDescription,
   readWorkflowDisplayName,
   runWorkflowFile,
@@ -452,6 +453,64 @@ export async function resumeToolRequest({
           approved === false ? "reject" : output.status === "cancelled" ? "cancelled" : "approve",
         approvedBy: String(runtime.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || null,
       });
+
+      // Child-first nested resume: the resumed run is the child gate that
+      // triggered the suspension. Once it reaches a terminal state, walk up the
+      // parent chain (marking each workflow-call step done and continuing the
+      // parent past it). The top-most result — a re-suspension at a deeper gate,
+      // or the root run's terminal state — is what we surface.
+      const resumedRun = loadedRun?.runId
+        ? await getStoredRun(runtime.env, loadedRun.runId).catch(() => null)
+        : null;
+      if (resumedRun?.parentRunId) {
+        const walk = await continueParentChain({
+          ctx: { ...runtime, checkpointRun: loadedRun },
+          childRunId: loadedRun!.runId,
+          childStatus: output.status === "cancelled" ? "cancelled" : "ok",
+          childOutput: output.output,
+        });
+        const topRun = await loadWorkflowRunHead(runtime.env, walk.topRunId);
+        const topSessionExtra = await sessionExtraForRun(runtime, topRun ?? loadedRun);
+        const walkResult = walk.result;
+        if (walkResult.status === "needs_approval") {
+          return okEnvelope(
+            "needs_approval",
+            [],
+            walkResult.requiresApproval ?? null,
+            null,
+            topRun ?? loadedRun,
+            topSessionExtra,
+          );
+        }
+        if (walkResult.status === "needs_input") {
+          return okEnvelope(
+            "needs_input",
+            [],
+            null,
+            walkResult.requiresInput ?? null,
+            topRun ?? loadedRun,
+            topSessionExtra,
+          );
+        }
+        if (walkResult.status === "paused") {
+          return okEnvelope("paused", [], null, null, topRun ?? loadedRun, {
+            ...topSessionExtra,
+            ...pausedExtra(walkResult),
+          });
+        }
+        if (walkResult.status === "cancelled") {
+          return okEnvelope("cancelled", [], null, null, topRun ?? loadedRun, topSessionExtra);
+        }
+        return okEnvelope(
+          "ok",
+          walkResult.output,
+          null,
+          null,
+          topRun ?? loadedRun,
+          topSessionExtra,
+        );
+      }
+
       if (output.status === "cancelled") {
         await maybeUpdateRun(runtime, loadedRun, "cancelled");
         return okEnvelope("cancelled", [], null, null, loadedRun, sessionExtra);
@@ -911,18 +970,25 @@ async function resolveRewindTarget(params: {
     const steps = await listStoredRunSteps({ env, runId });
     const step = steps.find((s) => s.stepPath === params.stepPath);
     if (!step) {
-      return { error: errorEnvelope("not_found", `Step "${params.stepPath}" not found for job "${jobId}"`) };
+      return {
+        error: errorEnvelope("not_found", `Step "${params.stepPath}" not found for job "${jobId}"`),
+      };
     }
     resolvedCheckpointId = step.boundaryCheckpointId;
   }
   if (!resolvedCheckpointId) {
-    return { error: errorEnvelope("invalid_request", "rewind requires either checkpointId or stepPath") };
+    return {
+      error: errorEnvelope("invalid_request", "rewind requires either checkpointId or stepPath"),
+    };
   }
 
   const checkpoint = await getStoredCheckpoint({ env, checkpointId: resolvedCheckpointId });
   if (!checkpoint || checkpoint.jobId !== jobId) {
     return {
-      error: errorEnvelope("not_found", `Checkpoint "${resolvedCheckpointId}" not found for job "${jobId}"`),
+      error: errorEnvelope(
+        "not_found",
+        `Checkpoint "${resolvedCheckpointId}" not found for job "${jobId}"`,
+      ),
     };
   }
   // Only a step boundary (a step outcome or an active gate) is rewindable;
@@ -938,14 +1004,21 @@ async function resolveRewindTarget(params: {
   const targetRun =
     checkpoint.runId === run.runId ? run : await getStoredRun(env, checkpoint.runId);
   if (!targetRun) {
-    return { error: errorEnvelope("not_found", `Run "${checkpoint.runId}" not found for checkpoint`) };
+    return {
+      error: errorEnvelope("not_found", `Run "${checkpoint.runId}" not found for checkpoint`),
+    };
   }
   if (targetRun.sourceType !== "workflow_file" || !targetRun.workflowFile) {
-    return { error: errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only") };
+    return {
+      error: errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only"),
+    };
   }
   if (typeof checkpoint.stepIndex !== "number") {
     return {
-      error: errorEnvelope("replay_not_supported", "Checkpoint does not contain workflow replay state"),
+      error: errorEnvelope(
+        "replay_not_supported",
+        "Checkpoint does not contain workflow replay state",
+      ),
     };
   }
   return {
@@ -1444,6 +1517,26 @@ async function loadWorkflowRunContext(
     stepPathPrefix: typeof resume?.stepPathPrefix === "string" ? resume.stepPathPrefix : "root",
     depth: typeof resume?.depth === "number" ? resume.depth : 0,
     latestCheckpointId: checkpointId,
+  });
+}
+
+/**
+ * Build a run execution context from a run id. Used after a nested parent
+ * walk-up to anchor the resume envelope on the top-most (root) run rather than
+ * the child gate that was originally resumed.
+ */
+async function loadWorkflowRunHead(
+  env: Record<string, string | undefined>,
+  runId: string,
+): Promise<WorkflowExecutionContext | undefined> {
+  const run = await getStoredRun(env, runId).catch(() => null);
+  if (!run) return undefined;
+  return createCheckpointRun(run.runId, {
+    jobId: run.jobId,
+    rootRunId: run.rootRunId,
+    parentRunId: run.parentRunId ?? null,
+    depth: run.depth,
+    latestCheckpointId: run.latestCheckpointId ?? null,
   });
 }
 

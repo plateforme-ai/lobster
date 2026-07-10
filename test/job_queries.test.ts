@@ -77,7 +77,9 @@ test("public core query APIs expose job, nested runs, and pending approvals", as
   assert.equal(job?.control.stepMode, true);
   assert.equal(job?.control.desired, "none");
   assert.equal(job?.wait?.kind, "approval");
-  assert.equal(job?.wait?.stepId, "callChild");
+  // The head wait resolves to the child gate that actually triggered the
+  // suspension (the child's `review` step), not the parent call-stack frame.
+  assert.equal(job?.wait?.stepId, "review");
 
   const rootRun = await getRun({ runId: first.runId!, ctx: { env } });
   assert.equal(rootRun?.runId, first.runId);
