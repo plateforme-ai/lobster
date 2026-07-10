@@ -1,3 +1,5 @@
+import type { UsageTotals } from "../core/cost_tracker.js";
+
 export type RunStatus =
   | "running"
   | "waiting"
@@ -47,6 +49,10 @@ export type JobRecord = {
   pipelineText?: string | null;
   control: RunControlSnapshot;
   wait?: JobWaitSnapshot | null;
+  // Aggregate LLM token usage + estimated cost across all of the job's runs,
+  // summed from per-step/per-detail checkpoint usage. Present when any tracked
+  // LLM call occurred; omitted otherwise.
+  usage?: UsageTotals | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -87,6 +93,9 @@ export type RunRecord = {
   finalOutputBlobId?: string | null;
   latestCheckpointId?: string | null;
   control: RunControlSnapshot;
+  // Aggregate LLM token usage + estimated cost for this run, summed from the
+  // run's per-step/per-detail checkpoint usage.
+  usage?: UsageTotals | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -181,6 +190,9 @@ export type StepRecord = {
   } | null;
   error?: unknown;
   stepResult?: unknown;
+  // LLM token usage + estimated cost attributed to this step (its boundary plus
+  // any auto-metadata detail). Present only when the step made tracked LLM calls.
+  usage?: UsageTotals | null;
   boundaryCheckpointId: string;
   detailCheckpointIds: string[];
 };

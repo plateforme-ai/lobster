@@ -68,7 +68,16 @@ export type LlmTextCompleter = (params: {
   prompt: string;
   model?: string | null;
   signal?: AbortSignal;
-}) => Promise<{ text: string | null } | null>;
+}) => Promise<{ text: string | null; usage?: Record<string, unknown> | null } | null>;
+
+// Result of an internal text completion. `usage`/`model` are surfaced so callers
+// can account internal generation (e.g. `metadata: auto`) against the run's
+// cost tracker instead of silently discarding the tokens spent.
+export type LlmTextResult = {
+  text: string | null;
+  usage?: Record<string, unknown> | null;
+  model?: string | null;
+};
 
 export function resolveProvider(
   args: any,
@@ -420,7 +429,7 @@ export async function invokeLlmText({
   model?: string | null;
   signal?: AbortSignal;
   timeoutMs?: number;
-}): Promise<string | null> {
+}): Promise<LlmTextResult> {
   const args: any = {};
   if (model) args.model = model;
 
@@ -466,14 +475,15 @@ export async function invokeLlmText({
     );
   });
 
+  const effectiveModel = resolvedModel || model || null;
   try {
     if (textCompleter) {
       const result = await Promise.race([
-        textCompleter({ prompt, model: resolvedModel || model || null, signal: combinedSignal }),
+        textCompleter({ prompt, model: effectiveModel, signal: combinedSignal }),
         abortPromise,
       ]);
       const text = typeof result?.text === "string" ? result.text.trim() : "";
-      return text || null;
+      return { text: text || null, usage: result?.usage ?? null, model: effectiveModel };
     }
 
     // Fallback (standalone core, no in-process completer): resolve a transport
@@ -494,11 +504,16 @@ export async function invokeLlmText({
       throw new Error(envelope?.error?.message ?? "llm adapter returned an error");
     }
     const output = envelope.result?.output;
+    const usage = envelope.result?.usage ?? null;
+    const responseModel =
+      typeof envelope.result?.model === "string" ? envelope.result.model : effectiveModel;
     const text = typeof output?.text === "string" ? output.text.trim() : "";
-    if (text) return text;
+    if (text) return { text, usage, model: responseModel };
     const data = output?.data;
-    if (typeof data === "string" && data.trim()) return data.trim();
-    return null;
+    if (typeof data === "string" && data.trim()) {
+      return { text: data.trim(), usage, model: responseModel };
+    }
+    return { text: null, usage, model: responseModel };
   } finally {
     if (timer) clearTimeout(timer);
   }

@@ -32,8 +32,14 @@ import {
 import { readLineFromStream } from "../read_line.js";
 import { resolveInlineShellCommand } from "../shell.js";
 import { compileCached } from "../validation.js";
-import { CostTracker } from "../core/cost_tracker.js";
-import type { CostLimit, CostSummary } from "../core/cost_tracker.js";
+import {
+  CostTracker,
+  addStepCostToTotals,
+  addUsageTotals,
+  emptyUsageTotals,
+  hasUsageTotals,
+} from "../core/cost_tracker.js";
+import type { CostLimit, CostSummary, StepCost, UsageTotals } from "../core/cost_tracker.js";
 import { withRetry, resolveRetryConfig } from "../core/retry.js";
 import type { RetryConfig } from "../core/retry.js";
 import {
@@ -1306,6 +1312,9 @@ export async function runWorkflowFile({
         const indexVar = step.index_var ?? "index";
         const batchSize = step.batch_size ?? 1;
         const iterationResults: unknown[] = [];
+        // Accumulate LLM usage across all for_each sub-step invocations so the
+        // loop's single boundary checkpoint carries the aggregate.
+        const forEachUsage = emptyUsageTotals();
 
         for (let itemIdx = 0; itemIdx < itemsRef.length; itemIdx++) {
           if (step.pause_ms && itemIdx > 0 && itemIdx % batchSize === 0) {
@@ -1382,7 +1391,10 @@ export async function runWorkflowFile({
             }
 
             scopedResults[subStep.id] = subResult;
-            trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult);
+            addStepCostToTotals(
+              forEachUsage,
+              trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult),
+            );
             if (workflow.cost_limit) {
               costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
             }
@@ -1413,14 +1425,10 @@ export async function runWorkflowFile({
           kind: "step",
           name: "for_each",
           status: "succeeded",
-          metadata: { stepResult: loopResult },
+          metadata: { stepResult: loopResult, ...usageMetadata(forEachUsage) },
           io: { jsonOutput: iterationResults },
         });
         lastStepId = step.id;
-        trackStepCost(costTracker, step.id, loopResult);
-        if (workflow.cost_limit) {
-          costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
-        }
         continue;
       }
 
@@ -1826,13 +1834,18 @@ export async function runWorkflowFile({
         continue;
       }
 
+      // Aggregate this step's LLM token usage (its own result plus any parallel
+      // branch results) so it can be persisted on the boundary checkpoint. The
+      // in-memory tracker still drives cost_limit enforcement below.
+      const stepUsage = emptyUsageTotals();
       if (parallelBranchResults) {
         for (const [branchId, branchResult] of Object.entries(parallelBranchResults)) {
           results[branchId] = branchResult;
-          trackStepCost(costTracker, branchId, branchResult);
+          addStepCostToTotals(stepUsage, trackStepCost(costTracker, branchId, branchResult));
         }
       }
       results[step.id] = result;
+      addStepCostToTotals(stepUsage, trackStepCost(costTracker, step.id, result));
       lastStepId = step.id;
       await appendCheckpoint({
         env: ctx.env,
@@ -1847,6 +1860,7 @@ export async function runWorkflowFile({
           stepResult: result,
           branchResults: parallelBranchResults ?? undefined,
           retry: retryConfig.max > 1 ? retryConfig : undefined,
+          ...usageMetadata(stepUsage),
         },
         io: {
           stdin: resolveShellStdin(step.stdin, resolvedArgs, results),
@@ -1867,6 +1881,7 @@ export async function runWorkflowFile({
           step,
           stepIndex: idx,
           checkpointRun,
+          costTracker,
           resolvedArgs,
           results,
           input: resolveShellStdin(step.stdin, resolvedArgs, results),
@@ -1907,7 +1922,9 @@ export async function runWorkflowFile({
         }
       }
 
-      trackStepCost(costTracker, step.id, result);
+      // Usage was already recorded into the tracker above (before the boundary
+      // checkpoint) so it could be persisted; enforce the limit here so the
+      // step's boundary is durably logged before we may abort the run.
       if (workflow.cost_limit) {
         costTracker.checkLimit(workflow.cost_limit, ctx.stderr);
       }
@@ -2301,6 +2318,7 @@ async function applyStepMetadata({
   step,
   stepIndex,
   checkpointRun,
+  costTracker,
   resolvedArgs,
   results,
   input,
@@ -2310,6 +2328,7 @@ async function applyStepMetadata({
   step: WorkflowStep;
   stepIndex: number;
   checkpointRun: WorkflowExecutionContext;
+  costTracker: CostTracker;
   resolvedArgs: Record<string, unknown>;
   results: Record<string, WorkflowStepResult>;
   input: unknown;
@@ -2317,6 +2336,7 @@ async function applyStepMetadata({
 }): Promise<StepMetadataOutcome> {
   const meta = step.metadata as NormalizedWorkflowStepMetadata;
   const stepPath = workflowStepPath(checkpointRun, step.id);
+  const autoUsage = emptyUsageTotals();
   try {
     const updates: {
       title?: string;
@@ -2333,6 +2353,7 @@ async function applyStepMetadata({
       const auto = await generateJobMetadataAuto({
         ctx,
         step,
+        costTracker,
         input,
         output,
         needTitle: meta.autoTitle,
@@ -2340,6 +2361,7 @@ async function applyStepMetadata({
       });
       if (meta.autoTitle && auto.title) updates.title = auto.title;
       if (meta.autoDescription && auto.description) updates.description = auto.description;
+      addUsageTotals(autoUsage, auto.usage);
     }
     if (Object.keys(meta.custom).length > 0) {
       updates.metadata = meta.custom;
@@ -2399,6 +2421,7 @@ async function applyStepMetadata({
           ...(updates.description !== undefined ? { description: updates.description } : {}),
           ...(updates.metadata !== undefined ? { custom: updates.metadata } : {}),
           auto: { title: meta.autoTitle, description: meta.autoDescription },
+          ...usageMetadata(autoUsage),
         },
       }).catch(() => {});
     }
@@ -2426,6 +2449,7 @@ async function applyStepMetadata({
 async function generateJobMetadataAuto({
   ctx,
   step,
+  costTracker,
   input,
   output,
   needTitle,
@@ -2433,24 +2457,40 @@ async function generateJobMetadataAuto({
 }: {
   ctx: RunContext;
   step: WorkflowStep;
+  costTracker: CostTracker;
   input: unknown;
   output: WorkflowStepResult;
   needTitle: boolean;
   needDescription: boolean;
-}): Promise<{ title?: string; description?: string }> {
+}): Promise<{ title?: string; description?: string; usage: UsageTotals }> {
   const { invokeLlmText } = await import("../commands/stdlib/llm_client.js");
   const inputText = compactForPrompt(input);
   const outputText = compactForPrompt(output.json ?? output.stdout ?? null);
   const timeoutMs = parseMetadataTimeoutMs(ctx.env);
   const signal = ctx.signal;
-  const result: { title?: string; description?: string } = {};
+  const result: { title?: string; description?: string; usage: UsageTotals } = {
+    usage: emptyUsageTotals(),
+  };
+  // Account internal auto-metadata generation against the run's cost tracker so
+  // its tokens are enforced by cost_limit and surface in the job usage aggregate.
+  const recordAutoUsage = (
+    usage: Record<string, unknown> | null | undefined,
+    model?: string | null,
+  ) => {
+    if (!usage) return;
+    addStepCostToTotals(
+      result.usage,
+      costTracker.recordUsage(`${step.id}.metadata`, model ?? null, usage),
+    );
+  };
   if (needTitle) {
     const prompt =
       `Write a concise title (at most 8 words, no surrounding quotes) that summarizes the ` +
       `result of workflow step "${step.id}". Input: ${inputText} Output: ${outputText} ` +
       `Respond with only the title text.`;
     const title = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
-    if (title) result.title = title.split("\n")[0]!.trim();
+    recordAutoUsage(title.usage, title.model);
+    if (title.text) result.title = title.text.split("\n")[0]!.trim();
   }
   if (needDescription) {
     const prompt =
@@ -2458,7 +2498,8 @@ async function generateJobMetadataAuto({
       `"${step.id}". Input: ${inputText} Output: ${outputText} ` +
       `Respond with only the description text.`;
     const description = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
-    if (description) result.description = description.trim();
+    recordAutoUsage(description.usage, description.model);
+    if (description.text) result.description = description.text.trim();
   }
   return result;
 }
@@ -3216,19 +3257,45 @@ function parseBoolLike(value: unknown): boolean | undefined {
   return undefined;
 }
 
-function trackStepCost(costTracker: CostTracker, stepId: string, result: WorkflowStepResult) {
+// Record every LLM `usage` block carried by a step result into the cost tracker
+// (for cost_limit enforcement) and return the aggregated per-step usage so the
+// caller can persist it on the step's boundary checkpoint. Returns undefined
+// when the result carried no usage.
+function trackStepCost(
+  costTracker: CostTracker,
+  stepId: string,
+  result: WorkflowStepResult,
+): StepCost | undefined {
   const json = result.json;
-  if (!json || typeof json !== "object") return;
+  if (!json || typeof json !== "object") return undefined;
 
   const items = Array.isArray(json) ? json : [json];
+  let recorded = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let costUsd = 0;
+  let model: string | null = null;
   for (const item of items) {
     if (!item || typeof item !== "object") continue;
     const usage = (item as Record<string, unknown>).usage;
     if (!usage || typeof usage !== "object") continue;
     const modelValue = (item as Record<string, unknown>).model;
-    const model = typeof modelValue === "string" ? modelValue : null;
-    costTracker.recordUsage(stepId, model, usage as Record<string, unknown>);
+    const itemModel = typeof modelValue === "string" ? modelValue : null;
+    const cost = costTracker.recordUsage(stepId, itemModel, usage as Record<string, unknown>);
+    inputTokens += cost.inputTokens;
+    outputTokens += cost.outputTokens;
+    costUsd += cost.costUsd;
+    if (itemModel) model = itemModel;
+    recorded = true;
   }
+  if (!recorded) return undefined;
+  return { stepId, model, inputTokens, outputTokens, costUsd };
+}
+
+// Serialize UsageTotals for persistence on checkpoint metadata (only when there
+// is something to record).
+function usageMetadata(totals: UsageTotals): { usage: UsageTotals } | undefined {
+  return hasUsageTotals(totals) ? { usage: totals } : undefined;
 }
 
 function parseJson(stdout: string) {

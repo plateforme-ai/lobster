@@ -19,6 +19,13 @@ import type {
   RunRecord,
   RunStatus,
 } from "../workflows/checkpoints.js";
+import {
+  addUsageTotals,
+  emptyUsageTotals,
+  hasUsageTotals,
+  readUsageTotals,
+} from "../core/cost_tracker.js";
+import type { UsageTotals } from "../core/cost_tracker.js";
 import { storePayload, readBlobJson } from "./blob_store.js";
 import { parseJsonSafe, stringifySafe } from "./serialization.js";
 import { withRuntimeDb } from "./sqlite.js";
@@ -404,7 +411,9 @@ export async function getRun(
         .get(runId) as any,
   );
   if (!row) return null;
-  return rowToRun(env, row);
+  const run = await rowToRun(env, row);
+  run.usage = await aggregateRunUsage({ env, runId });
+  return run;
 }
 
 export async function getJob(
@@ -434,6 +443,7 @@ export async function getJob(
   if (!row) return null;
   const job = await rowToJob(env, row);
   job.wait = await resolveJobHeadWait({ env, jobId });
+  job.usage = await aggregateJobUsage({ env, jobId });
   return job;
 }
 
@@ -1137,6 +1147,36 @@ export async function listJobCheckpoints(params: {
   return rows.map(rowToCheckpoint);
 }
 
+// Sum the per-step/per-detail `metadata.usage` blocks persisted on a set of
+// checkpoints into a single aggregate. Resume-safe by construction: each
+// checkpoint is written exactly once, so summing never double-counts and never
+// depends on a run reaching its terminal bookend.
+export function aggregateCheckpointUsage(checkpoints: CheckpointRecord[]): UsageTotals | undefined {
+  const totals = emptyUsageTotals();
+  for (const cp of checkpoints) {
+    addUsageTotals(totals, readUsageTotals((cp.metadata as any)?.usage));
+  }
+  return hasUsageTotals(totals) ? totals : undefined;
+}
+
+export async function aggregateJobUsage(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+}): Promise<UsageTotals | undefined> {
+  return aggregateCheckpointUsage(
+    await listJobCheckpoints({ env: params.env, jobId: params.jobId }),
+  );
+}
+
+export async function aggregateRunUsage(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}): Promise<UsageTotals | undefined> {
+  return aggregateCheckpointUsage(
+    await listRunCheckpoints({ env: params.env, runId: params.runId }),
+  );
+}
+
 const TERMINAL_STEP_STATUSES: ReadonlySet<CheckpointRecord["status"]> = new Set([
   "succeeded",
   "failed",
@@ -1165,6 +1205,7 @@ export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepR
     activeGate?: CheckpointRecord;
     lastBoundary?: CheckpointRecord;
     details: { seq: number; checkpointId: string }[];
+    usage: UsageTotals;
   };
   const byPath = new Map<string, Acc>();
 
@@ -1190,6 +1231,7 @@ export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepR
         },
         firstSeq: cp.seq,
         details: [],
+        usage: emptyUsageTotals(),
       };
       byPath.set(key, acc);
     }
@@ -1204,6 +1246,9 @@ export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepR
     acc.firstSeq = Math.min(acc.firstSeq, cp.seq);
     acc.step.stepId = cp.stepId ?? acc.step.stepId;
     acc.step.stepIndex = cp.stepIndex ?? acc.step.stepIndex;
+    // Usage is persisted on both the step boundary and its metadata detail; sum
+    // across every checkpoint of the step (boundary + details).
+    addUsageTotals(acc.usage, readUsageTotals((cp.metadata as any)?.usage));
 
     if (cp.kind === "detail") {
       acc.details.push({ seq: cp.seq, checkpointId: cp.checkpointId });
@@ -1248,6 +1293,7 @@ export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepR
       step.boundaryCheckpointId = boundary.checkpointId;
     }
     step.detailCheckpointIds = acc.details.sort((a, b) => a.seq - b.seq).map((d) => d.checkpointId);
+    if (hasUsageTotals(acc.usage)) step.usage = acc.usage;
     resolved.push({ firstSeq: acc.firstSeq, step });
   }
   resolved.sort((a, b) => a.firstSeq - b.firstSeq);

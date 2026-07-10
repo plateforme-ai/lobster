@@ -13,6 +13,71 @@ export type CostSummary = {
   byStep: StepCost[];
 };
 
+// Compact per-scope (step / run / job) usage aggregate persisted on checkpoints
+// and surfaced by the public query APIs. Token counts plus estimated USD.
+export type UsageTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+};
+
+export function emptyUsageTotals(): UsageTotals {
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 };
+}
+
+export function hasUsageTotals(totals: UsageTotals | null | undefined): boolean {
+  if (!totals) return false;
+  return (
+    totals.inputTokens > 0 ||
+    totals.outputTokens > 0 ||
+    totals.totalTokens > 0 ||
+    totals.costUsd > 0
+  );
+}
+
+function roundCost(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000;
+}
+
+export function addStepCostToTotals(
+  totals: UsageTotals,
+  cost: StepCost | null | undefined,
+): UsageTotals {
+  if (!cost) return totals;
+  totals.inputTokens += cost.inputTokens;
+  totals.outputTokens += cost.outputTokens;
+  totals.totalTokens += cost.inputTokens + cost.outputTokens;
+  totals.costUsd = roundCost(totals.costUsd + cost.costUsd);
+  return totals;
+}
+
+// Coerce an untrusted persisted value into UsageTotals (used when summing usage
+// read back from checkpoint metadata). Non-finite/negative fields drop to zero.
+export function readUsageTotals(value: unknown): UsageTotals | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const inputTokens = toTokenCount(record.inputTokens);
+  const outputTokens = toTokenCount(record.outputTokens);
+  const totalTokens = toTokenCount(record.totalTokens) || inputTokens + outputTokens;
+  const costRaw = Number(record.costUsd ?? 0);
+  const costUsd = Number.isFinite(costRaw) && costRaw > 0 ? costRaw : 0;
+  const totals: UsageTotals = { inputTokens, outputTokens, totalTokens, costUsd };
+  return hasUsageTotals(totals) ? totals : undefined;
+}
+
+export function addUsageTotals(
+  target: UsageTotals,
+  addend: UsageTotals | null | undefined,
+): UsageTotals {
+  if (!addend) return target;
+  target.inputTokens += addend.inputTokens;
+  target.outputTokens += addend.outputTokens;
+  target.totalTokens += addend.totalTokens;
+  target.costUsd = roundCost(target.costUsd + addend.costUsd);
+  return target;
+}
+
 export type CostLimit = {
   max_usd: number;
   action?: "warn" | "stop";
@@ -56,7 +121,7 @@ export class CostTracker {
     this.stderr = stderr;
   }
 
-  recordUsage(stepId: string, model: string | null, usage: Record<string, unknown>) {
+  recordUsage(stepId: string, model: string | null, usage: Record<string, unknown>): StepCost {
     const inputTokens = toTokenCount(
       usage.inputTokens ?? usage.input_tokens ?? usage.prompt_tokens,
     );
@@ -74,7 +139,9 @@ export class CostTracker {
     const effectivePricing = pricing ?? { input: 0, output: 0 };
     const costUsd =
       (inputTokens * effectivePricing.input + outputTokens * effectivePricing.output) / 1_000_000;
-    this.steps.push({ stepId, model, inputTokens, outputTokens, costUsd });
+    const cost: StepCost = { stepId, model, inputTokens, outputTokens, costUsd };
+    this.steps.push(cost);
+    return cost;
   }
 
   getSummary(): CostSummary {

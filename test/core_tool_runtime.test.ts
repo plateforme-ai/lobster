@@ -554,17 +554,36 @@ test("invokeLlmText prefers ctx.llmText and never touches llmAdapters", async ()
     },
   };
   const env = {};
-  const text = await invokeLlmText({
+  const result = await invokeLlmText({
     ctx,
     env,
     prompt: "summarize",
     model: "m/x",
     timeoutMs: 5_000,
   });
-  assert.equal(text, "hook result");
+  assert.equal(result.text, "hook result");
   assert.equal(hookCalls.length, 1);
   assert.equal(hookCalls[0]!.model, "m/x");
   assert.equal(adapterCalls.length, 0);
+});
+
+test("invokeLlmText surfaces host usage from ctx.llmText", async () => {
+  const ctx = {
+    llmText: async () => ({
+      text: "hook result",
+      usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+    }),
+  };
+  const result = await invokeLlmText({
+    ctx,
+    env: {},
+    prompt: "summarize",
+    model: "m/x",
+    timeoutMs: 5_000,
+  });
+  assert.equal(result.text, "hook result");
+  assert.deepEqual(result.usage, { inputTokens: 12, outputTokens: 8, totalTokens: 20 });
+  assert.equal(result.model, "m/x");
 });
 
 async function writeTwoStepWorkflow(tmpDir: string): Promise<string> {
