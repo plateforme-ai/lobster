@@ -125,7 +125,7 @@ export async function finalizePipelineToolRun(params: {
     const approvalId = generateApprovalId();
     const checkpointId = await appendPipelineWaitCheckpoint(params.env, {
       run: params.checkpointRun,
-      stepType: "approval",
+      gate: "approval",
       resumeState,
       metadata: { approvalId, prompt: approval.prompt },
     });
@@ -183,7 +183,7 @@ export async function finalizePipelineToolRun(params: {
     };
     const checkpointId = await appendPipelineWaitCheckpoint(params.env, {
       run: params.checkpointRun,
-      stepType: "pipeline_input",
+      gate: "input",
       resumeState,
       metadata: { prompt: inputRequest.prompt },
     });
@@ -234,7 +234,7 @@ async function appendPipelineWaitCheckpoint(
   env: Record<string, string | undefined>,
   args: {
     run?: WorkflowExecutionContext;
-    stepType: "approval" | "pipeline_input";
+    gate: "approval" | "input";
     resumeState: PipelineResumeState;
     metadata?: unknown;
   },
@@ -242,8 +242,9 @@ async function appendPipelineWaitCheckpoint(
   return appendCheckpoint({
     env,
     run: args.run,
-    stepId: args.stepType === "approval" ? "pipeline-approval" : "pipeline-input",
-    stepType: args.stepType,
+    stepId: args.gate === "approval" ? "pipeline-approval" : "pipeline-input",
+    kind: "gate",
+    name: args.gate,
     status: "waiting",
     metadata: args.metadata,
     resumeState: args.resumeState,

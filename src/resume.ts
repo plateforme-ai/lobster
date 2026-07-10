@@ -108,12 +108,7 @@ export async function resolveApprovalId(
   }
 
   const resume = (checkpoint.resumeState ?? null) as { kind?: unknown } | null;
-  const kind =
-    resume?.kind === "pipeline-resume" ||
-    checkpoint.stepType === "pipeline" ||
-    checkpoint.stepType === "pipeline_input"
-      ? "pipeline-resume"
-      : "workflow-file";
+  const kind = resume?.kind === "pipeline-resume" ? "pipeline-resume" : "workflow-file";
 
   return encodeToken({
     protocolVersion: 1,

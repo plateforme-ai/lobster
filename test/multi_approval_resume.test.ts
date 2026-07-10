@@ -31,8 +31,7 @@ function resume(token, approve, env) {
 
 test("two approve gates can be resumed sequentially", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-multi-approval-"));
-  const stateDir = path.join(tmpDir, "state");
-  const env = { LOBSTER_DIR: path.dirname(stateDir) };
+  const env = { LOBSTER_DIR: tmpDir };
 
   const pipeline = [
     "exec --json --shell \"printf '%s' '[{\\\"x\\\":1}]'\"",
@@ -52,8 +51,4 @@ test("two approve gates can be resumed sequentially", async () => {
   const done = resume(second.requiresApproval.resumeToken, true, env);
   assert.equal(done.status, "ok");
   assert.deepEqual(done.output, [{ x: 1 }]);
-
-  const files = await fsp.readdir(stateDir);
-  const pipelineResumeFiles = files.filter((name) => name.startsWith("pipeline_resume_"));
-  assert.deepEqual(pipelineResumeFiles, []);
 });

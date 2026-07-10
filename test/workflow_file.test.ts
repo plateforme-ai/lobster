@@ -57,7 +57,6 @@ test("workflow file runs with approval and resume", async () => {
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -96,10 +95,6 @@ test("workflow file runs with approval and resume", async () => {
 
   assert.equal(resumed.status, "ok");
   assert.deepEqual(resumed.output, [{ done: true, value: 2 }]);
-
-  const stateFiles = await fsp.readdir(stateDir);
-  const resumeStateFiles = stateFiles.filter((name) => name.startsWith("workflow_resume_"));
-  assert.deepEqual(resumeStateFiles, []);
 });
 
 test("workflow resume cancellation cleans up resume state", async () => {
@@ -120,7 +115,6 @@ test("workflow resume cancellation cleans up resume state", async () => {
   };
 
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-cancel-"));
-  const stateDir = path.join(tmpDir, "state");
   const filePath = path.join(tmpDir, "workflow.lobster");
   await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
@@ -160,9 +154,11 @@ test("workflow resume cancellation cleans up resume state", async () => {
 
   assert.equal(cancelled.status, "cancelled");
   assert.deepEqual(cancelled.output, []);
-  const files = await fsp.readdir(stateDir);
-  const resumeStateFiles = files.filter((name) => name.startsWith("workflow_resume_"));
-  assert.deepEqual(resumeStateFiles, []);
+
+  // Resume state lives on the waiting gate checkpoint. Cancelling must spend it:
+  // the gate is no longer `waiting`, so the token can never be resumed again.
+  const spentGate = await getCheckpoint({ env, checkpointId: payload.checkpointId! });
+  assert.notEqual(spentGate?.status, "waiting");
 });
 
 test("workflow file input steps pause and resume with structured responses", async () => {

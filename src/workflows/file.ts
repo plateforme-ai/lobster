@@ -970,9 +970,11 @@ export async function runWorkflowFile({
       await appendCheckpoint({
         env: ctx.env,
         run: checkpointRun,
-        stepId: "workflow-start",
-        stepIndex: -1,
-        stepType: "workflow",
+        stepId: null,
+        stepIndex: null,
+        stepPath: null,
+        kind: "internal",
+        name: "start",
         status: "started",
         metadata: {
           filePath: resolvedFilePath,
@@ -992,6 +994,7 @@ export async function runWorkflowFile({
             parentRunId: child.parentRunId,
             stepPathPrefix: child.stepPathPrefix,
             depth: child.depth,
+            ...(checkpointRun?.observer ? { observer: checkpointRun.observer } : {}),
           })
         : undefined;
       const childResult = await runWorkflowFile({
@@ -1067,7 +1070,9 @@ export async function runWorkflowFile({
         run: checkpointRun,
         stepId: resumeState.approvalStepId,
         stepIndex: stepIndexById.get(resumeState.approvalStepId) ?? null,
-        stepType: "approval",
+        stepPath: workflowStepPath(checkpointRun, resumeState.approvalStepId),
+        kind: "internal",
+        name: "resumed",
         status: "resumed",
         metadata: {
           approved,
@@ -1157,7 +1162,9 @@ export async function runWorkflowFile({
           run: checkpointRun,
           stepId: resumeState.inputStepId,
           stepIndex: stepIndexById.get(resumeState.inputStepId) ?? null,
-          stepType: "input",
+          stepPath: workflowStepPath(checkpointRun, resumeState.inputStepId),
+          kind: "internal",
+          name: "resumed",
           status: "resumed",
           metadata: {
             stepResult: previous,
@@ -1214,7 +1221,8 @@ export async function runWorkflowFile({
             run: checkpointRun,
             stepId: step.id,
             stepIndex: idx,
-            stepType: "pause",
+            kind: "gate",
+            name: "pause",
             status: "waiting",
             metadata: { reason },
             resumeState: {
@@ -1255,7 +1263,8 @@ export async function runWorkflowFile({
           run: checkpointRun,
           stepId: step.id,
           stepIndex: idx,
-          stepType: getStepExecution(step).kind,
+          kind: "step",
+          name: getStepExecution(step).kind,
           status: "skipped",
           metadata: {
             condition: step.when ?? step.condition ?? null,
@@ -1287,7 +1296,8 @@ export async function runWorkflowFile({
             run: checkpointRun,
             stepId: step.id,
             stepIndex: idx,
-            stepType: "input",
+            kind: "gate",
+            name: "input",
             status: "waiting",
             metadata: { prompt: step.input.prompt },
             resumeState: {
@@ -1346,7 +1356,8 @@ export async function runWorkflowFile({
           run: checkpointRun,
           stepId: step.id,
           stepIndex: idx,
-          stepType: "input",
+          kind: "step",
+          name: "input",
           status: "succeeded",
           metadata: { stepResult: results[step.id] },
           io: { jsonInput: subject, jsonOutput: parsed },
@@ -1427,8 +1438,9 @@ export async function runWorkflowFile({
               const pipelineText = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
               const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
               subResult = await runPipelineStep({
-                stepId: subStep.id,
-                stepScopeId: `${step.id}.${subStep.id}`,
+                stepId: step.id,
+                stepIndex: idx,
+                branchScope: subStep.id,
                 pipelineText,
                 inputValue,
                 ctx,
@@ -1470,7 +1482,8 @@ export async function runWorkflowFile({
           run: checkpointRun,
           stepId: step.id,
           stepIndex: idx,
-          stepType: "for_each",
+          kind: "step",
+          name: "for_each",
           status: "succeeded",
           metadata: { stepResult: loopResult },
           io: { jsonOutput: iterationResults },
@@ -1567,8 +1580,9 @@ export async function runWorkflowFile({
                 const pipelineText = resolveTemplate(branchExec.value, resolvedArgs, results);
                 const inputValue = resolveInputValue(branch.stdin, resolvedArgs, results);
                 const branchResult = await runPipelineStep({
-                  stepId: branch.id,
-                  stepScopeId: `${step.id}.${branch.id}`,
+                  stepId: step.id,
+                  stepIndex: idx,
+                  branchScope: branch.id,
                   pipelineText,
                   inputValue,
                   ctx: { ...ctx, signal: branchSignal },
@@ -1725,6 +1739,7 @@ export async function runWorkflowFile({
             const inputValue = resolveInputValue(step.stdin, resolvedArgs, results);
             result = await runPipelineStep({
               stepId: step.id,
+              stepIndex: idx,
               pipelineText,
               inputValue,
               ctx: { ...ctx, signal: stepSignal },
@@ -1797,7 +1812,8 @@ export async function runWorkflowFile({
             run: checkpointRun,
             stepId: err.stepId,
             stepIndex: idx,
-            stepType: "pipeline_input",
+            kind: "gate",
+            name: "input",
             status: "waiting",
             metadata: { prompt: err.request.prompt },
             resumeState: {
@@ -1854,10 +1870,9 @@ export async function runWorkflowFile({
           : (err?.message ?? String(err));
         const policy = step.on_error ?? "stop";
 
-        if (policy === "stop") {
-          throw isTimeout ? new Error(errorMessage) : err;
-        }
-
+        // Record the failed step boundary for every policy (including `stop`) so the failure is a first-class
+        // checkpoint: it surfaces in the run timeline, folds into a `failed` step, and is rewindable. Policy only
+        // governs control flow afterwards.
         results[step.id] = {
           id: step.id,
           error: true,
@@ -1868,13 +1883,17 @@ export async function runWorkflowFile({
           run: checkpointRun,
           stepId: step.id,
           stepIndex: idx,
-          stepType: execution.kind,
+          kind: "step",
+          name: execution.kind,
           status: "failed",
           finishedAt: new Date().toISOString(),
           error: { message: errorMessage },
           metadata: { policy, stepResult: results[step.id] },
         });
 
+        if (policy === "stop") {
+          throw isTimeout ? new Error(errorMessage) : err;
+        }
         if (policy === "skip_rest") {
           break;
         }
@@ -1894,7 +1913,8 @@ export async function runWorkflowFile({
         run: checkpointRun,
         stepId: step.id,
         stepIndex: idx,
-        stepType: execution.kind,
+        kind: "step",
+        name: execution.kind,
         status: "succeeded",
         finishedAt: new Date().toISOString(),
         metadata: {
@@ -1929,11 +1949,31 @@ export async function runWorkflowFile({
         if (!metadataOutcome.ok) {
           // Metadata generation is a step sub-operation: on failure follow the
           // step's on_error policy so it can be stopped/replayed/rewound like any
-          // other step failure. The scoped metadata checkpoint is the anchor.
-          // The step's own succeeded checkpoint stays intact.
+          // other step failure. The scoped metadata detail remains available, but
+          // the owning step boundary must also fail so folding, rewind, and live
+          // session mirroring see the step's terminal state.
           const metadataPolicy = step.on_error ?? "stop";
+          const errorMessage =
+            metadataOutcome.error ?? `metadata generation failed for step '${step.id}'`;
+          results[step.id] = {
+            id: step.id,
+            error: true,
+            errorMessage,
+          };
+          await appendCheckpoint({
+            env: ctx.env,
+            run: checkpointRun,
+            stepId: step.id,
+            stepIndex: idx,
+            kind: "step",
+            name: execution.kind,
+            status: "failed",
+            finishedAt: new Date().toISOString(),
+            error: { message: errorMessage },
+            metadata: { policy: metadataPolicy, stepResult: results[step.id] },
+          });
           if (metadataPolicy === "stop") {
-            throw new Error(metadataOutcome.error ?? `metadata generation failed for step '${step.id}'`);
+            throw new Error(errorMessage);
           }
           if (metadataPolicy === "skip_rest") {
             break;
@@ -1960,7 +2000,8 @@ export async function runWorkflowFile({
             run: checkpointRun,
             stepId: step.id,
             stepIndex: idx,
-            stepType: "approval",
+            kind: "gate",
+            name: "approval",
             status: "waiting",
             metadata: {
               approvalId,
@@ -2034,15 +2075,17 @@ export async function runWorkflowFile({
     if (consumedResumeCheckpointId) {
       await consumeWorkflowResumeState(ctx.env, consumedResumeCheckpointId);
     }
-    // Symmetric terminal bookend to `workflow-start`: one `workflow`/`succeeded`
-    // row closing the run. Per-step outputs already live on their own
-    // checkpoints, so no results snapshot is duplicated here.
+    // Symmetric terminal bookend to the run `start`: one run-scoped `internal`
+    // row (`name="end"`) closing the run. Per-step outputs already live on their
+    // own checkpoints, so no results snapshot is duplicated here.
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: "workflow-end",
-      stepIndex: steps.length,
-      stepType: "workflow",
+      stepId: null,
+      stepIndex: null,
+      stepPath: null,
+      kind: "internal",
+      name: "end",
       status: "succeeded",
       finishedAt: new Date().toISOString(),
       metadata: { lastStepId },
@@ -2161,7 +2204,8 @@ async function wrapChildSuspension({
       run: parentRun,
       stepId: childStepId,
       stepIndex: parentResumeAtIndex,
-      stepType: "approval",
+      kind: "gate",
+      name: "approval",
       status: "waiting",
       metadata: {
         approvalId,
@@ -2202,7 +2246,8 @@ async function wrapChildSuspension({
       run: parentRun,
       stepId: childStepId,
       stepIndex: parentResumeAtIndex,
-      stepType: "input",
+      kind: "gate",
+      name: "input",
       status: "waiting",
       metadata: { nested: true, childStepId },
       resumeState: parentResumeState,
@@ -2223,7 +2268,8 @@ async function wrapChildSuspension({
       run: parentRun,
       stepId: childStepId,
       stepIndex: parentResumeAtIndex,
-      stepType: "pause",
+      kind: "gate",
+      name: "pause",
       status: "waiting",
       metadata: {
         reason: childResult.paused.reason,
@@ -2268,7 +2314,7 @@ async function applyStepMetadata({
   output: WorkflowStepResult;
 }): Promise<StepMetadataOutcome> {
   const meta = step.metadata as NormalizedWorkflowStepMetadata;
-  const stepPath = workflowSubStepPath(checkpointRun, step.id, "metadata");
+  const stepPath = workflowStepPath(checkpointRun, step.id);
   try {
     const updates: {
       title?: string;
@@ -2318,10 +2364,11 @@ async function applyStepMetadata({
       await appendCheckpoint({
         env: ctx.env,
         run: checkpointRun,
-        stepId: 'metadata',
+        stepId: step.id,
         stepPath,
         stepIndex,
-        stepType: "metadata",
+        kind: "detail",
+        name: "metadata",
         status: "failed",
         finishedAt: new Date().toISOString(),
         error: { message },
@@ -2338,10 +2385,11 @@ async function applyStepMetadata({
       await appendCheckpoint({
         env: ctx.env,
         run: checkpointRun,
-        stepId: 'metadata',
+        stepId: step.id,
         stepPath,
         stepIndex,
-        stepType: "metadata",
+        kind: "detail",
+        name: "metadata",
         status: "succeeded",
         finishedAt: new Date().toISOString(),
         metadata: {
@@ -2359,10 +2407,11 @@ async function applyStepMetadata({
     await appendCheckpoint({
       env: ctx.env,
       run: checkpointRun,
-      stepId: 'metadata',
+      stepId: step.id,
       stepPath,
       stepIndex,
-      stepType: "metadata",
+      kind: "detail",
+      name: "metadata",
       status: "failed",
       finishedAt: new Date().toISOString(),
       error: { message },
@@ -2438,14 +2487,6 @@ function workflowOutputToStepResult(stepId: string, output: unknown[]): Workflow
 
 function workflowStepPath(run: WorkflowExecutionContext | undefined, stepId: string) {
   return run?.stepPathPrefix ? `${run.stepPathPrefix}.${stepId}` : stepId;
-}
-
-function workflowSubStepPath(
-  run: WorkflowExecutionContext | undefined,
-  stepId: string,
-  subStepId: string,
-) {
-  return `${workflowStepPath(run, stepId)}.${subStepId}`;
 }
 
 function decodeCheckpointIdFromResumeToken(token: string) {
@@ -3788,7 +3829,8 @@ function getStepExecution(step: WorkflowStep) {
 
 async function runPipelineStep({
   stepId,
-  stepScopeId,
+  stepIndex,
+  branchScope,
   pipelineText,
   inputValue,
   ctx,
@@ -3798,7 +3840,8 @@ async function runPipelineStep({
   requestInputEnabled = true,
 }: {
   stepId: string;
-  stepScopeId?: string;
+  stepIndex: number | null;
+  branchScope?: string;
   pipelineText: string;
   inputValue: unknown;
   ctx: RunContext;
@@ -3859,9 +3902,18 @@ async function runPipelineStep({
           onConsumed: resume.onConsumed,
         }
       : undefined,
+    // The pipeline runs the sub-operations of this workflow step, so every stage
+    // checkpoint inherits the step's owning identity (folds into one StepRecord).
+    // A parallel/for_each branch scope is carried in each stage's `name`.
+    stageNamePrefix: branchScope,
     checkpointRun: {
       ...ctx.checkpointRun,
-      stepPathPrefix: workflowStepPath(ctx.checkpointRun, stepScopeId ?? stepId),
+      stepPathPrefix: workflowStepPath(ctx.checkpointRun, stepId),
+      ownerStep: {
+        stepPath: workflowStepPath(ctx.checkpointRun, stepId),
+        stepId,
+        stepIndex,
+      },
     },
   });
   stdout.end();

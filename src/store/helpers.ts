@@ -5,8 +5,7 @@ import { randomBytes } from "node:crypto";
 
 export function getPrefixDir(env) {
   return (
-    (env?.LOBSTER_DIR && String(env.LOBSTER_DIR).trim()) ||
-    path.join(os.homedir(), ".lobster")
+    (env?.LOBSTER_DIR && String(env.LOBSTER_DIR).trim()) || path.join(os.homedir(), ".lobster")
   );
 }
 

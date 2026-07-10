@@ -45,7 +45,11 @@ async function writeApprovalWorkflow(tmpDir: string) {
       {
         steps: [
           { id: "work", run: 'node -e "process.stdout.write(JSON.stringify({n:1}))"' },
-          { id: "gate", approval: true, run: 'node -e "process.stdout.write(JSON.stringify({n:2}))"' },
+          {
+            id: "gate",
+            approval: true,
+            run: 'node -e "process.stdout.write(JSON.stringify({n:2}))"',
+          },
           { id: "after", run: 'node -e "process.stdout.write(JSON.stringify({n:3}))"' },
         ],
       },
@@ -69,7 +73,11 @@ async function writeInputWorkflow(tmpDir: string) {
             id: "ask",
             input: {
               prompt: "How many?",
-              responseSchema: { type: "object", properties: { count: { type: "number" } }, required: ["count"] },
+              responseSchema: {
+                type: "object",
+                properties: { count: { type: "number" } },
+                required: ["count"],
+              },
             },
           },
           { id: "after", run: 'node -e "process.stdout.write(JSON.stringify({n:3}))"' },
@@ -90,7 +98,10 @@ async function writeSlowFirstStepWorkflow(tmpDir: string) {
     JSON.stringify(
       {
         steps: [
-          { id: "slow", run: 'node -e "setTimeout(()=>process.stdout.write(JSON.stringify({n:1})),1500)"' },
+          {
+            id: "slow",
+            run: 'node -e "setTimeout(()=>process.stdout.write(JSON.stringify({n:1})),1500)"',
+          },
           { id: "two", run: 'node -e "process.stdout.write(JSON.stringify({n:2}))"' },
         ],
       },
@@ -211,12 +222,12 @@ test("cancel at a pause gate takes effect immediately with a terminal checkpoint
 
   const checkpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   assert.ok(
-    checkpoints.some((cp) => cp.stepType === "pause" && cp.status === "cancelled"),
+    checkpoints.some((cp) => cp.name === "pause" && cp.status === "cancelled"),
     "head pause checkpoint should be transitioned to cancelled",
   );
   assert.ok(
-    checkpoints.some((cp) => cp.stepType === "control" && cp.status === "cancelled"),
-    "a terminal control/cancelled checkpoint should be appended",
+    checkpoints.some((cp) => cp.name === "cancel" && cp.status === "cancelled"),
+    "a terminal cancel checkpoint should be appended",
   );
 });
 
@@ -244,7 +255,7 @@ test("cancel at an approval gate cancels immediately and drops the pending appro
   assert.equal(approvals.length, 0);
 
   const checkpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
-  assert.ok(checkpoints.some((cp) => cp.stepType === "control" && cp.status === "cancelled"));
+  assert.ok(checkpoints.some((cp) => cp.name === "cancel" && cp.status === "cancelled"));
 });
 
 test("cancel at an input gate cancels immediately with a terminal checkpoint", async () => {
@@ -265,10 +276,10 @@ test("cancel at an input gate cancels immediately with a terminal checkpoint", a
 
   const checkpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   assert.ok(
-    checkpoints.some((cp) => cp.stepType === "input" && cp.status === "cancelled"),
+    checkpoints.some((cp) => cp.name === "input" && cp.status === "cancelled"),
     "head input checkpoint should be transitioned to cancelled",
   );
-  assert.ok(checkpoints.some((cp) => cp.stepType === "control" && cp.status === "cancelled"));
+  assert.ok(checkpoints.some((cp) => cp.name === "cancel" && cp.status === "cancelled"));
 });
 
 test("cancel mid-step is cooperative: desired=cancel then cancelled at the next boundary", async () => {
@@ -299,7 +310,7 @@ test("cancel mid-step is cooperative: desired=cancel then cancelled at the next 
   assert.equal(finalJob?.status, "cancelled");
 
   const checkpoints = await listJobCheckpoints({ jobId: running!.jobId, ctx });
-  assert.ok(checkpoints.some((cp) => cp.stepType === "control" && cp.status === "cancelled"));
+  assert.ok(checkpoints.some((cp) => cp.name === "cancel" && cp.status === "cancelled"));
 });
 
 test("approval reject appends a terminal control/cancelled checkpoint", async () => {
@@ -323,8 +334,8 @@ test("approval reject appends a terminal control/cancelled checkpoint", async ()
 
   const checkpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   assert.ok(
-    checkpoints.some((cp) => cp.stepType === "control" && cp.status === "cancelled"),
-    "approval reject should append a terminal control/cancelled checkpoint",
+    checkpoints.some((cp) => cp.name === "cancel" && cp.status === "cancelled"),
+    "approval reject should append a terminal cancel checkpoint",
   );
 });
 

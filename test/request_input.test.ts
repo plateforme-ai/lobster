@@ -1002,7 +1002,9 @@ test("built CLI ask restores subject state across processes", async () => {
   });
   const pipeline = `exec --json=true node -e "process.stdout.write(JSON.stringify([{draft:'hello'}]))" | ask --subject-from-stdin --prompt "Review?" --schema ${JSON.stringify(schema)} | pick decision`;
 
-  const first = runCli(["run", "--mode", "tool", pipeline], { LOBSTER_DIR: path.dirname(stateDir) });
+  const first = runCli(["run", "--mode", "tool", pipeline], {
+    LOBSTER_DIR: path.dirname(stateDir),
+  });
   assert.equal(first.status, 0, first.stderr);
   const firstJson = JSON.parse(first.stdout);
   assert.equal(firstJson.status, "needs_input");

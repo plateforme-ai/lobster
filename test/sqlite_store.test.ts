@@ -51,7 +51,8 @@ test("sqlite runtime store persists runs, checkpoints, approvals, and cache entr
     run,
     stepId: "json",
     stepIndex: 0,
-    stepType: "pipeline_stage",
+    kind: "step",
+    name: "json",
     status: "succeeded",
     io: { jsonOutput: [{ ok: true }] },
   });
@@ -214,7 +215,8 @@ test("recordTerminalCancel transitions a waiting gate checkpoint and appends a t
     run,
     stepId: "gate",
     stepIndex: 1,
-    stepType: "approval",
+    kind: "gate",
+    name: "approval",
     status: "waiting",
     resumeState: { kind: "workflow-file", resumeAtIndex: 2 },
   });
@@ -247,9 +249,14 @@ test("recordTerminalCancel transitions a waiting gate checkpoint and appends a t
 
   const checkpoints = await listRunCheckpoints({ env, runId: run.runId });
   const gate = checkpoints.find((cp) => cp.checkpointId === gateCheckpointId);
-  assert.equal(gate?.status, "cancelled", "waiting gate checkpoint should be transitioned to cancelled");
+  assert.equal(
+    gate?.status,
+    "cancelled",
+    "waiting gate checkpoint should be transitioned to cancelled",
+  );
   const terminal = checkpoints.find((cp) => cp.checkpointId === terminalId);
-  assert.equal(terminal?.stepType, "control");
+  assert.equal(terminal?.kind, "internal");
+  assert.equal(terminal?.name, "cancel");
   assert.equal(terminal?.status, "cancelled");
 });
 
@@ -418,7 +425,8 @@ test("large payloads spill to content-addressed blobs and round-trip through the
     run,
     stepId: "json",
     stepIndex: 0,
-    stepType: "pipeline_stage",
+    kind: "step",
+    name: "json",
     status: "succeeded",
     io: { stdout: bigText, jsonOutput: [{ big: bigText }] },
   });

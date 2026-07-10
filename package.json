@@ -50,7 +50,7 @@
     "format:check": "oxfmt --check package.json tsconfig.json src test",
     "lint": "pnpm format:check && oxlint --tsconfig tsconfig.json src test",
     "fmt": "pnpm format",
-    "test": "pnpm build && node --test \"dist/test/*.test.js\"",
+    "test": "pnpm build && node --test --import ./dist/test/setup.js \"dist/test/*.test.js\"",
     "check:changed": "pnpm run test",
     "test:changed": "pnpm run test",
     "crabbox:hydrate": "crabbox actions hydrate",

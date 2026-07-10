@@ -7,12 +7,14 @@ import type {
   CacheEntryRecord,
   CheckpointIORecord,
   CheckpointRecord,
+  CheckpointKind,
   JobRecord,
   JobWaitKind,
   JobWaitSnapshot,
   RunControlRecord,
   RunControlSnapshot,
   RunControlState,
+  StepRecord,
   WorkflowExecutionContext,
   RunRecord,
   RunStatus,
@@ -21,16 +23,12 @@ import { storePayload, readBlobJson } from "./blob_store.js";
 import { parseJsonSafe, stringifySafe } from "./serialization.js";
 import { withRuntimeDb } from "./sqlite.js";
 
-type WaitGateStepType = (typeof WAIT_GATE_STEP_TYPES)[number];
-
 const DEFAULT_CHECKPOINT_INLINE_BYTES = 65_536;
 const DEFAULT_CHECKPOINT_PREVIEW_BYTES = 16_384;
 const DEFAULT_CACHE_INLINE_BYTES = 65_536;
 const DEFAULT_CACHE_TTL_DAYS = 1;
 const DEFAULT_QUERY_LIMIT = 50;
 const MAX_QUERY_LIMIT = 200;
-const WAIT_GATE_STEP_TYPES = ["pause", "approval", "input", "pipeline_input"] as const;
-const WAIT_GATE_STEP_TYPE_SQL = WAIT_GATE_STEP_TYPES.map(() => "?").join(", ");
 
 export function createCheckpointRun(
   runId: string,
@@ -46,6 +44,8 @@ export function createCheckpointRun(
     stepPathPrefix: options?.stepPathPrefix ?? "root",
     depth: options?.depth ?? 0,
     latestCheckpointId: options?.latestCheckpointId ?? null,
+    ...(options?.observer ? { observer: options.observer } : {}),
+    ...(options?.ownerStep ? { ownerStep: options.ownerStep } : {}),
   };
 }
 
@@ -175,9 +175,11 @@ export async function createRewindRun(params: {
 }
 
 /**
- * Cancel every run of a job that is still `running`/`waiting` (except
- * `exceptRunId`) and flip their still-`waiting` gate checkpoints/approvals to a
- * terminal state so no zombie waiting gates survive a rewind replay.
+ * Mark every run of a job that is still `running`/`waiting` (except
+ * `exceptRunId`) as `superseded` — a rewind replaced them, which is distinct
+ * from a real user cancel. Their still-`waiting` gate checkpoints/approvals are
+ * flipped to `cancelled` so no zombie waiting gates survive the rewind replay,
+ * while any `succeeded` step checkpoints on the run stay intact and queryable.
  */
 export async function cancelSupersededRuns(params: {
   env: Record<string, string | undefined>;
@@ -188,16 +190,15 @@ export async function cancelSupersededRuns(params: {
   const except = params.exceptRunId ?? null;
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
-      `UPDATE runs SET status = 'cancelled', updated_at = ?
+      `UPDATE runs SET status = 'superseded', updated_at = ?
         WHERE job_id = ? AND status IN ('running', 'waiting')
         AND (? IS NULL OR run_id != ?)`,
     ).run(now, params.jobId, except, except);
     db.prepare(
       `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
-        WHERE job_id = ? AND status = 'waiting'
-        AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+        WHERE job_id = ? AND status = 'waiting' AND kind = 'gate'
         AND (? IS NULL OR run_id != ?)`,
-    ).run(now, params.jobId, ...WAIT_GATE_STEP_TYPES, except, except);
+    ).run(now, params.jobId, except, except);
     db.prepare(
       `UPDATE approvals SET status = 'cancelled', decision = 'superseded', resolved_at = ?
         WHERE job_id = ? AND status = 'waiting'
@@ -319,6 +320,8 @@ export async function createChildRun(params: {
     parentStepPath: params.parentStepPath,
     stepPathPrefix,
     depth: params.parent.depth + 1,
+    // Inherit the run observer so sub-workflow checkpoints stream live too.
+    ...(params.parent.observer ? { observer: params.parent.observer } : {}),
   });
 }
 
@@ -542,9 +545,8 @@ export async function recordTerminalCancel(params: {
   await withRuntimeDb(params.env, (db) => {
     db.prepare(
       `UPDATE checkpoints SET status = 'cancelled', finished_at = ?
-        WHERE run_id = ? AND status = 'waiting'
-        AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})`,
-    ).run(now, params.runId, ...WAIT_GATE_STEP_TYPES);
+        WHERE run_id = ? AND status = 'waiting' AND kind = 'gate'`,
+    ).run(now, params.runId);
   });
   const checkpointId = await appendCheckpoint({
     env: params.env,
@@ -556,7 +558,8 @@ export async function recordTerminalCancel(params: {
     stepId: params.stepId ?? null,
     stepIndex: params.stepIndex ?? null,
     stepPath: params.stepPath ?? null,
-    stepType: "control",
+    kind: "internal",
+    name: "cancel",
     status: "cancelled",
     metadata: { reason: "cancel_requested", ...(params.metadata ?? {}) },
   });
@@ -601,17 +604,17 @@ export async function resolveJobHeadWait(params: {
         ? db
             .prepare(
               `SELECT * FROM checkpoints
-              WHERE status = 'waiting' AND run_id = ? AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+              WHERE status = 'waiting' AND run_id = ? AND kind = 'gate'
               ORDER BY created_at DESC LIMIT 1`,
             )
-            .get(params.runId, ...WAIT_GATE_STEP_TYPES)
+            .get(params.runId)
         : db
             .prepare(
               `SELECT * FROM checkpoints
-              WHERE status = 'waiting' AND job_id = ? AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+              WHERE status = 'waiting' AND job_id = ? AND kind = 'gate'
               ORDER BY created_at DESC LIMIT 1`,
             )
-            .get(scope.job_id ?? params.jobId, ...WAIT_GATE_STEP_TYPES)
+            .get(scope.job_id ?? params.jobId)
     ) as any;
     const resolvedFallback = checkpointRowToWaitSnapshot(db, fallbackCheckpoint);
     if (resolvedFallback) return resolvedFallback;
@@ -636,7 +639,7 @@ export async function resolveJobHeadWait(params: {
 export type HeadResumeCheckpoint = {
   checkpointId: string;
   kind: JobWaitKind;
-  stepType: string | null;
+  name: string | null;
   resumeKind: "workflow-file" | "pipeline-resume";
 };
 
@@ -649,14 +652,11 @@ export async function findHeadResumeCheckpoint(params: {
   env: Record<string, string | undefined>;
   jobId?: string | null;
   runId?: string | null;
-  allowedStepTypes?: readonly WaitGateStepType[];
+  allowedGateNames?: readonly string[];
 }): Promise<HeadResumeCheckpoint | null> {
   const wait = await resolveJobHeadWait(params);
   if (!wait?.checkpointId) return null;
-  if (
-    params.allowedStepTypes &&
-    !params.allowedStepTypes.includes(wait.stepType as WaitGateStepType)
-  ) {
+  if (params.allowedGateNames && !params.allowedGateNames.includes(wait.name ?? "")) {
     return null;
   }
   const checkpoint = await getCheckpoint({ env: params.env, checkpointId: wait.checkpointId });
@@ -666,7 +666,7 @@ export async function findHeadResumeCheckpoint(params: {
   return {
     checkpointId: wait.checkpointId,
     kind: wait.kind,
-    stepType: wait.stepType ?? null,
+    name: wait.name ?? null,
     resumeKind,
   };
 }
@@ -676,14 +676,35 @@ export async function findHeadResumeCheckpoint(params: {
  * step persists its own `WorkflowStepResult` once (in the step checkpoint's
  * `metadata.stepResult`); replaying them in `seq` order reconstructs the
  * `Record<stepId, WorkflowStepResult>` that resume/rewind need — no per-
- * checkpoint snapshot duplication. `uptoSeq` bounds the fold to a gate.
+ * checkpoint snapshot duplication.
+ *
+ * The fold is bounded by exactly one strategy:
+ * - `uptoSeq`: include every checkpoint at or before this sequence. Gate resume
+ *   uses this to reconstruct all prior step results up to (and including) the
+ *   gate's own step.
+ * - `beforeStepIndex`: include only checkpoints whose owning step is strictly
+ *   before this index. Rewind uses this to preserve the target step's
+ *   predecessors while excluding the target itself, so the target step (and
+ *   everything after it) re-executes from scratch.
+ * Passing neither folds the whole run.
  */
 export async function foldRunResults(params: {
   env: Record<string, string | undefined>;
   runId: string;
   uptoSeq?: number | null;
+  beforeStepIndex?: number | null;
 }): Promise<Record<string, any>> {
+  if (typeof params.uptoSeq === "number" && typeof params.beforeStepIndex === "number") {
+    throw new Error("foldRunResults accepts either uptoSeq or beforeStepIndex, not both");
+  }
   const rows = await withRuntimeDb(params.env, (db) => {
+    if (typeof params.beforeStepIndex === "number") {
+      return db
+        .prepare(
+          "SELECT * FROM checkpoints WHERE run_id = ? AND step_index IS NOT NULL AND step_index < ? ORDER BY seq",
+        )
+        .all(params.runId, params.beforeStepIndex) as any[];
+    }
     if (typeof params.uptoSeq === "number") {
       return db
         .prepare("SELECT * FROM checkpoints WHERE run_id = ? AND seq <= ? ORDER BY seq")
@@ -695,9 +716,10 @@ export async function foldRunResults(params: {
   });
   const results: Record<string, any> = {};
   for (const row of rows) {
-    const metadata = parseJsonSafe(row.metadata_json ?? null) as
-      | { stepResult?: unknown; branchResults?: unknown }
-      | null;
+    const metadata = parseJsonSafe(row.metadata_json ?? null) as {
+      stepResult?: unknown;
+      branchResults?: unknown;
+    } | null;
     if (!metadata) continue;
     if (metadata.branchResults && typeof metadata.branchResults === "object") {
       for (const [branchId, branchResult] of Object.entries(
@@ -730,16 +752,16 @@ export async function updateCheckpointStatus(params: {
   });
 }
 
-function waitKindFromStepType(stepType: string | null | undefined): JobWaitKind | null {
-  if (stepType === "pause") return "pause";
-  if (stepType === "approval") return "approval";
-  if (stepType === "input" || stepType === "pipeline_input") return "input";
+function waitKindFromName(name: string | null | undefined): JobWaitKind | null {
+  if (name === "pause") return "pause";
+  if (name === "approval") return "approval";
+  if (name === "input") return "input";
   return null;
 }
 
 function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobWaitSnapshot | null {
-  if (!row || row.status !== "waiting") return null;
-  const kind = waitKindFromStepType(row.step_type);
+  if (!row || row.status !== "waiting" || row.kind !== "gate") return null;
+  const kind = waitKindFromName(row.name);
   if (!kind) return null;
 
   const metadata = parseJsonSafe(row.metadata_json ?? null) as {
@@ -769,7 +791,7 @@ function checkpointRowToWaitSnapshot(db: any, row: any | null | undefined): JobW
     kind,
     checkpointId: row.checkpoint_id,
     stepId: row.step_id ?? null,
-    stepType: row.step_type ?? null,
+    name: row.name ?? null,
     approvalId:
       typeof metadata?.approvalId === "string"
         ? metadata.approvalId
@@ -784,7 +806,7 @@ function approvalRowToWaitSnapshot(row: any | null | undefined): JobWaitSnapshot
     kind: "approval",
     checkpointId: row.checkpoint_id ?? null,
     stepId: null,
-    stepType: "approval",
+    name: "approval",
     approvalId: row.approval_id ?? null,
   };
 }
@@ -940,7 +962,8 @@ export async function appendCheckpoint(params: {
   stepId?: string | null;
   stepPath?: string | null;
   stepIndex?: number | null;
-  stepType?: string | null;
+  kind: CheckpointKind;
+  name: string;
   status: CheckpointRecord["status"];
   startedAt?: string | null;
   finishedAt?: string | null;
@@ -955,9 +978,15 @@ export async function appendCheckpoint(params: {
   const jobId = params.jobId ?? params.run?.jobId ?? runId;
   const rootRunId = params.rootRunId ?? params.run?.rootRunId ?? runId;
   const parentRunId = params.parentRunId ?? params.run?.parentRunId ?? null;
-  const stepPath = params.stepPath ?? joinStepPath(params.run?.stepPathPrefix, params.stepId);
+  // Explicit `null` means run-scoped (no owning step); only default when the
+  // caller omits `stepPath` entirely.
+  const stepPath =
+    params.stepPath !== undefined
+      ? params.stepPath
+      : joinStepPath(params.run?.stepPathPrefix, params.stepId);
   const checkpointId = randomUUID();
   const createdAt = new Date().toISOString();
+  let seq = 0;
   await withRuntimeDb(params.env, (db) => {
     // `seq` is a per-database monotonic ordinal computed inside the INSERT so
     // fold/replay ordering is deterministic and independent of UUIDs or equal
@@ -966,10 +995,10 @@ export async function appendCheckpoint(params: {
     db.prepare(
       `INSERT INTO checkpoints (
         checkpoint_id, seq, job_id, run_id, root_run_id, parent_run_id,
-        step_id, step_path, step_index, step_type,
+        step_id, step_path, step_index, kind, name,
         status, started_at, finished_at,
         metadata_json, resume_state_json, error_json, exit_status, created_at
-      ) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM checkpoints), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM checkpoints), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       checkpointId,
       jobId,
@@ -979,7 +1008,8 @@ export async function appendCheckpoint(params: {
       params.stepId ?? null,
       stepPath,
       params.stepIndex ?? null,
-      params.stepType ?? null,
+      params.kind,
+      params.name,
       params.status,
       params.startedAt ?? createdAt,
       params.finishedAt ?? null,
@@ -989,19 +1019,19 @@ export async function appendCheckpoint(params: {
       params.exitStatus ?? null,
       createdAt,
     );
-    if (
-      params.status === "waiting" &&
-      params.stepType &&
-      WAIT_GATE_STEP_TYPES.includes(params.stepType as WaitGateStepType)
-    ) {
+    const seqRow = db
+      .prepare("SELECT seq FROM checkpoints WHERE checkpoint_id = ?")
+      .get(checkpointId) as { seq?: number } | undefined;
+    seq = Number(seqRow?.seq ?? 0);
+    if (params.status === "waiting" && params.kind === "gate") {
       db.prepare(
         `UPDATE checkpoints
         SET status = 'resumed', finished_at = ?
         WHERE run_id = ?
           AND status = 'waiting'
-          AND step_type IN (${WAIT_GATE_STEP_TYPE_SQL})
+          AND kind = 'gate'
           AND checkpoint_id != ?`,
-      ).run(createdAt, runId, ...WAIT_GATE_STEP_TYPES, checkpointId);
+      ).run(createdAt, runId, checkpointId);
       db.prepare(
         `UPDATE approvals
         SET status = 'cancelled', decision = 'superseded', resolved_at = ?
@@ -1016,6 +1046,33 @@ export async function appendCheckpoint(params: {
   if (params.io) await writeCheckpointIO(params.env, checkpointId, params.io);
   if (params.run) params.run.latestCheckpointId = checkpointId;
   await updateRun({ env: params.env, runId, latestCheckpointId: checkpointId });
+  // Stream the durably-written checkpoint to the run observer so embedders can
+  // publish it live, instead of only after the whole run returns. Fired after
+  // the write commits so consumers only ever see persisted state.
+  if (params.run?.observer?.onCheckpoint) {
+    const record: CheckpointRecord = {
+      checkpointId,
+      seq,
+      jobId,
+      runId,
+      rootRunId,
+      parentRunId,
+      stepId: params.stepId ?? null,
+      stepPath,
+      stepIndex: params.stepIndex ?? null,
+      kind: params.kind,
+      name: params.name,
+      status: params.status,
+      startedAt: params.startedAt ?? createdAt,
+      finishedAt: params.finishedAt ?? null,
+      metadata: params.metadata,
+      resumeState: params.resumeState,
+      error: params.error,
+      exitStatus: params.exitStatus ?? null,
+      createdAt,
+    };
+    await params.run.observer.onCheckpoint(record);
+  }
   return checkpointId;
 }
 
@@ -1045,6 +1102,179 @@ export async function listJobCheckpoints(params: {
         .all(params.jobId) as any[],
   );
   return rows.map(rowToCheckpoint);
+}
+
+const TERMINAL_STEP_STATUSES: ReadonlySet<CheckpointRecord["status"]> = new Set([
+  "succeeded",
+  "failed",
+  "skipped",
+]);
+
+/**
+ * Fold a run's append-only checkpoints into first-class steps (one `StepRecord`
+ * per owning `step_path`). Every checkpoint of a step shares that step's
+ * identity, so grouping is a pure GROUP BY `step_path`: no prefix matching.
+ * `step`/`gate` rows define the boundary; `detail` rows are the step's
+ * sub-operations; `internal` rows are ignored. Run-scoped rows with no
+ * `step_path` (e.g. `start`/`end` bookends) belong to no step and are skipped.
+ * Status precedence per step: the latest terminal outcome
+ * (`succeeded`/`failed`/`skipped`) wins, else an active `waiting` gate, else the
+ * latest boundary status (e.g. a resumed/in-flight step).
+ */
+export function foldCheckpointsIntoSteps(checkpoints: CheckpointRecord[]): StepRecord[] {
+  type Acc = {
+    step: StepRecord;
+    firstSeq: number;
+    terminal?: CheckpointRecord;
+    activeGate?: CheckpointRecord;
+    lastBoundary?: CheckpointRecord;
+    details: { seq: number; checkpointId: string }[];
+  };
+  const byPath = new Map<string, Acc>();
+
+  const ensure = (cp: CheckpointRecord, key: string): Acc => {
+    let acc = byPath.get(key);
+    if (!acc) {
+      acc = {
+        step: {
+          runId: cp.runId,
+          jobId: cp.jobId,
+          stepId: cp.stepId ?? key,
+          stepPath: key,
+          stepIndex: cp.stepIndex ?? null,
+          name: null,
+          status: cp.status,
+          startedAt: cp.startedAt ?? cp.createdAt,
+          finishedAt: cp.finishedAt ?? null,
+          gate: null,
+          error: undefined,
+          stepResult: undefined,
+          boundaryCheckpointId: cp.checkpointId,
+          detailCheckpointIds: [],
+        },
+        firstSeq: cp.seq,
+        details: [],
+      };
+      byPath.set(key, acc);
+    }
+    return acc;
+  };
+
+  for (const cp of [...checkpoints].sort((a, b) => a.seq - b.seq)) {
+    if (cp.kind === "internal") continue;
+    const key = cp.stepPath;
+    if (!key) continue;
+    const acc = ensure(cp, key);
+    acc.firstSeq = Math.min(acc.firstSeq, cp.seq);
+    acc.step.stepId = cp.stepId ?? acc.step.stepId;
+    acc.step.stepIndex = cp.stepIndex ?? acc.step.stepIndex;
+
+    if (cp.kind === "detail") {
+      acc.details.push({ seq: cp.seq, checkpointId: cp.checkpointId });
+      continue;
+    }
+
+    // step | gate boundary row
+    acc.lastBoundary = cp;
+    if (cp.kind === "step") acc.step.name = cp.name ?? acc.step.name;
+    if (!acc.step.startedAt || (cp.startedAt && cp.startedAt < acc.step.startedAt)) {
+      acc.step.startedAt = cp.startedAt ?? acc.step.startedAt;
+    }
+    if (TERMINAL_STEP_STATUSES.has(cp.status)) {
+      acc.terminal = cp;
+    } else if (cp.kind === "gate" && cp.status === "waiting") {
+      acc.activeGate = cp;
+    }
+  }
+
+  const resolved: { firstSeq: number; step: StepRecord }[] = [];
+  for (const acc of byPath.values()) {
+    const boundary = acc.terminal ?? acc.activeGate ?? acc.lastBoundary;
+    if (!boundary) continue;
+    const step = acc.step;
+    if (acc.terminal) {
+      step.status = acc.terminal.status;
+      step.finishedAt = acc.terminal.finishedAt ?? acc.terminal.createdAt;
+      step.error = acc.terminal.error;
+      step.stepResult = (acc.terminal.metadata as any)?.stepResult;
+      step.boundaryCheckpointId = acc.terminal.checkpointId;
+      step.gate = null;
+    } else if (acc.activeGate) {
+      step.status = "waiting";
+      step.finishedAt = null;
+      step.boundaryCheckpointId = acc.activeGate.checkpointId;
+      step.gate = {
+        checkpointId: acc.activeGate.checkpointId,
+        name: acc.activeGate.name ?? null,
+      };
+    } else {
+      step.status = boundary.status;
+      step.boundaryCheckpointId = boundary.checkpointId;
+    }
+    step.detailCheckpointIds = acc.details.sort((a, b) => a.seq - b.seq).map((d) => d.checkpointId);
+    resolved.push({ firstSeq: acc.firstSeq, step });
+  }
+  resolved.sort((a, b) => a.firstSeq - b.firstSeq);
+  return resolved.map((r) => r.step);
+}
+
+export async function listRunSteps(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+}): Promise<StepRecord[]> {
+  const checkpoints = await listRunCheckpoints({ env: params.env, runId: params.runId });
+  return foldCheckpointsIntoSteps(checkpoints);
+}
+
+/**
+ * First-class steps for every run of a job, folded per run. A rewind re-executes
+ * the target step and everything after it in a new run, so the job's current
+ * logical workflow is spread across runs: the preserved prefix lives in the origin
+ * run and the replayed target-onward steps in the rewind run. Because `step_path`
+ * is only unique
+ * within a run (`root.foo` exists in both the origin and rewind runs), folding must
+ * group by `run_id` first and fold each run independently — a flat job-wide fold
+ * would collide same-path steps across runs. Runs are ordered by their earliest
+ * checkpoint so the lineage reads oldest-run-first; each `StepRecord` carries its
+ * own `runId` for the caller to reconstruct the run/rewind tree.
+ */
+export async function listJobStepsAllRuns(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+}): Promise<StepRecord[]> {
+  const checkpoints = await listJobCheckpoints({ env: params.env, jobId: params.jobId });
+  const byRun = new Map<string, CheckpointRecord[]>();
+  const runFirstSeen = new Map<string, string>();
+  for (const cp of checkpoints) {
+    let group = byRun.get(cp.runId);
+    if (!group) {
+      group = [];
+      byRun.set(cp.runId, group);
+    }
+    group.push(cp);
+    const seen = runFirstSeen.get(cp.runId);
+    if (seen === undefined || cp.createdAt < seen) runFirstSeen.set(cp.runId, cp.createdAt);
+  }
+  const runIds = [...byRun.keys()].sort((a, b) => {
+    const sa = runFirstSeen.get(a) ?? "";
+    const sb = runFirstSeen.get(b) ?? "";
+    if (sa !== sb) return sa < sb ? -1 : 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  const steps: StepRecord[] = [];
+  for (const runId of runIds) {
+    steps.push(...foldCheckpointsIntoSteps(byRun.get(runId)!));
+  }
+  return steps;
+}
+
+export async function getStep(params: {
+  env: Record<string, string | undefined>;
+  runId: string;
+  stepPath: string;
+}): Promise<StepRecord | null> {
+  const steps = await listRunSteps({ env: params.env, runId: params.runId });
+  return steps.find((s) => s.stepPath === params.stepPath) ?? null;
 }
 
 export async function getCheckpoint(params: {
@@ -1458,7 +1688,8 @@ function rowToCheckpoint(row: any): CheckpointRecord {
     stepId: row.step_id,
     stepPath: row.step_path,
     stepIndex: row.step_index,
-    stepType: row.step_type,
+    kind: (row.kind ?? "internal") as CheckpointKind,
+    name: row.name ?? "",
     status: row.status,
     startedAt: row.started_at,
     finishedAt: row.finished_at,

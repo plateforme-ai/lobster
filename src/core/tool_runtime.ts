@@ -34,6 +34,8 @@ import {
   listJobs as listStoredJobs,
   listPendingApprovals as listStoredPendingApprovals,
   listRunCheckpoints as listStoredRunCheckpoints,
+  listRunSteps as listStoredRunSteps,
+  listJobStepsAllRuns as listStoredJobStepsAllRuns,
   getCheckpointIO as getStoredCheckpointIO,
   resolveApprovalRecord,
   resolveJobHeadWait,
@@ -43,8 +45,16 @@ import {
   updateCheckpointStatus,
   updateRun,
 } from "../store/runtime_store.js";
-import type { WorkflowExecutionContext } from "../workflows/checkpoints.js";
+import type {
+  CheckpointRecord,
+  JobRecord,
+  RunRecord,
+  ToolRunObserver,
+  WorkflowExecutionContext,
+} from "../workflows/checkpoints.js";
 import type { LlmTextCompleter } from "../commands/stdlib/llm_client.js";
+
+export type { ToolRunObserver } from "../workflows/checkpoints.js";
 
 type ToolRunContext = {
   cwd?: string;
@@ -57,6 +67,7 @@ type ToolRunContext = {
   registry?: any;
   llmAdapters?: Record<string, any>;
   llmText?: LlmTextCompleter;
+  observer?: ToolRunObserver;
 };
 
 type PausedInfo = {
@@ -182,6 +193,10 @@ export async function runToolRequest({
         metadata: normalizedMetadata,
         lineage,
       });
+      await attachObserverAndAnnounce(runtime, checkpointRun, {
+        sourceType: "workflow_file",
+        lineage,
+      });
       if (stepMode && checkpointRun?.runId) {
         await setRunControl({
           env: runtime.env,
@@ -259,6 +274,10 @@ export async function runToolRequest({
       metadata: normalizedMetadata,
       lineage,
     });
+    await attachObserverAndAnnounce(runtime, checkpointRun, {
+      sourceType: "pipeline",
+      lineage,
+    });
     const output = await runPipeline({
       pipeline: parsed,
       registry: runtime.registry,
@@ -287,12 +306,14 @@ export async function runToolRequest({
       finalized.status === "ok" ? "succeeded" : "waiting",
       finalized.output,
     );
+    const sessionExtra = await sessionExtraForRun(runtime, checkpointRun);
     return okEnvelope(
       finalized.status,
       finalized.output,
       finalized.requiresApproval,
       finalized.requiresInput,
       checkpointRun,
+      sessionExtra,
     );
   } catch (err: any) {
     await maybeUpdateRun(runtime, checkpointRun, "failed");
@@ -342,7 +363,7 @@ export async function resumeToolRequest({
         env: runtime.env,
         jobId,
         runId,
-        allowedStepTypes: isContinueIntent ? ["pause"] : undefined,
+        allowedGateNames: isContinueIntent ? ["pause"] : undefined,
       });
       if (!head) {
         const wait = isContinueIntent
@@ -375,6 +396,7 @@ export async function resumeToolRequest({
       const loadedRun = payload.checkpointId
         ? await loadWorkflowRunContext(runtime.env, payload.checkpointId)
         : undefined;
+      attachObserver(runtime, loadedRun);
       const output = await runWorkflowFile({
         filePath: payload.filePath,
         ctx: { ...runtime, checkpointRun: loadedRun },
@@ -460,6 +482,7 @@ export async function resumeToolRequest({
         depth: resumeState.depth,
       })
     : undefined;
+  attachObserver(runtime, pipelineCheckpointRun);
 
   if (resumeState.haltType === "input_request") {
     if (approved !== undefined) {
@@ -572,12 +595,14 @@ export async function resumeToolRequest({
       finalized.status === "ok" ? "succeeded" : "waiting",
       finalized.output,
     );
+    const sessionExtra = await sessionExtraForRun(runtime, pipelineCheckpointRun);
     return okEnvelope(
       finalized.status,
       finalized.output,
       finalized.requiresApproval,
       finalized.requiresInput,
       pipelineCheckpointRun,
+      sessionExtra,
     );
   } catch (err: any) {
     // Don't clean up index on error — allow retry by --id
@@ -597,6 +622,7 @@ export function createToolContext(ctx: ToolRunContext = {}) {
     registry: ctx.registry ?? createDefaultRegistry(),
     llmAdapters: ctx.llmAdapters,
     llmText: ctx.llmText,
+    observer: ctx.observer,
   };
 }
 
@@ -707,7 +733,7 @@ export async function getRun(params: { runId: string; ctx?: ToolRunContext }) {
 }
 
 export async function listJobs(params: {
-  status?: "running" | "waiting" | "succeeded" | "failed" | "cancelled";
+  status?: "running" | "waiting" | "succeeded" | "failed" | "cancelled" | "superseded";
   limit?: number;
   cursor?: string | null;
   ctx?: ToolRunContext;
@@ -751,6 +777,38 @@ export async function listRunCheckpoints(params: { runId: string; ctx?: ToolRunC
 export async function listJobCheckpoints(params: { jobId: string; ctx?: ToolRunContext }) {
   const runtime = createToolContext(params.ctx);
   return listStoredJobCheckpoints({ env: runtime.env, jobId: params.jobId });
+}
+
+export async function listRunSteps(params: { runId: string; ctx?: ToolRunContext }) {
+  const runtime = createToolContext(params.ctx);
+  return listStoredRunSteps({ env: runtime.env, runId: params.runId });
+}
+
+/**
+ * First-class steps for a job. Defaults to the job's latest run so the caller
+ * sees the current attempt's steps (a rewind creates a new run); pass an explicit
+ * `runId` to inspect a specific attempt. Pass `allRuns: true` for the full,
+ * collision-safe lineage across every run (folded per run) — required whenever a
+ * rewind has spread the job's current logical workflow across the origin
+ * (surviving prefix) and rewind (replayed suffix) runs.
+ */
+export async function listJobSteps(params: {
+  jobId: string;
+  runId?: string;
+  allRuns?: boolean;
+  ctx?: ToolRunContext;
+}) {
+  const runtime = createToolContext(params.ctx);
+  if (params.allRuns) {
+    return listStoredJobStepsAllRuns({ env: runtime.env, jobId: params.jobId });
+  }
+  let runId = params.runId ?? null;
+  if (!runId) {
+    const job = await getStoredJob(runtime.env, params.jobId);
+    runId = job?.latestRunId ?? job?.rootRunId ?? null;
+  }
+  if (!runId) return [];
+  return listStoredRunSteps({ env: runtime.env, runId });
 }
 
 export async function getCheckpointIO(params: { checkpointId: string; ctx?: ToolRunContext }) {
@@ -821,16 +879,137 @@ export async function rerunToolRequest({
   );
 }
 
+/**
+ * A rewind target that has passed all validation: a `step`/`gate` boundary
+ * checkpoint on a replayable workflow-file run, with a concrete step index.
+ */
+type ResolvedRewindTarget = {
+  checkpoint: CheckpointRecord & { stepIndex: number };
+  targetRun: RunRecord & { workflowFile: string };
+};
+
+/**
+ * Resolve a rewind request to the concrete step-boundary checkpoint it targets
+ * and validate that it is rewindable. `stepPath` targets the step's boundary
+ * checkpoint on the job's latest run — the ergonomic form, since a step (not a
+ * raw checkpoint) is the rewindable unit; `checkpointId` targets that checkpoint
+ * directly. Exactly one must be provided. Only `step`/`gate` checkpoints on a
+ * workflow-file run with a concrete step index are rewindable.
+ */
+async function resolveRewindTarget(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+  job: JobRecord;
+  run: RunRecord;
+  checkpointId?: string;
+  stepPath?: string;
+}): Promise<ResolvedRewindTarget | { error: ToolEnvelope }> {
+  const { env, jobId, job, run } = params;
+  let resolvedCheckpointId = params.checkpointId ?? null;
+  if (!resolvedCheckpointId && params.stepPath) {
+    const runId = job.latestRunId ?? job.rootRunId!;
+    const steps = await listStoredRunSteps({ env, runId });
+    const step = steps.find((s) => s.stepPath === params.stepPath);
+    if (!step) {
+      return { error: errorEnvelope("not_found", `Step "${params.stepPath}" not found for job "${jobId}"`) };
+    }
+    resolvedCheckpointId = step.boundaryCheckpointId;
+  }
+  if (!resolvedCheckpointId) {
+    return { error: errorEnvelope("invalid_request", "rewind requires either checkpointId or stepPath") };
+  }
+
+  const checkpoint = await getStoredCheckpoint({ env, checkpointId: resolvedCheckpointId });
+  if (!checkpoint || checkpoint.jobId !== jobId) {
+    return {
+      error: errorEnvelope("not_found", `Checkpoint "${resolvedCheckpointId}" not found for job "${jobId}"`),
+    };
+  }
+  // Only a step boundary (a step outcome or an active gate) is rewindable;
+  // `detail`/`internal` checkpoints are not independent targets.
+  if (checkpoint.kind !== "step" && checkpoint.kind !== "gate") {
+    return {
+      error: errorEnvelope(
+        "rewind_target_not_a_step",
+        `Checkpoint "${resolvedCheckpointId}" has kind "${checkpoint.kind}" and is not a rewindable step boundary`,
+      ),
+    };
+  }
+  const targetRun =
+    checkpoint.runId === run.runId ? run : await getStoredRun(env, checkpoint.runId);
+  if (!targetRun) {
+    return { error: errorEnvelope("not_found", `Run "${checkpoint.runId}" not found for checkpoint`) };
+  }
+  if (targetRun.sourceType !== "workflow_file" || !targetRun.workflowFile) {
+    return { error: errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only") };
+  }
+  if (typeof checkpoint.stepIndex !== "number") {
+    return {
+      error: errorEnvelope("replay_not_supported", "Checkpoint does not contain workflow replay state"),
+    };
+  }
+  return {
+    checkpoint: checkpoint as CheckpointRecord & { stepIndex: number },
+    targetRun: targetRun as RunRecord & { workflowFile: string },
+  };
+}
+
+/**
+ * Build the inline resume state for a rewind: replay the target step and every
+ * step after it. The preserved prefix (steps strictly before the target) is
+ * folded from the run's append-only log into the seed results map; the target
+ * step's own prior result is deliberately excluded so it re-executes from
+ * scratch. `inputOverride` may edit ONLY preserved prefix steps — the target and
+ * downstream steps run fresh, so overriding them is meaningless and rejected.
+ */
+async function buildRewindReplayState(params: {
+  env: Record<string, string | undefined>;
+  jobId: string;
+  runId: string;
+  targetStepIndex: number;
+  inputOverride?: Record<string, Record<string, unknown>>;
+}): Promise<{ resumeAtIndex: number; steps: Record<string, any> } | { error: ToolEnvelope }> {
+  let steps = await foldRunResults({
+    env: params.env,
+    runId: params.runId,
+    beforeStepIndex: params.targetStepIndex,
+  });
+
+  if (params.inputOverride && Object.keys(params.inputOverride).length > 0) {
+    steps = { ...steps };
+    for (const [stepId, patch] of Object.entries(params.inputOverride)) {
+      if (!(stepId in steps)) {
+        return {
+          error: errorEnvelope(
+            "invalid_input_override",
+            `Step "${stepId}" is not a preserved step before the rewind target for job "${params.jobId}"; only steps before the target can be overridden`,
+          ),
+        };
+      }
+      steps[stepId] = { ...steps[stepId], ...patch };
+    }
+  }
+
+  // The target step re-executes, so replay starts AT its index regardless of its
+  // prior status (succeeded, failed, skipped, or a waiting gate).
+  return { resumeAtIndex: params.targetStepIndex, steps };
+}
+
 export async function rewindToolRequest({
   jobId,
   checkpointId,
+  stepPath,
   argsPatch,
   inputOverride,
   envPatch,
   ctx = {},
 }: {
   jobId: string;
-  checkpointId: string;
+  // Rewind target: either a raw `checkpointId` or a `stepPath` (resolved to that
+  // step's boundary checkpoint). Exactly one is required. The target step and
+  // every step after it re-execute; earlier steps are preserved.
+  checkpointId?: string;
+  stepPath?: string;
   argsPatch?: Record<string, unknown>;
   inputOverride?: Record<string, Record<string, unknown>>;
   envPatch?: Record<string, string | undefined>;
@@ -841,48 +1020,26 @@ export async function rewindToolRequest({
   if (!job?.rootRunId) return errorEnvelope("not_found", `Job "${jobId}" not found`);
   const run = await getStoredRun(runtime.env, job.rootRunId);
   if (!run) return errorEnvelope("not_found", `Root run for job "${jobId}" not found`);
-  const checkpoint = await getStoredCheckpoint({ env: runtime.env, checkpointId });
-  if (!checkpoint || checkpoint.jobId !== jobId) {
-    return errorEnvelope("not_found", `Checkpoint "${checkpointId}" not found for job "${jobId}"`);
-  }
-  const targetRun =
-    checkpoint.runId === run.runId ? run : await getStoredRun(runtime.env, checkpoint.runId);
-  if (!targetRun) {
-    return errorEnvelope("not_found", `Run "${checkpoint.runId}" not found for checkpoint`);
-  }
-  if (targetRun.sourceType !== "workflow_file" || !targetRun.workflowFile) {
-    return errorEnvelope("replay_not_supported", "V1 rewind supports workflow-file runs only");
-  }
-  if (typeof checkpoint.stepIndex !== "number") {
-    return errorEnvelope(
-      "replay_not_supported",
-      "Checkpoint does not contain workflow replay state",
-    );
-  }
 
-  // Fold the run's append-only log up to (and including) this checkpoint into
-  // the per-step results map. The log is the single source of truth — there is
-  // no per-checkpoint snapshot to read.
-  let steps = await foldRunResults({
+  const target = await resolveRewindTarget({
     env: runtime.env,
-    runId: checkpoint.runId,
-    uptoSeq: checkpoint.seq,
+    jobId,
+    job,
+    run,
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(stepPath ? { stepPath } : {}),
   });
+  if ("error" in target) return target.error;
+  const { checkpoint, targetRun } = target;
 
-  // Apply per-step input overrides into the replay snapshot so downstream steps
-  // and conditions observe the edited prior outputs.
-  if (inputOverride && Object.keys(inputOverride).length > 0) {
-    steps = { ...steps };
-    for (const [stepId, patch] of Object.entries(inputOverride)) {
-      if (!(stepId in steps)) {
-        return errorEnvelope(
-          "invalid_input_override",
-          `Step "${stepId}" is not present in the checkpoint snapshot for job "${jobId}"`,
-        );
-      }
-      steps[stepId] = { ...steps[stepId], ...patch };
-    }
-  }
+  const replay = await buildRewindReplayState({
+    env: runtime.env,
+    jobId,
+    runId: checkpoint.runId,
+    targetStepIndex: checkpoint.stepIndex,
+    ...(inputOverride ? { inputOverride } : {}),
+  });
+  if ("error" in replay) return replay.error;
 
   const replayArgs = mergePatch(targetRun.args, argsPatch);
   // All validation above completes before any write, so a rejected rewind leaves
@@ -898,6 +1055,11 @@ export async function rewindToolRequest({
     checkpointId: checkpoint.checkpointId,
     args: replayArgs,
   });
+  await attachObserverAndAnnounce(runtime, checkpointRun, {
+    sourceType: targetRun.sourceType,
+    isRewind: true,
+    lineage: { parentJobId: job.parentJobId ?? null, rootJobId: job.rootJobId ?? null },
+  });
   try {
     const output = await runWorkflowFile({
       filePath: targetRun.workflowFile,
@@ -907,11 +1069,8 @@ export async function rewindToolRequest({
         v: 1,
         kind: "workflow-file",
         filePath: targetRun.workflowFile,
-        resumeAtIndex:
-          checkpoint.status === "succeeded" || checkpoint.status === "skipped"
-            ? checkpoint.stepIndex + 1
-            : checkpoint.stepIndex,
-        steps,
+        resumeAtIndex: replay.resumeAtIndex,
+        steps: replay.steps,
         args: replayArgs,
       },
     });
@@ -1158,6 +1317,52 @@ async function maybeCreateRun(params: {
   });
 }
 
+/**
+ * Attach the run's observer onto an existing (resumed) execution context so
+ * per-checkpoint callbacks fire during resume. No job-created announcement: the
+ * job already exists and any external session is already bound.
+ */
+function attachObserver(
+  runtime: ReturnType<typeof createToolContext>,
+  checkpointRun: WorkflowExecutionContext | undefined,
+): void {
+  if (checkpointRun && runtime.observer) {
+    checkpointRun.observer = runtime.observer;
+  }
+}
+
+/**
+ * Bind the observer to a freshly created run context and announce the job/run
+ * BEFORE any step executes, so embedders can attach a session up front. Throws
+ * from onJobCreated propagate to the caller's catch, aborting the run before
+ * execution.
+ */
+async function attachObserverAndAnnounce(
+  runtime: ReturnType<typeof createToolContext>,
+  checkpointRun: WorkflowExecutionContext | undefined,
+  opts: {
+    sourceType: "workflow_file" | "pipeline";
+    isRewind?: boolean;
+    lineage?: {
+      parentJobId?: string | null;
+      rootJobId?: string | null;
+    };
+  },
+): Promise<void> {
+  if (!checkpointRun) return;
+  attachObserver(runtime, checkpointRun);
+  if (!checkpointRun.jobId) return;
+  await runtime.observer?.onJobCreated?.({
+    jobId: checkpointRun.jobId,
+    runId: checkpointRun.runId,
+    rootRunId: checkpointRun.rootRunId,
+    sourceType: opts.sourceType,
+    ...(opts.isRewind ? { isRewind: true } : {}),
+    ...(opts.lineage?.parentJobId !== undefined ? { parentJobId: opts.lineage.parentJobId } : {}),
+    ...(opts.lineage?.rootJobId !== undefined ? { rootJobId: opts.lineage.rootJobId } : {}),
+  });
+}
+
 function normalizeJobTextField(value: unknown, label: string): string | null {
   if (value === undefined || value === null) return null;
   if (typeof value !== "string") {
@@ -1208,7 +1413,7 @@ function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<obj
 async function maybeUpdateRun(
   runtime: ReturnType<typeof createToolContext>,
   checkpointRun: WorkflowExecutionContext | undefined,
-  status: "running" | "waiting" | "succeeded" | "failed" | "cancelled",
+  status: "running" | "waiting" | "succeeded" | "failed" | "cancelled" | "superseded",
   finalOutput?: unknown,
 ) {
   if (!checkpointRun) return;
@@ -1228,15 +1433,15 @@ async function loadWorkflowRunContext(
   const checkpoint = await getStoredCheckpoint({ env, checkpointId }).catch(() => null);
   const runId = checkpoint?.runId ?? null;
   if (!runId) return undefined;
-  const resume = (checkpoint?.resumeState ?? null) as
-    | { stepPathPrefix?: unknown; depth?: unknown }
-    | null;
+  const resume = (checkpoint?.resumeState ?? null) as {
+    stepPathPrefix?: unknown;
+    depth?: unknown;
+  } | null;
   return createCheckpointRun(runId, {
     jobId: checkpoint?.jobId ?? runId,
     rootRunId: checkpoint?.rootRunId ?? runId,
     parentRunId: checkpoint?.parentRunId ?? null,
-    stepPathPrefix:
-      typeof resume?.stepPathPrefix === "string" ? resume.stepPathPrefix : "root",
+    stepPathPrefix: typeof resume?.stepPathPrefix === "string" ? resume.stepPathPrefix : "root",
     depth: typeof resume?.depth === "number" ? resume.depth : 0,
     latestCheckpointId: checkpointId,
   });
@@ -1244,7 +1449,7 @@ async function loadWorkflowRunContext(
 
 /**
  * Build a resume token from a waiting checkpoint id, deriving the resume kind
- * from the checkpoint's persisted resume state / step type.
+ * from the checkpoint's persisted resume state (the single source of truth).
  */
 async function encodeCheckpointResumeToken(
   env: Record<string, string | undefined>,
@@ -1252,12 +1457,7 @@ async function encodeCheckpointResumeToken(
 ): Promise<string> {
   const checkpoint = await getStoredCheckpoint({ env, checkpointId });
   const resume = (checkpoint?.resumeState ?? null) as { kind?: unknown } | null;
-  const kind =
-    resume?.kind === "pipeline-resume" ||
-    checkpoint?.stepType === "pipeline" ||
-    checkpoint?.stepType === "pipeline_input"
-      ? "pipeline-resume"
-      : "workflow-file";
+  const kind = resume?.kind === "pipeline-resume" ? "pipeline-resume" : "workflow-file";
   return encodeToken({
     protocolVersion: 1,
     v: 1,

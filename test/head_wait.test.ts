@@ -81,7 +81,9 @@ test("job-scoped continue advances only the head pause", async () => {
   assert.equal(second.paused?.stepIndex, 1);
 
   const afterSecond = await listJobCheckpoints({ jobId: first.jobId!, ctx });
-  const pauseCheckpoints = afterSecond.filter((checkpoint) => checkpoint.stepType === "pause");
+  const pauseCheckpoints = afterSecond.filter(
+    (checkpoint) => checkpoint.kind === "gate" && checkpoint.name === "pause",
+  );
   assert.deepEqual(
     pauseCheckpoints.map((checkpoint) => checkpoint.status),
     ["resumed", "waiting"],
@@ -98,7 +100,7 @@ test("job-scoped continue advances only the head pause", async () => {
   const finalCheckpoints = await listJobCheckpoints({ jobId: first.jobId!, ctx });
   assert.deepEqual(
     finalCheckpoints
-      .filter((checkpoint) => checkpoint.stepType === "pause")
+      .filter((checkpoint) => checkpoint.kind === "gate" && checkpoint.name === "pause")
       .map((checkpoint) => checkpoint.status),
     ["resumed", "resumed", "resumed"],
   );

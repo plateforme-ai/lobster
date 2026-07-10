@@ -17,7 +17,12 @@
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getStateDir, ensureDirectory, isJsonSyntaxError, writeFileAtomic } from "../../store/helpers.js";
+import {
+  getStateDir,
+  ensureDirectory,
+  isJsonSyntaxError,
+  writeFileAtomic,
+} from "../../store/helpers.js";
 
 /**
  * Convert a key to a safe file path

@@ -49,7 +49,13 @@ test("workflow tool runs create sqlite checkpoints and redact secret-looking out
 
   const checkpoints = await listRunCheckpoints({ runId: result.runId!, ctx: { env } });
   assert.ok(checkpoints.some((checkpoint) => checkpoint.stepId === "secret"));
-  assert.ok(checkpoints.some((checkpoint) => checkpoint.stepId === "workflow-end"));
+  // The run's terminal bookend is a run-scoped internal row (no owning step).
+  assert.ok(
+    checkpoints.some(
+      (checkpoint) =>
+        checkpoint.kind === "internal" && checkpoint.name === "end" && checkpoint.stepPath == null,
+    ),
+  );
 
   const secretCheckpoint = checkpoints.find((checkpoint) => checkpoint.stepId === "secret");
   assert.ok(secretCheckpoint);
@@ -156,29 +162,40 @@ test("workflow pipeline checkpoints are scoped under the owning step path", asyn
   assert.ok(result.runId);
 
   const checkpoints = await listRunCheckpoints({ runId: result.runId, ctx: { env } });
+  // The workflow step boundary owns the pipeline: kind=step, name=exec kind.
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
         checkpoint.stepId === "transform" &&
         checkpoint.stepPath === "root.transform" &&
-        checkpoint.stepType === "pipeline",
+        checkpoint.kind === "step" &&
+        checkpoint.name === "pipeline",
     ),
   );
+  // The nested stage shares the owning step's identity; its own name is the
+  // stage command name and it is a `detail`, not a distinct sub-path.
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
-        checkpoint.stepId === "json" &&
-        checkpoint.stepPath === "root.transform.json" &&
-        checkpoint.stepType === "pipeline_stage",
+        checkpoint.stepId === "transform" &&
+        checkpoint.stepPath === "root.transform" &&
+        checkpoint.kind === "detail" &&
+        checkpoint.name === "json",
     ),
   );
+  // The pipeline output envelope is engine bookkeeping under the owning step.
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
-        checkpoint.stepId === "pipeline-output" &&
-        checkpoint.stepPath === "root.transform.pipeline-output" &&
-        checkpoint.stepType === "pipeline_output",
+        checkpoint.stepPath === "root.transform" &&
+        checkpoint.kind === "internal" &&
+        checkpoint.name === "output",
     ),
+  );
+  // No fabricated sub-paths: the stage never gets its own step_path.
+  assert.equal(
+    checkpoints.some((checkpoint) => checkpoint.stepPath === "root.transform.json"),
+    false,
   );
   assert.equal(
     checkpoints.some((checkpoint) => checkpoint.stepPath === "root.json"),
@@ -198,20 +215,23 @@ test("standalone pipeline checkpoints keep top-level step paths", async () => {
   assert.ok(result.runId);
 
   const checkpoints = await listRunCheckpoints({ runId: result.runId, ctx: { env } });
+  // A top-level pipeline's stage owns itself: kind=step, name=stage command.
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
         checkpoint.stepId === "json" &&
         checkpoint.stepPath === "root.json" &&
-        checkpoint.stepType === "pipeline_stage",
+        checkpoint.kind === "step" &&
+        checkpoint.name === "json",
     ),
   );
+  // The output envelope is run-scoped bookkeeping (no owning step).
   assert.ok(
     checkpoints.some(
       (checkpoint) =>
-        checkpoint.stepId === "pipeline-output" &&
-        checkpoint.stepPath === "root.pipeline-output" &&
-        checkpoint.stepType === "pipeline_output",
+        checkpoint.stepPath == null &&
+        checkpoint.kind === "internal" &&
+        checkpoint.name === "output",
     ),
   );
 });

@@ -14,6 +14,8 @@ export {
   listPendingApprovals,
   listJobCheckpoints,
   listRunCheckpoints,
+  listJobSteps,
+  listRunSteps,
   getCheckpoint,
   getCheckpointIO,
   rerunToolRequest,
@@ -23,11 +25,13 @@ export {
   setStepMode,
   setJobExternalSession,
 } from "./tool_runtime.js";
-export type { ToolEnvelope } from "./tool_runtime.js";
+export type { ToolEnvelope, ToolRunObserver } from "./tool_runtime.js";
 export type {
   JobRecord,
   RunRecord,
   CheckpointRecord,
+  CheckpointKind,
+  StepRecord,
   CheckpointIORecord,
   ApprovalRecord,
   RunControlSnapshot,

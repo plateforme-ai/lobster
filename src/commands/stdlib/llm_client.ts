@@ -150,7 +150,12 @@ export function resolveAdapter({
       provider,
       source: config.sourceForProvider?.(provider) ?? "pi",
       async invoke({ payload, signal }) {
-        return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload, signal });
+        return invokeHttpAdapter({
+          endpoint: buildAdapterEndpoint(adapterUrl),
+          token,
+          payload,
+          signal,
+        });
       },
     };
   }
@@ -164,7 +169,12 @@ export function resolveAdapter({
     provider,
     source: config.sourceForProvider?.(provider) ?? "http",
     async invoke({ payload, signal }) {
-      return invokeHttpAdapter({ endpoint: buildAdapterEndpoint(adapterUrl), token, payload, signal });
+      return invokeHttpAdapter({
+        endpoint: buildAdapterEndpoint(adapterUrl),
+        token,
+        payload,
+        signal,
+      });
     },
   };
 }
@@ -430,7 +440,9 @@ export async function invokeLlmText({
     timer = setTimeout(
       () =>
         timeoutController.abort(
-          new Error(`metadata auto-generation timed out after ${Math.floor(timeoutMs as number)}ms`),
+          new Error(
+            `metadata auto-generation timed out after ${Math.floor(timeoutMs as number)}ms`,
+          ),
         ),
       Math.floor(timeoutMs as number),
     );
@@ -446,7 +458,10 @@ export async function invokeLlmText({
     }
     combinedSignal.addEventListener(
       "abort",
-      () => reject(combinedSignal.reason ?? new DOMException("The operation was aborted.", "AbortError")),
+      () =>
+        reject(
+          combinedSignal.reason ?? new DOMException("The operation was aborted.", "AbortError"),
+        ),
       { once: true },
     );
   });

@@ -1,5 +1,9 @@
 import { createJsonRenderer } from "./renderers/json.js";
-import type { WorkflowExecutionContext } from "./workflows/checkpoints.js";
+import type {
+  CheckpointKind,
+  CheckpointStatus,
+  WorkflowExecutionContext,
+} from "./workflows/checkpoints.js";
 import type { LlmTextCompleter } from "./commands/stdlib/llm_client.js";
 import { appendCheckpoint } from "./store/runtime_store.js";
 import {
@@ -28,6 +32,7 @@ export async function runPipeline({
   requestInputResume = undefined,
   requestInputEnabled = true,
   checkpointRun = undefined,
+  stageNamePrefix = undefined,
 }: {
   pipeline: any[];
   registry: any;
@@ -45,6 +50,7 @@ export async function runPipeline({
   requestInputResume?: CommandInputResume | undefined;
   requestInputEnabled?: boolean;
   checkpointRun?: WorkflowExecutionContext | undefined;
+  stageNamePrefix?: string | undefined;
 }) {
   if (dryRun) {
     return dryRunPipeline({ pipeline, registry, stderr });
@@ -55,6 +61,29 @@ export async function runPipeline({
   let halted = false;
   let haltedAt = null;
   let pipelineOutputStarted = false;
+
+  // Owner step, when this pipeline runs the sub-operations of an enclosing
+  // workflow step: every stage checkpoint is then a `detail` of that step (and
+  // the per-stage `started` bookend is `internal` noise). For a top-level
+  // pipeline (no owner) each stage is itself a first-class step: terminal ->
+  // `step`, suspension -> `gate`, `started` bookend -> `internal`.
+  const owner = checkpointRun?.ownerStep ?? null;
+  const stageKind = (status: CheckpointStatus): CheckpointKind => {
+    if (owner) return status === "started" ? "internal" : "detail";
+    if (status === "succeeded" || status === "failed" || status === "skipped") return "step";
+    if (status === "waiting") return "gate";
+    return "internal";
+  };
+  // Owning identity for every stage row: the enclosing step when nested, else
+  // the stage owns itself.
+  const stageIdentity = (stage: any, idx: number) =>
+    owner
+      ? { stepId: owner.stepId, stepIndex: owner.stepIndex, stepPath: owner.stepPath }
+      : { stepId: stage.name, stepIndex: idx, stepPath: undefined };
+  // A parallel/for_each branch scope distinguishes sibling stages that all fold
+  // into the same owning step.
+  const stageName = (stage: any) =>
+    stageNamePrefix ? `${stageNamePrefix}:${stage.name}` : stage.name;
 
   const baseCtx = {
     stdin,
@@ -79,9 +108,9 @@ export async function runPipeline({
     await appendCheckpoint({
       env,
       run: checkpointRun,
-      stepId: stage.name,
-      stepIndex: idx,
-      stepType: "pipeline_stage",
+      ...stageIdentity(stage, idx),
+      kind: stageKind("started"),
+      name: stageName(stage),
       status: "started",
       startedAt: stageStartedAt,
       metadata: { stage },
@@ -134,9 +163,9 @@ export async function runPipeline({
         await appendCheckpoint({
           env,
           run: checkpointRun,
-          stepId: stage.name,
-          stepIndex: idx,
-          stepType: "pipeline_stage",
+          ...stageIdentity(stage, idx),
+          kind: stageKind("waiting"),
+          name: stageName(stage),
           status: "waiting",
           startedAt: stageStartedAt,
           finishedAt: new Date().toISOString(),
@@ -147,9 +176,9 @@ export async function runPipeline({
       await appendCheckpoint({
         env,
         run: checkpointRun,
-        stepId: stage.name,
-        stepIndex: idx,
-        stepType: "pipeline_stage",
+        ...stageIdentity(stage, idx),
+        kind: stageKind("failed"),
+        name: stageName(stage),
         status: "failed",
         startedAt: stageStartedAt,
         finishedAt: new Date().toISOString(),
@@ -201,9 +230,9 @@ export async function runPipeline({
       await appendCheckpoint({
         env,
         run: checkpointRun,
-        stepId: stage.name,
-        stepIndex: idx,
-        stepType: "pipeline_stage",
+        ...stageIdentity(stage, idx),
+        kind: stageKind("waiting"),
+        name: stageName(stage),
         status: "waiting",
         startedAt: stageStartedAt,
         finishedAt: new Date().toISOString(),
@@ -216,9 +245,9 @@ export async function runPipeline({
     await appendCheckpoint({
       env,
       run: checkpointRun,
-      stepId: stage.name,
-      stepIndex: idx,
-      stepType: "pipeline_stage",
+      ...stageIdentity(stage, idx),
+      kind: stageKind("succeeded"),
+      name: stageName(stage),
       status: "succeeded",
       startedAt: stageStartedAt,
       finishedAt: new Date().toISOString(),
@@ -240,12 +269,17 @@ export async function runPipeline({
   }
   assertRequestInputResumeConsumed(requestInputResume);
 
+  // The pipeline output envelope is engine bookkeeping, never a user-visible
+  // step: `internal`, `name="output"`. Nested it carries the owning step's
+  // identity; top-level it is run-scoped (no step).
   await appendCheckpoint({
     env,
     run: checkpointRun,
-    stepId: "pipeline-output",
-    stepIndex: pipeline.length,
-    stepType: "pipeline_output",
+    stepId: owner ? owner.stepId : null,
+    stepIndex: owner ? owner.stepIndex : null,
+    stepPath: owner ? owner.stepPath : null,
+    kind: "internal",
+    name: "output",
     status: halted ? "waiting" : "succeeded",
     finishedAt: new Date().toISOString(),
     io: { jsonOutput: items },

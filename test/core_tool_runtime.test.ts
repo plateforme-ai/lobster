@@ -4,7 +4,13 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { getJob, listJobCheckpoints, resumeToolRequest, runToolRequest } from "../src/core/index.js";
+import {
+  getJob,
+  listJobCheckpoints,
+  listJobSteps,
+  resumeToolRequest,
+  runToolRequest,
+} from "../src/core/index.js";
 import { DEFAULT_METADATA_TIMEOUT_MS, parseMetadataTimeoutMs } from "../src/workflows/file.js";
 import { invokeLlmText } from "../src/commands/stdlib/llm_client.js";
 
@@ -197,11 +203,62 @@ test("runToolRequest/resumeToolRequest handles needs_input workflow pauses", asy
   assert.deepEqual(resumed.output, [{ decision: "approve", subject: "hello" }]);
 });
 
+test("workflow step failure with default on_error records a failed step boundary", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-step-fail-"));
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          { id: "fail", run: "node -e \"process.stderr.write('boom');process.exit(1)\"" },
+          { id: "after", run: "echo should-not-run" },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
+  let jobId: string | undefined;
+  const ctx = { cwd: tmpDir, env };
+
+  const result = await runToolRequest({
+    filePath,
+    ctx: { ...ctx, observer: { onJobCreated: (job) => void (jobId = job.jobId) } },
+  });
+  assert.equal(result.ok, false);
+  assert.ok(jobId);
+  assert.match(result.error?.message ?? "", /workflow command failed/);
+
+  const checkpoints = await listJobCheckpoints({ jobId: jobId!, ctx });
+  const failedBoundary = checkpoints.find(
+    (cp) => cp.stepId === "fail" && cp.kind === "step" && cp.status === "failed",
+  );
+  assert.ok(failedBoundary, "expected a failed step checkpoint before the run failed");
+  assert.equal(failedBoundary?.stepPath, "root.fail");
+  assert.equal(failedBoundary?.name, "shell");
+
+  const steps = await listJobSteps({ jobId: jobId!, ctx });
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].stepId, "fail");
+  assert.equal(steps[0].status, "failed");
+  assert.equal(steps[0].boundaryCheckpointId, failedBoundary?.checkpointId);
+});
+
 function createMetadataTextHook() {
   const calls: Array<{ prompt: string; model?: string | null }> = [];
   return {
     calls,
-    llmText: async ({ prompt, model }: { prompt: string; model?: string | null; signal?: AbortSignal }) => {
+    llmText: async ({
+      prompt,
+      model,
+    }: {
+      prompt: string;
+      model?: string | null;
+      signal?: AbortSignal;
+    }) => {
       calls.push({ prompt, model: model ?? null });
       const text = /concise title/.test(prompt)
         ? "Weather Summary"
@@ -261,11 +318,11 @@ test("metadata:auto resolves in-process via ctx.llmText, writes job title/descri
 
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
   const metadataCheckpoint = checkpoints.find(
-    (cp) => cp.stepType === "metadata" && cp.status === "succeeded",
+    (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "succeeded",
   );
   assert.ok(metadataCheckpoint, "expected a succeeded metadata checkpoint");
-  assert.equal(metadataCheckpoint?.stepId, "metadata");
-  assert.ok(metadataCheckpoint?.stepPath?.endsWith("summarize.metadata"));
+  assert.equal(metadataCheckpoint?.stepId, "summarize");
+  assert.equal(metadataCheckpoint?.stepPath, "root.summarize");
 });
 
 test("metadata:auto failure follows the step's default on_error (stop) and errors the run", async () => {
@@ -280,13 +337,38 @@ test("metadata:auto failure follows the step's default on_error (stop) and error
     ...process.env,
     LOBSTER_DIR: tmpDir,
   };
-  const ctx = { cwd: tmpDir, env, llmText: failingText };
+  let jobId: string | undefined;
+  const ctx = {
+    cwd: tmpDir,
+    env,
+    llmText: failingText,
+    observer: { onJobCreated: (job: { jobId: string }) => void (jobId = job.jobId) },
+  };
 
   const result = await runToolRequest({ filePath, ctx });
   // Default on_error is "stop": the metadata failure halts the run like any step failure.
   assert.equal(result.ok, false);
   assert.match(result.error?.message ?? "", /llm exploded/);
+  assert.ok(jobId);
   assert.ok(calls.length >= 1);
+
+  const checkpoints = await listJobCheckpoints({ jobId: jobId!, ctx });
+  const failedMetadata = checkpoints.find(
+    (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "failed",
+  );
+  assert.ok(failedMetadata, "expected a failed metadata detail checkpoint");
+  const failedBoundary = checkpoints.find(
+    (cp) => cp.name === "shell" && cp.kind === "step" && cp.status === "failed",
+  );
+  assert.ok(failedBoundary, "metadata stop failure must flip the owning step boundary to failed");
+  assert.equal(failedBoundary?.stepId, "summarize");
+  assert.equal(failedBoundary?.stepPath, "root.summarize");
+
+  const steps = await listJobSteps({ jobId: jobId!, ctx });
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].stepId, "summarize");
+  assert.equal(steps[0].status, "failed");
+  assert.equal(steps[0].boundaryCheckpointId, failedBoundary?.checkpointId);
 });
 
 test("metadata:auto failure with on_error continue records a scoped failed checkpoint and finishes the run", async () => {
@@ -313,12 +395,25 @@ test("metadata:auto failure with on_error continue records a scoped failed check
   assert.equal(job?.description ?? null, null);
 
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
-  const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
+  const failed = checkpoints.find(
+    (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "failed",
+  );
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "metadata");
-  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
+  assert.equal(failed?.stepId, "summarize");
+  assert.equal(failed?.stepPath, "root.summarize");
+  const failedBoundary = checkpoints.find(
+    (cp) => cp.name === "shell" && cp.kind === "step" && cp.status === "failed",
+  );
   assert.ok(
-    !checkpoints.some((cp) => cp.stepType === "metadata" && cp.status === "succeeded"),
+    failedBoundary,
+    "metadata continue failure must flip the owning step boundary to failed",
+  );
+  const steps = await listJobSteps({ jobId: result.jobId!, ctx });
+  assert.equal(steps[0].status, "failed");
+  assert.ok(
+    !checkpoints.some(
+      (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "succeeded",
+    ),
     "no succeeded metadata checkpoint should be recorded on failure",
   );
 });
@@ -347,11 +442,25 @@ test("metadata:auto empty output is a failure (metadata_generation_empty), not a
   assert.equal(job?.description ?? null, null);
 
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
-  const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
+  const failed = checkpoints.find(
+    (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "failed",
+  );
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "metadata");
-  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
-  assert.equal((failed?.metadata as { reason?: string } | undefined)?.reason, "metadata_generation_empty");
+  assert.equal(failed?.stepId, "summarize");
+  assert.equal(failed?.stepPath, "root.summarize");
+  const failedBoundary = checkpoints.find(
+    (cp) => cp.name === "shell" && cp.kind === "step" && cp.status === "failed",
+  );
+  assert.ok(
+    failedBoundary,
+    "metadata empty-output failure must flip the owning step boundary to failed",
+  );
+  const steps = await listJobSteps({ jobId: result.jobId!, ctx });
+  assert.equal(steps[0].status, "failed");
+  assert.equal(
+    (failed?.metadata as { reason?: string } | undefined)?.reason,
+    "metadata_generation_empty",
+  );
 });
 
 // --- Metadata auto timeout tests ---
@@ -413,10 +522,12 @@ test("metadata:auto timeout follows on_error continue and records a failed check
   assert.equal(job?.description ?? null, null);
 
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
-  const failed = checkpoints.find((cp) => cp.stepType === "metadata" && cp.status === "failed");
+  const failed = checkpoints.find(
+    (cp) => cp.name === "metadata" && cp.kind === "detail" && cp.status === "failed",
+  );
   assert.ok(failed, "expected a failed metadata checkpoint");
-  assert.equal(failed?.stepId, "metadata");
-  assert.ok(failed?.stepPath?.endsWith("summarize.metadata"));
+  assert.equal(failed?.stepId, "summarize");
+  assert.equal(failed?.stepPath, "root.summarize");
   assert.equal(
     (failed?.metadata as { reason?: string } | undefined)?.reason,
     "metadata_generation_failed",
@@ -443,11 +554,99 @@ test("invokeLlmText prefers ctx.llmText and never touches llmAdapters", async ()
     },
   };
   const env = {};
-  const text = await invokeLlmText({ ctx, env, prompt: "summarize", model: "m/x", timeoutMs: 5_000 });
+  const text = await invokeLlmText({
+    ctx,
+    env,
+    prompt: "summarize",
+    model: "m/x",
+    timeoutMs: 5_000,
+  });
   assert.equal(text, "hook result");
   assert.equal(hookCalls.length, 1);
   assert.equal(hookCalls[0]!.model, "m/x");
   assert.equal(adapterCalls.length, 0);
+});
+
+async function writeTwoStepWorkflow(tmpDir: string): Promise<string> {
+  const filePath = path.join(tmpDir, "workflow.lobster");
+  await fsp.writeFile(
+    filePath,
+    JSON.stringify(
+      {
+        steps: [
+          { id: "first", run: 'node -e "process.stdout.write(JSON.stringify({n:1}))"' },
+          { id: "second", run: 'node -e "process.stdout.write(JSON.stringify({n:2}))"' },
+        ],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  return filePath;
+}
+
+test("run observer fires onJobCreated before any checkpoint and onCheckpoint per durable checkpoint", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-observer-"));
+  const filePath = await writeTwoStepWorkflow(tmpDir);
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
+
+  const events: string[] = [];
+  let createdInfo: any;
+  const checkpointJobIds: string[] = [];
+  const observer = {
+    onJobCreated: (info: any) => {
+      createdInfo = info;
+      events.push("job");
+    },
+    onCheckpoint: (cp: any) => {
+      checkpointJobIds.push(cp.jobId);
+      events.push("cp");
+    },
+  };
+
+  const result = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env, observer } });
+  assert.equal(result.ok, true);
+  assert.equal(result.status, "ok");
+  assert.ok(result.jobId);
+
+  // The job is announced exactly once, before any checkpoint streams.
+  assert.equal(events[0], "job");
+  assert.equal(events.filter((e) => e === "job").length, 1);
+  assert.equal(createdInfo.jobId, result.jobId);
+  assert.equal(createdInfo.sourceType, "workflow_file");
+
+  // Every step checkpoint is streamed live and carries the run's jobId.
+  assert.ok(events.filter((e) => e === "cp").length >= 2);
+  assert.ok(checkpointJobIds.every((id) => id === result.jobId));
+});
+
+test("run observer onJobCreated throwing aborts the run before any step executes", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-core-observer-abort-"));
+  const filePath = await writeTwoStepWorkflow(tmpDir);
+  const env = { ...process.env, LOBSTER_DIR: tmpDir };
+
+  let checkpointCount = 0;
+  let createdJobId: string | undefined;
+  const observer = {
+    onJobCreated: (info: any) => {
+      createdJobId = info.jobId;
+      throw new Error("bind boom");
+    },
+    onCheckpoint: () => {
+      checkpointCount += 1;
+    },
+  };
+
+  const result = await runToolRequest({ filePath, ctx: { cwd: tmpDir, env, observer } });
+  // The run is aborted before any step runs; no checkpoints stream.
+  assert.equal(result.ok, false);
+  assert.equal(checkpointCount, 0);
+
+  // The job row exists (announced) but no step checkpoints were recorded.
+  assert.ok(createdJobId);
+  const checkpoints = await listJobCheckpoints({ jobId: createdJobId!, ctx: { cwd: tmpDir, env } });
+  assert.ok(!checkpoints.some((cp) => cp.stepId === "first" || cp.stepId === "second"));
 });
 
 test("nested-workflow condition passes when structured llm.invoke returns output.data (regression)", async () => {
