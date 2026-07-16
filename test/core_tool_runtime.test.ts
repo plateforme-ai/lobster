@@ -260,9 +260,9 @@ function createMetadataTextHook() {
       signal?: AbortSignal;
     }) => {
       calls.push({ prompt, model: model ?? null });
-      const text = /concise title/.test(prompt)
-        ? "Weather Summary"
-        : "The step summarized the current weather reading.";
+      const text = /specific job title/.test(prompt)
+        ? "72°F in Seattle, clear"
+        : "Current conditions in Seattle: 72°F and clear; no alerts.";
       return { text };
     },
   };
@@ -313,8 +313,8 @@ test("metadata:auto resolves in-process via ctx.llmText, writes job title/descri
   assert.equal(calls.length, 2);
 
   const job = await getJob({ jobId: result.jobId!, ctx });
-  assert.equal(job?.title, "Weather Summary");
-  assert.equal(job?.description, "The step summarized the current weather reading.");
+  assert.equal(job?.title, "72°F in Seattle, clear");
+  assert.equal(job?.description, "Current conditions in Seattle: 72°F and clear; no alerts.");
 
   const checkpoints = await listJobCheckpoints({ jobId: result.jobId!, ctx });
   const metadataCheckpoint = checkpoints.find(

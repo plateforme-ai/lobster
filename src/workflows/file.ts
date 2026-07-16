@@ -2484,19 +2484,60 @@ async function generateJobMetadataAuto({
     );
   };
   if (needTitle) {
-    const prompt =
-      `Write a concise title (at most 8 words, no surrounding quotes) that summarizes the ` +
-      `result of workflow step "${step.id}". Input: ${inputText} Output: ${outputText} ` +
-      `Respond with only the title text.`;
+    const prompt = [
+      "Write a specific job title (at most 10 words, no quotes) for what this run is about or about to do.",
+      "",
+      "Rules:",
+      "- Name the business subject using concrete entities from the input/output (people, orgs, IDs, amounts, products, destinations).",
+      "- Do NOT describe the workflow, step, tooling, extraction, parsing, or summarization.",
+      "- Prefer outcome/subject phrasing over process phrasing.",
+      "- If key entities are present, they MUST appear in the title.",
+      "",
+      "Bad examples:",
+      '- "Extracts details from inbound message"',
+      '- "Creates a data snapshot"',
+      '- "Processes API response"',
+      "",
+      "Good examples:",
+      '- "Order for Acme Corp: 24× SKU-4401"',
+      '- "Onboard Jane Doe to O365"',
+      '- "72°F in Seattle, clear"',
+      "",
+      `Step: ${step.id}`,
+      `Input: ${inputText}`,
+      `Output: ${outputText}`,
+      "",
+      "Respond with only the title text.",
+    ].join("\n");
     const title = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
     recordAutoUsage(title.usage, title.model);
     if (title.text) result.title = title.text.split("\n")[0]!.trim();
   }
   if (needDescription) {
-    const prompt =
-      `Write a 1-2 sentence description that summarizes the result of workflow step ` +
-      `"${step.id}". Input: ${inputText} Output: ${outputText} ` +
-      `Respond with only the description text.`;
+    const prompt = [
+      "Write a 2-3 sentence(s) job description of what this run is doing or about to do.",
+      "",
+      "Rules:",
+      "- Ground it in concrete facts from the input/output (who, what, how many, which item/system).",
+      "- Do NOT narrate what the step did, and do NOT describe workflow mechanics.",
+      "- Avoid process phrasing such as extracted, identified, parsed, processed, summarized, or snapshot.",
+      "",
+      "Bad examples:",
+      '- "The step extracted key fields from the inbound message."',
+      '- "This workflow creates a snapshot of the employee profile."',
+      '- "The step summarized the current API reading."',
+      "",
+      "Good examples:",
+      '- "New order for Acme Corp: 24 units of SKU-4401 from inbound email, awaiting approval."',
+      '- "Provision O365 profile and mailbox for Jane Doe (Engineering)."',
+      '- "Current conditions in Seattle: 72°F and clear; no alerts."',
+      "",
+      `Step: ${step.id}`,
+      `Input: ${inputText}`,
+      `Output: ${outputText}`,
+      "",
+      "Respond with only the description text.",
+    ].join("\n");
     const description = await invokeLlmText({ ctx, env: ctx.env, prompt, signal, timeoutMs });
     recordAutoUsage(description.usage, description.model);
     if (description.text) result.description = description.text.trim();

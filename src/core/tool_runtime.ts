@@ -1220,6 +1220,18 @@ export async function pauseRun(params: {
   const runtime = createToolContext(params.ctx);
   const target = await resolveControlTarget(runtime, params);
   if ("error" in target) return target.error;
+
+  // At a wait gate the run is already suspended — pause only applies to in-flight
+  // runs. Queuing desired=pause here would surprise operators after approve/input.
+  const job = await getStoredJob(runtime.env, target.jobId).catch(() => null);
+  const wait = job?.status === "waiting" ? job.wait : null;
+  if (wait && (wait.kind === "pause" || wait.kind === "approval" || wait.kind === "input")) {
+    return errorEnvelope(
+      "already_waiting",
+      `Job is already waiting on ${wait.kind}`,
+    );
+  }
+
   await setRunControl({
     env: runtime.env,
     runId: target.runId,

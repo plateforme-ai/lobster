@@ -14,7 +14,6 @@ import {
   resumeToolRequest,
   runToolRequest,
   setJobExternalSession,
-  setStepMode,
 } from "../src/core/index.js";
 
 async function writeThreeStepWorkflow(tmpDir: string) {
@@ -341,29 +340,90 @@ test("approval reject appends a terminal control/cancelled checkpoint", async ()
 
 test("explicit pause is honored at the next step boundary", async () => {
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pause-"));
+  const filePath = await writeSlowFirstStepWorkflow(tmpDir);
+  const env = makeEnv(tmpDir);
+  const ctx = { cwd: tmpDir, env };
+
+  const runPromise = runToolRequest({ filePath, ctx });
+  // Let the slow step enter flight.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  const { jobs } = await listJobs({ ctx });
+  const running = jobs.find((entry) => entry.status === "running");
+  assert.ok(running, "expected a running job to target");
+
+  const pauseEnvelope = await pauseRun({ jobId: running!.jobId, ctx });
+  assert.equal(pauseEnvelope.ok, true);
+  assert.equal(pauseEnvelope.status, "ok");
+
+  const job = await getJob({ jobId: running!.jobId, ctx });
+  assert.equal(job?.control.desired, "pause");
+
+  const first = await runPromise;
+  assert.equal(first.status, "paused");
+  assert.equal(first.paused?.reason, "pause_requested");
+
+  // Pause is one-shot: the next resume runs to completion.
+  const second = await resumeToolRequest({ token: first.paused!.resumeToken!, ctx });
+  assert.equal(second.status, "ok");
+  assert.deepEqual(second.output, [{ n: 2 }]);
+});
+
+test("pause at an approval gate returns already_waiting without mutating control", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pause-approval-"));
+  const filePath = await writeApprovalWorkflow(tmpDir);
+  const env = makeEnv(tmpDir);
+  const ctx = { cwd: tmpDir, env };
+
+  const first = await runToolRequest({ filePath, ctx });
+  assert.equal(first.status, "needs_approval");
+
+  const pauseEnvelope = await pauseRun({ jobId: first.jobId!, ctx });
+  assert.equal(pauseEnvelope.ok, false);
+  assert.equal(pauseEnvelope.error?.type, "already_waiting");
+  assert.match(pauseEnvelope.error?.message ?? "", /waiting on approval/);
+
+  const job = await getJob({ jobId: first.jobId!, ctx });
+  assert.equal(job?.wait?.kind, "approval");
+  assert.equal(job?.control.desired, "none");
+});
+
+test("pause at an input gate returns already_waiting without mutating control", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pause-input-"));
+  const filePath = await writeInputWorkflow(tmpDir);
+  const env = makeEnv(tmpDir);
+  const ctx = { cwd: tmpDir, env };
+
+  const first = await runToolRequest({ filePath, ctx });
+  assert.equal(first.status, "needs_input");
+
+  const pauseEnvelope = await pauseRun({ jobId: first.jobId!, ctx });
+  assert.equal(pauseEnvelope.ok, false);
+  assert.equal(pauseEnvelope.error?.type, "already_waiting");
+  assert.match(pauseEnvelope.error?.message ?? "", /waiting on input/);
+
+  const job = await getJob({ jobId: first.jobId!, ctx });
+  assert.equal(job?.wait?.kind, "input");
+  assert.equal(job?.control.desired, "none");
+});
+
+test("pause at a pause gate returns already_waiting without mutating control", async () => {
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-pause-paused-"));
   const filePath = await writeThreeStepWorkflow(tmpDir);
   const env = makeEnv(tmpDir);
   const ctx = { cwd: tmpDir, env };
 
-  // Start in step mode so we get a handle (jobId + resume token) without
-  // running to completion synchronously.
   const first = await runToolRequest({ filePath, stepMode: true, ctx });
   assert.equal(first.status, "paused");
 
-  // Turn off step mode, then request a one-shot pause.
-  await setStepMode({ jobId: first.jobId!, stepMode: false, ctx });
+  const pauseEnvelope = await pauseRun({ jobId: first.jobId!, ctx });
+  assert.equal(pauseEnvelope.ok, false);
+  assert.equal(pauseEnvelope.error?.type, "already_waiting");
+  assert.match(pauseEnvelope.error?.message ?? "", /waiting on pause/);
+
   const job = await getJob({ jobId: first.jobId!, ctx });
-  assert.equal(job?.control.stepMode, false);
-  await pauseRun({ jobId: first.jobId!, ctx });
-
-  const second = await resumeToolRequest({ token: first.paused!.resumeToken, ctx });
-  assert.equal(second.status, "paused");
-  assert.equal(second.paused?.reason, "pause_requested");
-
-  // Pause is one-shot: the next resume runs to completion.
-  const third = await resumeToolRequest({ token: second.paused!.resumeToken, ctx });
-  assert.equal(third.status, "ok");
-  assert.deepEqual(third.output, [{ n: 3 }]);
+  assert.equal(job?.wait?.kind, "pause");
+  assert.equal(job?.control.desired, "none");
 });
 
 test("external session id round-trips through the store and run envelopes", async () => {
